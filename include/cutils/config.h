@@ -90,12 +90,29 @@ int config_get_int(const cutils_config_t *cfg, const char *key, int default_val)
  * Returns default_val if key doesn't exist or isn't parseable. */
 int config_get_bool(const cutils_config_t *cfg, const char *key, int default_val);
 
-/* --- Mutation API (file-backed, non-minimum keys only) --- */
+/* --- Mutation API --- */
 
 /* Update a file-backed key. Rewrites the YAML file preserving comments.
  * Returns CUTILS_ERR_INVALID if the key is a hard minimum (immutable).
  * Returns CUTILS_ERR_NOT_FOUND if the key doesn't exist. */
 int config_set(cutils_config_t *cfg, const char *key, const char *value);
+
+/* Update a DB-backed key.
+ * Returns CUTILS_ERR_NOT_FOUND if the key doesn't exist.
+ * Returns CUTILS_ERR_INVALID if the key is file-backed. */
+int config_set_db(cutils_config_t *cfg, const char *key, const char *value);
+
+/* --- DB config integration --- */
+
+/* Forward declaration */
+typedef struct cutils_db cutils_db_t;
+
+/* Register DB-backed keys and attach a database handle.
+ * Seeds any new keys into the config table with their defaults.
+ * Must be called after config_init() and db_open() + migrations.
+ * db_keys array must be terminated with a {NULL} sentinel. */
+int config_attach_db(cutils_config_t *cfg, cutils_db_t *db,
+                     const config_key_t *db_keys);
 
 /* --- Query API --- */
 
@@ -107,5 +124,8 @@ const config_key_t *config_get_key_def(const cutils_config_t *cfg, const char *k
 
 /* Get the number of registered file-backed keys. */
 int config_file_key_count(const cutils_config_t *cfg);
+
+/* Get the number of registered DB-backed keys. */
+int config_db_key_count(const cutils_config_t *cfg);
 
 #endif

@@ -1,4 +1,5 @@
 #include "cutils/config.h"
+#include "cutils/db.h"
 #include "cutils/error.h"
 #include "config_yaml.h"
 
@@ -41,6 +42,9 @@ struct cutils_config {
 
     /* Parsed YAML document */
     yaml_doc_t     *doc;
+
+    /* DB handle (attached after DB init, NULL until then) */
+    cutils_db_t    *db;
 };
 
 /* --- Helpers --- */
@@ -259,6 +263,88 @@ void config_free(cutils_config_t *cfg)
     free(cfg);
 }
 
+/* --- DB config integration --- */
+
+/* Thread-local buffer for DB config reads (avoids alloc/free churn) */
+static _Thread_local char db_val_buf[1024];
+
+static const char *config_get_from_db(const cutils_config_t *cfg, const char *key)
+{
+    if (!cfg->db) return NULL;
+
+    const char *params[] = { key, NULL };
+    db_result_t *result = NULL;
+
+    int rc = db_execute(cfg->db, "SELECT value FROM config WHERE key = ?",
+                        params, &result);
+    if (rc != CUTILS_OK || !result || result->nrows == 0) {
+        db_result_free(result);
+        return NULL;
+    }
+
+    snprintf(db_val_buf, sizeof(db_val_buf), "%s", result->rows[0][0]);
+    db_result_free(result);
+    return db_val_buf;
+}
+
+int config_attach_db(cutils_config_t *cfg, cutils_db_t *db,
+                     const config_key_t *db_keys)
+{
+    cfg->db = db;
+
+    if (!db_keys) return CUTILS_OK;
+
+    /* Register DB-backed keys */
+    for (int i = 0; db_keys[i].key != NULL; i++) {
+        if (db_keys[i].store != CFG_STORE_DB) continue;
+
+        int rc = add_key(cfg, &db_keys[i]);
+        if (rc != CUTILS_OK) return rc;
+    }
+
+    /* Seed defaults into DB for any keys that don't exist yet */
+    for (int i = 0; db_keys[i].key != NULL; i++) {
+        if (db_keys[i].store != CFG_STORE_DB) continue;
+
+        /* Check if already in DB */
+        const char *params[] = { db_keys[i].key, NULL };
+        db_result_t *result = NULL;
+        int rc = db_execute(db, "SELECT key FROM config WHERE key = ?",
+                            params, &result);
+        if (rc != CUTILS_OK) {
+            db_result_free(result);
+            return rc;
+        }
+
+        if (result->nrows > 0) {
+            db_result_free(result);
+            continue;
+        }
+        db_result_free(result);
+
+        /* Insert with defaults */
+        const char *type_str = "string";
+        if (db_keys[i].type == CFG_INT) type_str = "int";
+        else if (db_keys[i].type == CFG_BOOL) type_str = "bool";
+
+        const char *ins_params[] = {
+            db_keys[i].key,
+            db_keys[i].default_value ? db_keys[i].default_value : "",
+            type_str,
+            db_keys[i].default_value ? db_keys[i].default_value : "",
+            db_keys[i].description ? db_keys[i].description : "",
+            NULL
+        };
+        rc = db_execute_non_query(db,
+            "INSERT INTO config (key, value, type, default_value, description) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ins_params, NULL);
+        if (rc != CUTILS_OK) return rc;
+    }
+
+    return CUTILS_OK;
+}
+
 /* --- Read API --- */
 
 const char *config_get_str(const cutils_config_t *cfg, const char *key)
@@ -271,17 +357,22 @@ const char *config_get_str(const cutils_config_t *cfg, const char *key)
         if (envval) return envval;
     }
 
-    /* 2. Check YAML file */
-    if (cfg->doc) {
-        const char *val = yaml_get(cfg->doc, key);
+    /* Determine store for this key */
+    const config_key_t *def = config_get_key_def(cfg, key);
+
+    /* 2. Check the appropriate store */
+    if (def && def->store == CFG_STORE_DB) {
+        const char *val = config_get_from_db(cfg, key);
         if (val && val[0] != '\0') return val;
+    } else {
+        if (cfg->doc) {
+            const char *val = yaml_get(cfg->doc, key);
+            if (val && val[0] != '\0') return val;
+        }
     }
 
     /* 3. Compiled-in default */
-    for (int i = 0; i < cfg->nkeys; i++) {
-        if (strcmp(cfg->keys[i].key, key) == 0)
-            return cfg->keys[i].default_value;
-    }
+    if (def) return def->default_value;
 
     return NULL;
 }
@@ -375,4 +466,32 @@ int config_file_key_count(const cutils_config_t *cfg)
             count++;
     }
     return count;
+}
+
+int config_db_key_count(const cutils_config_t *cfg)
+{
+    int count = 0;
+    for (int i = 0; i < cfg->nkeys; i++) {
+        if (cfg->keys[i].store == CFG_STORE_DB)
+            count++;
+    }
+    return count;
+}
+
+int config_set_db(cutils_config_t *cfg, const char *key, const char *value)
+{
+    if (!cfg->db)
+        return set_error(CUTILS_ERR_INVALID, "DB not attached to config");
+
+    /* Verify key exists and is DB-backed */
+    const config_key_t *def = config_get_key_def(cfg, key);
+    if (!def)
+        return set_error(CUTILS_ERR_NOT_FOUND, "config key '%s' not found", key);
+    if (def->store != CFG_STORE_DB)
+        return set_error(CUTILS_ERR_INVALID,
+            "key '%s' is file-backed, use config_set()", key);
+
+    const char *params[] = { value, key, NULL };
+    return db_execute_non_query(cfg->db,
+        "UPDATE config SET value = ? WHERE key = ?", params, NULL);
 }
