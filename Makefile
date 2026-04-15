@@ -15,6 +15,8 @@ CFLAGS   = -Wall -Wextra -Wpedantic -Wshadow -Wunused -Wunused-function \
 SRCS     = src/error.c \
            src/db.c \
            src/migrations.c \
+           src/config.c \
+           src/config_yaml.c \
            lib/cJSON/cJSON.c
 OBJS     = $(SRCS:.c=.o)
 
