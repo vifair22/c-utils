@@ -51,17 +51,17 @@ void log_stream_unregister(int handle);
 /* --- Logging macros ---
  * These capture __func__ automatically. Use these, not log_write() directly. */
 
-#define log_debug(fmt, ...) \
-    log_write(LOG_DEBUG, __func__, fmt, ##__VA_ARGS__)
+#define log_debug(...) \
+    log_write(LOG_DEBUG, __func__, __VA_ARGS__)
 
-#define log_info(fmt, ...) \
-    log_write(LOG_INFO, __func__, fmt, ##__VA_ARGS__)
+#define log_info(...) \
+    log_write(LOG_INFO, __func__, __VA_ARGS__)
 
-#define log_warn(fmt, ...) \
-    log_write(LOG_WARNING, __func__, fmt, ##__VA_ARGS__)
+#define log_warn(...) \
+    log_write(LOG_WARNING, __func__, __VA_ARGS__)
 
-#define log_error(fmt, ...) \
-    log_write(LOG_ERROR, __func__, fmt, ##__VA_ARGS__)
+#define log_error(...) \
+    log_write(LOG_ERROR, __func__, __VA_ARGS__)
 
 /* Internal — called by macros */
 void log_write(log_level_t level, const char *func, const char *fmt, ...)
