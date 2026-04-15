@@ -13,6 +13,7 @@ CFLAGS   = -Wall -Wextra -Wpedantic -Wshadow -Wunused -Wunused-function \
 
 # Source files
 SRCS     = src/error.c \
+           src/db.c \
            lib/cJSON/cJSON.c
 OBJS     = $(SRCS:.c=.o)
 
