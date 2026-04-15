@@ -60,4 +60,18 @@ int db_savepoint(cutils_db_t *db, const char *name);
 int db_savepoint_release(cutils_db_t *db, const char *name);
 int db_savepoint_rollback(cutils_db_t *db, const char *name);
 
+/* --- Migration runner ---
+ *
+ * Migrations are tracked in a system_migrations table with SHA256 checksums.
+ * Already-applied migrations are verified by checksum; a mismatch is a
+ * fatal error. New migrations are applied within savepoints for rollback. */
+
+/* Run compiled-in library migrations (_lib/ prefix).
+ * Called internally by appguard_init(). */
+int db_run_lib_migrations(cutils_db_t *db);
+
+/* Run file-based app migrations from a directory of numbered .sql files.
+ * Files are applied in lexical order. NULL migrations_dir is a no-op. */
+int db_run_app_migrations(cutils_db_t *db, const char *migrations_dir);
+
 #endif

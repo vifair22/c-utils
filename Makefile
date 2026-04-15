@@ -14,6 +14,7 @@ CFLAGS   = -Wall -Wextra -Wpedantic -Wshadow -Wunused -Wunused-function \
 # Source files
 SRCS     = src/error.c \
            src/db.c \
+           src/migrations.c \
            lib/cJSON/cJSON.c
 OBJS     = $(SRCS:.c=.o)
 
@@ -37,7 +38,7 @@ check:
 TEST_SRCS = $(wildcard tests/test_*.c)
 TEST_BINS = $(TEST_SRCS:.c=)
 TEST_CFLAGS = $(CFLAGS)
-TEST_LIBS = -L. -lc-utils -lsqlite3 -lcurl -lcmocka -lpthread
+TEST_LIBS = -L. -lc-utils -lsqlite3 -lcurl -lcrypto -lcmocka -lpthread
 
 tests/%: tests/%.c $(LIB)
 	$(CC) $(TEST_CFLAGS) $< -o $@ $(TEST_LIBS)
