@@ -19,6 +19,7 @@ SRCS     = src/error.c \
            src/config_yaml.c \
            src/log.c \
            src/push.c \
+           src/error_loop.c \
            lib/cJSON/cJSON.c
 OBJS     = $(SRCS:.c=.o)
 
