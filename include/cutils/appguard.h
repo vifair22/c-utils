@@ -58,6 +58,14 @@ appguard_t *appguard_init(const appguard_config_t *cfg);
 /* Graceful shutdown in reverse order. Safe to call multiple times. */
 void appguard_shutdown(appguard_t *guard);
 
+/* Clean restart: graceful shutdown then exec's the process with original argv.
+ * Call appguard_set_argv() early in main() to enable this.
+ * Does not return on success. Returns -1 if argv was not set. */
+int appguard_restart(appguard_t *guard);
+
+/* Store argc/argv for restart. Call once from main() before appguard_init(). */
+void appguard_set_argv(int argc, char **argv);
+
 /* Get the config handle for reading config values. */
 cutils_config_t *appguard_config(appguard_t *guard);
 

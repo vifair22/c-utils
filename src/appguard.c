@@ -5,6 +5,7 @@
 #include "cutils/log.h"
 #include "cutils/push.h"
 
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,10 @@ struct appguard {
     int              log_started;
     int              shutdown_called;
 };
+
+/* Saved argv for restart */
+static int    saved_argc = 0;
+static char **saved_argv = NULL;
 
 /* --- Signal handling --- */
 
@@ -191,6 +196,36 @@ void appguard_shutdown(appguard_t *guard)
 
     signal_guard = NULL;
     free(guard);
+}
+
+/* --- Restart --- */
+
+void appguard_set_argv(int argc, char **argv)
+{
+    saved_argc = argc;
+    saved_argv = argv;
+}
+
+int appguard_restart(appguard_t *guard)
+{
+    if (!saved_argv || saved_argc < 1) {
+        fprintf(stderr, "appguard_restart: argv not set (call appguard_set_argv first)\n");
+        return -1;
+    }
+
+    log_info("restarting: %s", saved_argv[0]);
+
+    appguard_shutdown(guard);
+
+    /* Reset signal handlers to default before exec */
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+
+    execv(saved_argv[0], saved_argv);
+
+    /* execv only returns on failure */
+    fprintf(stderr, "appguard_restart: execv failed: %s\n", strerror(errno));
+    return -1;
 }
 
 /* --- Accessors --- */
