@@ -66,6 +66,12 @@ int db_savepoint_rollback(cutils_db_t *db, const char *name);
  * Already-applied migrations are verified by checksum; a mismatch is a
  * fatal error. New migrations are applied within savepoints for rollback. */
 
+/* Compiled migration entry. Terminate arrays with { NULL, NULL }. */
+typedef struct {
+    const char *name;  /* e.g. "001_users.sql" — used as tracking key */
+    const char *sql;   /* full SQL text */
+} db_migration_t;
+
 /* Run compiled-in library migrations (_lib/ prefix).
  * Called internally by appguard_init(). */
 int db_run_lib_migrations(cutils_db_t *db);
@@ -73,5 +79,10 @@ int db_run_lib_migrations(cutils_db_t *db);
 /* Run file-based app migrations from a directory of numbered .sql files.
  * Files are applied in lexical order. NULL migrations_dir is a no-op. */
 int db_run_app_migrations(cutils_db_t *db, const char *migrations_dir);
+
+/* Run compiled-in app migrations. The array must be NULL-terminated.
+ * Names should match .sql filenames for compatibility with file-based tracking.
+ * NULL migrations is a no-op. */
+int db_run_compiled_migrations(cutils_db_t *db, const db_migration_t *migrations);
 
 #endif

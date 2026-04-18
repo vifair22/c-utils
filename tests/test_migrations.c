@@ -201,6 +201,130 @@ static void test_null_dir_is_noop(void **state)
     db_close(db);
 }
 
+/* --- Compiled migration tests --- */
+
+static const db_migration_t compiled_migrations[] = {
+    {
+        "001_widgets.sql",
+        "CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT NOT NULL);"
+    },
+    {
+        "002_gadgets.sql",
+        "CREATE TABLE gadgets (id INTEGER PRIMARY KEY, widget_id INTEGER,"
+        " FOREIGN KEY (widget_id) REFERENCES widgets(id));"
+    },
+    { NULL, NULL }
+};
+
+static void test_compiled_migrations(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    db_run_lib_migrations(db);
+
+    assert_int_equal(db_run_compiled_migrations(db, compiled_migrations), CUTILS_OK);
+
+    /* Verify tables created */
+    db_result_t *result = NULL;
+    db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='widgets'",
+               NULL, &result);
+    assert_int_equal(result->nrows, 1);
+    db_result_free(result);
+
+    result = NULL;
+    db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='gadgets'",
+               NULL, &result);
+    assert_int_equal(result->nrows, 1);
+    db_result_free(result);
+
+    db_close(db);
+}
+
+static void test_compiled_migrations_idempotent(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    db_run_lib_migrations(db);
+
+    assert_int_equal(db_run_compiled_migrations(db, compiled_migrations), CUTILS_OK);
+    assert_int_equal(db_run_compiled_migrations(db, compiled_migrations), CUTILS_OK);
+
+    /* Count — should be exactly 2 (no _lib/ prefix) */
+    db_result_t *result = NULL;
+    db_execute(db,
+        "SELECT COUNT(*) FROM system_migrations WHERE filename NOT LIKE '_lib/%'",
+        NULL, &result);
+    assert_int_equal(result->nrows, 1);
+    assert_int_equal(atoi(result->rows[0][0]), 2);
+    db_result_free(result);
+
+    db_close(db);
+}
+
+static void test_compiled_migrations_checksum_mismatch(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    db_run_lib_migrations(db);
+
+    assert_int_equal(db_run_compiled_migrations(db, compiled_migrations), CUTILS_OK);
+
+    /* Run with same name but different SQL */
+    static const db_migration_t tampered[] = {
+        {
+            "001_widgets.sql",
+            "CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT, color TEXT);"
+        },
+        { NULL, NULL }
+    };
+    assert_int_not_equal(db_run_compiled_migrations(db, tampered), CUTILS_OK);
+
+    db_close(db);
+}
+
+static void test_compiled_migrations_null_is_noop(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_run_compiled_migrations(db, NULL), CUTILS_OK);
+    db_close(db);
+}
+
+static void test_compiled_and_file_migrations_coexist(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    db_run_lib_migrations(db);
+
+    /* Run compiled migrations first */
+    assert_int_equal(db_run_compiled_migrations(db, compiled_migrations), CUTILS_OK);
+
+    /* Then file-based migrations */
+    write_migration("003_extras.sql",
+        "CREATE TABLE extras (id INTEGER PRIMARY KEY, data TEXT);");
+    assert_int_equal(db_run_app_migrations(db, TEST_MIG_DIR), CUTILS_OK);
+
+    /* All three app tables should exist */
+    db_result_t *result = NULL;
+    db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='widgets'",
+               NULL, &result);
+    assert_int_equal(result->nrows, 1);
+    db_result_free(result);
+
+    result = NULL;
+    db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='extras'",
+               NULL, &result);
+    assert_int_equal(result->nrows, 1);
+    db_result_free(result);
+
+    db_close(db);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -211,6 +335,11 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_checksum_mismatch_fails, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failed_migration_rolls_back, setup, teardown),
         cmocka_unit_test_setup_teardown(test_null_dir_is_noop, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_compiled_migrations, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_compiled_migrations_idempotent, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_compiled_migrations_checksum_mismatch, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_compiled_migrations_null_is_noop, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_compiled_and_file_migrations_coexist, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -109,7 +109,20 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
         return NULL;
     }
 
-    /* Step 5: Run app migrations */
+    /* Step 5a: Run compiled-in app migrations */
+    if (cfg->migrations) {
+        rc = db_run_compiled_migrations(guard->db, cfg->migrations);
+        if (rc != CUTILS_OK) {
+            fprintf(stderr, "appguard: compiled migrations failed: %s\n",
+                    cutils_get_error());
+            db_close(guard->db);
+            config_free(guard->config);
+            free(guard);
+            return NULL;
+        }
+    }
+
+    /* Step 5b: Run file-based app migrations */
     if (cfg->migrations_dir) {
         rc = db_run_app_migrations(guard->db, cfg->migrations_dir);
         if (rc != CUTILS_OK) {
