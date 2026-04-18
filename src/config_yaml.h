@@ -8,8 +8,13 @@
  *   section:
  *     key: value
  *     key: value with spaces
+ *     key: value  # inline comment (stripped)
+ *     key: "value with # hash"  (quoted to preserve #)
  *
- * Values are always strings. No quoting, no multiline, no flow syntax.
+ * Values are always strings. No multiline, no flow syntax, no anchors.
+ * Inline comments (" # ...") are stripped unless the value is quoted.
+ * Double quotes around a value are removed during parse.
+ * Values containing " #" are auto-quoted on write for safe roundtrip.
  * Comments and blank lines are preserved during mutation. */
 
 #include <stddef.h>

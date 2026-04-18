@@ -22,6 +22,51 @@ static const char *skip_whitespace(const char *s)
     return s;
 }
 
+/* Strip inline comment and extract quoted values.
+ * For unquoted values: strips " # ..." when # is preceded by whitespace.
+ * For quoted values: extracts content between quotes, ignores trailing comment.
+ * Modifies in place. */
+static void strip_comment_and_unquote(char *s)
+{
+    /* Quoted value: extract content between quotes */
+    if (s[0] == '"') {
+        char *close = strchr(s + 1, '"');
+        if (close) {
+            size_t len = (size_t)(close - s - 1);
+            memmove(s, s + 1, len);
+            s[len] = '\0';
+            return;
+        }
+        /* No closing quote — treat as literal (leave as-is) */
+        return;
+    }
+
+    /* Unquoted value: strip " #" inline comment */
+    char *p = s;
+    while (*p) {
+        if (*p == '#' && (p == s || *(p - 1) == ' ' || *(p - 1) == '\t')) {
+            /* Trim the comment and trailing whitespace before it */
+            if (p > s) p--;
+            while (p > s && (*(p - 1) == ' ' || *(p - 1) == '\t')) p--;
+            *p = '\0';
+            return;
+        }
+        p++;
+    }
+}
+
+/* Check if a value needs quoting for safe roundtrip (contains " #"). */
+static int needs_quoting(const char *value)
+{
+    const char *p = value;
+    while (*p) {
+        if (*p == '#' && p > value && (*(p - 1) == ' ' || *(p - 1) == '\t'))
+            return 1;
+        p++;
+    }
+    return 0;
+}
+
 static void doc_add_entry(yaml_doc_t *doc, const char *section,
                           const char *key, const char *value)
 {
@@ -87,6 +132,8 @@ yaml_doc_t *yaml_parse_file(const char *path)
             if (tlen >= sizeof(secbuf)) tlen = sizeof(secbuf) - 1;
             memcpy(secbuf, trimmed, tlen);
             secbuf[tlen] = '\0';
+            strip_comment_and_unquote(secbuf);
+            strip_trailing_whitespace(secbuf);
             char *colon = strchr(secbuf, ':');
             if (colon && (*(colon + 1) == '\0' || *(colon + 1) == ' ')) {
                 const char *after = skip_whitespace(colon + 1);
@@ -106,8 +153,10 @@ yaml_doc_t *yaml_parse_file(const char *path)
             if (colon) {
                 *colon = '\0';
                 char *key = kvbuf;
-                const char *val = skip_whitespace(colon + 1);
+                char *val = (char *)skip_whitespace(colon + 1);
                 strip_trailing_whitespace(key);
+                strip_comment_and_unquote(val);
+                strip_trailing_whitespace(val);
                 doc_add_entry(doc, current_section, key, val);
             }
         }
@@ -223,8 +272,12 @@ int yaml_set(yaml_doc_t *doc, const char *dotkey, const char *value)
                     /* Reconstruct the line preserving indentation */
                     size_t indent = (size_t)(trimmed - line);
                     char newline[1024];
-                    snprintf(newline, sizeof(newline), "%.*s%s: %s",
-                             (int)indent, line, key, value);
+                    if (needs_quoting(value))
+                        snprintf(newline, sizeof(newline), "%.*s%s: \"%s\"",
+                                 (int)indent, line, key, value);
+                    else
+                        snprintf(newline, sizeof(newline), "%.*s%s: %s",
+                                 (int)indent, line, key, value);
                     free(doc->lines[i]);
                     doc->lines[i] = strdup(newline);
                     break;
@@ -303,10 +356,14 @@ int yaml_generate_template(const char *path,
         if (keys[i].description && keys[i].description[0])
             fprintf(f, "  # %s\n", keys[i].description);
 
-        if (keys[i].default_value && keys[i].default_value[0])
-            fprintf(f, "  %s: %s\n", subkey, keys[i].default_value);
-        else
+        if (keys[i].default_value && keys[i].default_value[0]) {
+            if (needs_quoting(keys[i].default_value))
+                fprintf(f, "  %s: \"%s\"\n", subkey, keys[i].default_value);
+            else
+                fprintf(f, "  %s: %s\n", subkey, keys[i].default_value);
+        } else {
             fprintf(f, "  %s:\n", subkey);
+        }
     }
 
     fclose(f);
