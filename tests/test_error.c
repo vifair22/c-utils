@@ -67,6 +67,23 @@ static void test_set_error_errno_appends(void **state)
     assert_non_null(strstr(msg, "No such file"));
 }
 
+static void test_err_name_unknown(void **state)
+{
+    (void)state;
+    /* Cast an invalid code to hit the default branch */
+    assert_string_equal(cutils_err_name((cutils_err_t)999), "ERR_UNKNOWN");
+    assert_string_equal(cutils_err_name((cutils_err_t)-99), "ERR_UNKNOWN");
+}
+
+static void test_err_name_all_codes(void **state)
+{
+    (void)state;
+    assert_string_equal(cutils_err_name(CUTILS_ERR_NOMEM), "ERR_NOMEM");
+    assert_string_equal(cutils_err_name(CUTILS_ERR_MIGRATE), "ERR_MIGRATE");
+    assert_string_equal(cutils_err_name(CUTILS_ERR_INVALID), "ERR_INVALID");
+    assert_string_equal(cutils_err_name(CUTILS_ERR_EXISTS), "ERR_EXISTS");
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -77,6 +94,8 @@ int main(void)
         cmocka_unit_test(test_error_overwrite),
         cmocka_unit_test(test_err_name),
         cmocka_unit_test(test_set_error_errno_appends),
+        cmocka_unit_test(test_err_name_unknown),
+        cmocka_unit_test(test_err_name_all_codes),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
