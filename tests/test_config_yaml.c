@@ -583,6 +583,194 @@ static void test_set_with_comments_between_sections(void **state)
     yaml_free(doc);
 }
 
+/* --- Inline comment stripping --- */
+
+static void test_parse_inline_comment(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML,
+        "db:\n"
+        "  path: test.db  # database file\n"
+        "  timeout: 5000 # milliseconds\n");
+
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    assert_string_equal(yaml_get(doc, "db.path"), "test.db");
+    assert_string_equal(yaml_get(doc, "db.timeout"), "5000");
+    yaml_free(doc);
+}
+
+static void test_parse_hash_without_space_preserved(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML,
+        "app:\n"
+        "  url: http://example.com/page#anchor\n"
+        "  tag: v1.0#beta\n");
+
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    /* No space before #, so it's part of the value */
+    assert_string_equal(yaml_get(doc, "app.url"), "http://example.com/page#anchor");
+    assert_string_equal(yaml_get(doc, "app.tag"), "v1.0#beta");
+    yaml_free(doc);
+}
+
+static void test_parse_value_is_only_comment(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML,
+        "db:\n"
+        "  path: # this is just a comment\n");
+
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    /* Everything after ": " is " # ...", which should strip to empty */
+    assert_string_equal(yaml_get(doc, "db.path"), "");
+    yaml_free(doc);
+}
+
+static void test_parse_section_with_inline_comment(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML,
+        "db: # database config\n"
+        "  path: test.db\n");
+
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    /* Section header should be recognized despite inline comment */
+    assert_string_equal(yaml_get(doc, "db.path"), "test.db");
+    yaml_free(doc);
+}
+
+/* --- Quoted value support --- */
+
+static void test_parse_quoted_value(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML,
+        "app:\n"
+        "  name: \"my app\"\n"
+        "  desc: \"has # hash in it\"\n");
+
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    assert_string_equal(yaml_get(doc, "app.name"), "my app");
+    assert_string_equal(yaml_get(doc, "app.desc"), "has # hash in it");
+    yaml_free(doc);
+}
+
+static void test_parse_quoted_empty(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML,
+        "app:\n"
+        "  empty: \"\"\n");
+
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    assert_string_equal(yaml_get(doc, "app.empty"), "");
+    yaml_free(doc);
+}
+
+static void test_parse_unmatched_quote(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML,
+        "app:\n"
+        "  broken: \"unterminated\n");
+
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    /* Unmatched quote is kept as literal */
+    assert_string_equal(yaml_get(doc, "app.broken"), "\"unterminated");
+    yaml_free(doc);
+}
+
+static void test_parse_quoted_value_with_trailing_comment(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML,
+        "app:\n"
+        "  name: \"quoted\" # comment after\n");
+
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    /* Quoted value should not have the inline comment stripped from inside,
+       but the comment after the closing quote is in the raw line.
+       Since the value starts with ", strip_inline_comment skips it,
+       and strip_quotes removes the quotes. */
+    assert_string_equal(yaml_get(doc, "app.name"), "quoted");
+    yaml_free(doc);
+}
+
+/* --- Set with value that needs quoting --- */
+
+static void test_set_value_with_hash(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML,
+        "app:\n"
+        "  desc: old\n");
+
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+
+    /* Set a value that contains " #" — should be quoted on write */
+    yaml_set(doc, "app.desc", "has # hash");
+    assert_string_equal(yaml_get(doc, "app.desc"), "has # hash");
+
+    /* Write and re-parse — should roundtrip correctly */
+    yaml_write_file(doc, TEST_YAML);
+    yaml_free(doc);
+
+    yaml_doc_t *doc2 = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc2);
+    assert_string_equal(yaml_get(doc2, "app.desc"), "has # hash");
+    yaml_free(doc2);
+}
+
+static void test_set_value_without_hash(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML,
+        "app:\n"
+        "  name: old\n");
+
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+
+    /* Normal value — should NOT be quoted */
+    yaml_set(doc, "app.name", "new value");
+    yaml_write_file(doc, TEST_YAML);
+    yaml_free(doc);
+
+    yaml_doc_t *doc2 = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc2);
+    assert_string_equal(yaml_get(doc2, "app.name"), "new value");
+    yaml_free(doc2);
+}
+
+/* --- Template generation with hash in default --- */
+
+static void test_generate_template_hash_in_default(void **state)
+{
+    (void)state;
+    const config_key_t keys[] = {
+        { "app.tag", CFG_STRING, "v1.0 # beta", "Version tag",
+          CFG_STORE_FILE, 0 },
+        { NULL, 0, NULL, NULL, 0, 0 }
+    };
+
+    assert_int_equal(yaml_generate_template(TEST_YAML, keys, 1, NULL, 0), 0);
+
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    assert_string_equal(yaml_get(doc, "app.tag"), "v1.0 # beta");
+    yaml_free(doc);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -615,6 +803,17 @@ int main(void)
         cmocka_unit_test_teardown(test_parse_bare_word_no_colon, teardown),
         cmocka_unit_test_teardown(test_parse_section_trailing_space, teardown),
         cmocka_unit_test_teardown(test_set_with_comments_between_sections, teardown),
+        cmocka_unit_test_teardown(test_parse_inline_comment, teardown),
+        cmocka_unit_test_teardown(test_parse_hash_without_space_preserved, teardown),
+        cmocka_unit_test_teardown(test_parse_value_is_only_comment, teardown),
+        cmocka_unit_test_teardown(test_parse_section_with_inline_comment, teardown),
+        cmocka_unit_test_teardown(test_parse_quoted_value, teardown),
+        cmocka_unit_test_teardown(test_parse_quoted_empty, teardown),
+        cmocka_unit_test_teardown(test_parse_unmatched_quote, teardown),
+        cmocka_unit_test_teardown(test_parse_quoted_value_with_trailing_comment, teardown),
+        cmocka_unit_test_teardown(test_set_value_with_hash, teardown),
+        cmocka_unit_test_teardown(test_set_value_without_hash, teardown),
+        cmocka_unit_test_teardown(test_generate_template_hash_in_default, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
