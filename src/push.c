@@ -42,20 +42,23 @@ static size_t discard_cb(void *ptr, size_t size, size_t nmemb, void *userdata)
 
 static int split_and_store(const char *title, const char *message,
                            const char *token, const char *user,
-                           int ttl, int timestamp)
+                           int ttl, int timestamp, int html, int priority)
 {
     size_t msglen = strlen(message);
-    char ts_str[32], ttl_str[16];
+    char ts_str[32], ttl_str[16], html_str[4], pri_str[4];
     snprintf(ts_str, sizeof(ts_str), "%d", timestamp);
     snprintf(ttl_str, sizeof(ttl_str), "%d", ttl);
+    snprintf(html_str, sizeof(html_str), "%d", html);
+    snprintf(pri_str, sizeof(pri_str), "%d", priority);
 
     if (msglen <= MAX_MSG_CHARS) {
         const char *params[] = {
-            ts_str, token, user, ttl_str, message, title, NULL
+            ts_str, token, user, ttl_str, message, title,
+            html_str, pri_str, NULL
         };
         return db_execute_non_query(push_db,
-            "INSERT INTO push (timestamp, token, user, ttl, message, title, failed) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0)",
+            "INSERT INTO push (timestamp, token, user, ttl, message, title, "
+            "failed, html, priority) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
             params, NULL);
     }
 
@@ -98,11 +101,12 @@ static int split_and_store(const char *title, const char *message,
         snprintf(part_ts, sizeof(part_ts), "%d", timestamp + part);
 
         const char *params[] = {
-            part_ts, token, user, ttl_str, chunk, part_title, NULL
+            part_ts, token, user, ttl_str, chunk, part_title,
+            html_str, pri_str, NULL
         };
         int rc = db_execute_non_query(push_db,
-            "INSERT INTO push (timestamp, token, user, ttl, message, title, failed) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0)",
+            "INSERT INTO push (timestamp, token, user, ttl, message, title, "
+            "failed, html, priority) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
             params, NULL);
 
         free(chunk);
@@ -126,7 +130,8 @@ typedef enum {
 
 static send_result_t send_one(const char *token, const char *user,
                               const char *title, const char *message,
-                              const char *timestamp, const char *ttl)
+                              const char *timestamp, const char *ttl,
+                              int html, int priority)
 {
     int attempt = 0;
     int delay = BASE_DELAY_SEC;
@@ -143,12 +148,22 @@ static send_result_t send_one(const char *token, const char *user,
         char *enc_title = curl_easy_escape(curl, title, 0);
         char *enc_msg   = curl_easy_escape(curl, message, 0);
 
-        snprintf(postfields, sizeof(postfields),
+        int written = snprintf(postfields, sizeof(postfields),
                  "token=%s&user=%s&title=%s&message=%s&timestamp=%s&ttl=%s",
                  token, user,
                  enc_title ? enc_title : "",
                  enc_msg ? enc_msg : "",
                  timestamp, ttl);
+
+        if (html)
+            written += snprintf(postfields + written,
+                                sizeof(postfields) - (size_t)written,
+                                "&html=1");
+        if (priority != 0)
+            written += snprintf(postfields + written,
+                                sizeof(postfields) - (size_t)written,
+                                "&priority=%d", priority);
+        (void)written;
 
         curl_free(enc_title);
         curl_free(enc_msg);
@@ -203,7 +218,8 @@ static void *push_worker_thread(void *arg)
         while (1) {
             db_result_t *result = NULL;
             int rc = db_execute(push_db,
-                "SELECT rowid, timestamp, token, user, ttl, message, title "
+                "SELECT rowid, timestamp, token, user, ttl, message, title, "
+                "html, priority "
                 "FROM push WHERE failed = 0 ORDER BY timestamp LIMIT 1",
                 NULL, &result);
 
@@ -219,9 +235,11 @@ static void *push_worker_thread(void *arg)
             const char *ttl       = result->rows[0][4];
             const char *message   = result->rows[0][5];
             const char *title     = result->rows[0][6];
+            int html              = atoi(result->rows[0][7]);
+            int priority          = atoi(result->rows[0][8]);
 
             send_result_t sr = send_one(token, user, title, message,
-                                        timestamp, ttl);
+                                        timestamp, ttl, html, priority);
 
             if (sr == SEND_OK) {
                 const char *del_params[] = { rowid, NULL };
@@ -322,7 +340,8 @@ int push_send_opts(const push_opts_t *opts)
         return set_error(CUTILS_ERR_CONFIG, "Pushover credentials not configured");
 
     int rc = split_and_store(opts->title, opts->message,
-                             token, user, ttl, timestamp);
+                             token, user, ttl, timestamp,
+                             opts->html, opts->priority);
     if (rc != CUTILS_OK) return rc;
 
     /* Wake the worker */

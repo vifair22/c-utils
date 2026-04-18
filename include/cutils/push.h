@@ -35,7 +35,16 @@ typedef struct {
     int         timestamp;  /* unix epoch, default now */
     const char *token;      /* override config token */
     const char *user;       /* override config user */
+    int         priority;   /* -2..2 (0 = normal, see PUSH_PRIORITY_*) */
+    int         html;       /* 1 = enable HTML in message body */
 } push_opts_t;
+
+/* Pushover priority levels */
+#define PUSH_PRIORITY_LOWEST  (-2)  /* no notification/alert */
+#define PUSH_PRIORITY_LOW     (-1)  /* quiet, no sound/vibration */
+#define PUSH_PRIORITY_NORMAL    0   /* default */
+#define PUSH_PRIORITY_HIGH      1   /* bypasses quiet hours */
+#define PUSH_PRIORITY_EMERGENCY 2   /* repeats until acknowledged */
 
 /* Send with explicit options. Fields set to 0/NULL use defaults. */
 int push_send_opts(const push_opts_t *opts);

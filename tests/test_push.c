@@ -251,6 +251,136 @@ static void test_push_send_opts_partial_creds(void **state)
     free_fixture(&fix);
 }
 
+static void test_push_send_html_flag(void **state)
+{
+    (void)state;
+    push_fixture_t fix = make_fixture(1);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+
+    push_opts_t opts = {
+        .title = "HTML Test",
+        .message = "<b>Bold</b> message",
+        .html = 1,
+    };
+    assert_int_equal(push_send_opts(&opts), CUTILS_OK);
+
+    /* Verify html=1 was stored */
+    db_result_t *result = NULL;
+    db_execute(fix.db,
+        "SELECT html, priority FROM push WHERE title = 'HTML Test'",
+        NULL, &result);
+    assert_non_null(result);
+    assert_int_equal(result->nrows, 1);
+    assert_string_equal(result->rows[0][0], "1");
+    assert_string_equal(result->rows[0][1], "0");
+    db_result_free(result);
+
+    push_shutdown();
+    free_fixture(&fix);
+}
+
+static void test_push_send_priority(void **state)
+{
+    (void)state;
+    push_fixture_t fix = make_fixture(1);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+
+    push_opts_t opts = {
+        .title = "High Priority",
+        .message = "Urgent alert",
+        .priority = PUSH_PRIORITY_HIGH,
+    };
+    assert_int_equal(push_send_opts(&opts), CUTILS_OK);
+
+    db_result_t *result = NULL;
+    db_execute(fix.db,
+        "SELECT priority FROM push WHERE title = 'High Priority'",
+        NULL, &result);
+    assert_non_null(result);
+    assert_int_equal(result->nrows, 1);
+    assert_string_equal(result->rows[0][0], "1");
+    db_result_free(result);
+
+    push_shutdown();
+    free_fixture(&fix);
+}
+
+static void test_push_send_html_and_priority(void **state)
+{
+    (void)state;
+    push_fixture_t fix = make_fixture(1);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+
+    push_opts_t opts = {
+        .title = "Combined",
+        .message = "<font color=\"#ef4444\"><b>CRITICAL</b></font>",
+        .html = 1,
+        .priority = PUSH_PRIORITY_HIGH,
+    };
+    assert_int_equal(push_send_opts(&opts), CUTILS_OK);
+
+    db_result_t *result = NULL;
+    db_execute(fix.db,
+        "SELECT html, priority FROM push WHERE title = 'Combined'",
+        NULL, &result);
+    assert_non_null(result);
+    assert_int_equal(result->nrows, 1);
+    assert_string_equal(result->rows[0][0], "1");
+    assert_string_equal(result->rows[0][1], "1");
+    db_result_free(result);
+
+    push_shutdown();
+    free_fixture(&fix);
+}
+
+static void test_push_send_defaults_zero(void **state)
+{
+    (void)state;
+    push_fixture_t fix = make_fixture(1);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+
+    /* push_send uses zero-initialized opts — html and priority should be 0 */
+    assert_int_equal(push_send("Default", "Plain message"), CUTILS_OK);
+
+    db_result_t *result = NULL;
+    db_execute(fix.db,
+        "SELECT html, priority FROM push WHERE title = 'Default'",
+        NULL, &result);
+    assert_non_null(result);
+    assert_int_equal(result->nrows, 1);
+    assert_string_equal(result->rows[0][0], "0");
+    assert_string_equal(result->rows[0][1], "0");
+    db_result_free(result);
+
+    push_shutdown();
+    free_fixture(&fix);
+}
+
+static void test_push_send_negative_priority(void **state)
+{
+    (void)state;
+    push_fixture_t fix = make_fixture(1);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+
+    push_opts_t opts = {
+        .title = "Silent",
+        .message = "No alert",
+        .priority = PUSH_PRIORITY_LOWEST,
+    };
+    assert_int_equal(push_send_opts(&opts), CUTILS_OK);
+
+    db_result_t *result = NULL;
+    db_execute(fix.db,
+        "SELECT priority FROM push WHERE title = 'Silent'",
+        NULL, &result);
+    assert_non_null(result);
+    assert_string_equal(result->rows[0][0], "-2");
+    db_result_free(result);
+
+    push_shutdown();
+    free_fixture(&fix);
+}
+
 static void test_push_shutdown_without_init(void **state)
 {
     (void)state;
@@ -269,6 +399,11 @@ int main(void)
         cmocka_unit_test_teardown(test_push_send_opts_override, teardown),
         cmocka_unit_test_teardown(test_push_send_long_message_split, teardown),
         cmocka_unit_test_teardown(test_push_send_opts_partial_creds, teardown),
+        cmocka_unit_test_teardown(test_push_send_html_flag, teardown),
+        cmocka_unit_test_teardown(test_push_send_priority, teardown),
+        cmocka_unit_test_teardown(test_push_send_html_and_priority, teardown),
+        cmocka_unit_test_teardown(test_push_send_defaults_zero, teardown),
+        cmocka_unit_test_teardown(test_push_send_negative_priority, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
