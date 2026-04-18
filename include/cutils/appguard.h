@@ -15,7 +15,7 @@
  *   2. Validate required file keys
  *   3. Open DB
  *   4. Run lib migrations (compiled-in)
- *   5. Run app migrations (from .sql files)
+ *   5. Run app migrations (compiled-in and/or from .sql files)
  *   6. Attach DB config + seed defaults
  *   7. Start log writer thread
  *   8. Start push worker thread (if enabled)
@@ -43,7 +43,8 @@ typedef struct {
     int                     log_retention_days; /* 0 = no cleanup */
     log_level_t             log_level;       /* minimum log level */
 
-    /* App migrations */
+    /* App migrations (compiled runs first if both are set) */
+    const db_migration_t   *migrations;      /* compiled-in app migrations, NULL = none */
     const char             *migrations_dir;  /* path to app .sql migrations, NULL = none */
 } appguard_config_t;
 

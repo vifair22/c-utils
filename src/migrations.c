@@ -20,10 +20,7 @@ static void sha256_hex(const char *data, size_t len, char *out)
 
 /* --- Compiled-in library migrations --- */
 
-static const struct {
-    const char *name;
-    const char *sql;
-} lib_migrations[] = {
+static const db_migration_t lib_migrations[] = {
     {
         "001_config_table",
         "CREATE TABLE IF NOT EXISTS config ("
@@ -140,9 +137,10 @@ static int apply_migration(cutils_db_t *db, const char *tracked_name,
     return db_savepoint_release(db, sp_name);
 }
 
-/* --- Public API: run compiled-in library migrations --- */
+/* --- Shared: run a db_migration_t array with optional name prefix --- */
 
-int db_run_lib_migrations(cutils_db_t *db)
+static int run_migration_array(cutils_db_t *db, const db_migration_t *migrations,
+                               const char *prefix)
 {
     /* Ensure tracking table exists */
     int rc = db_exec_raw(db, TRACKING_TABLE_SQL);
@@ -151,13 +149,16 @@ int db_run_lib_migrations(cutils_db_t *db)
     rc = db_begin(db);
     if (rc != CUTILS_OK) return rc;
 
-    for (int i = 0; lib_migrations[i].name != NULL; i++) {
-        const char *name = lib_migrations[i].name;
-        const char *sql = lib_migrations[i].sql;
+    for (int i = 0; migrations[i].name != NULL; i++) {
+        const char *name = migrations[i].name;
+        const char *sql = migrations[i].sql;
 
-        /* Build tracked name with _lib/ prefix */
+        /* Build tracked name (with prefix if provided) */
         char tracked[256];
-        snprintf(tracked, sizeof(tracked), "_lib/%s", name);
+        if (prefix)
+            snprintf(tracked, sizeof(tracked), "%s%s", prefix, name);
+        else
+            snprintf(tracked, sizeof(tracked), "%s", name);
 
         /* Compute checksum */
         char checksum[65];
@@ -181,6 +182,21 @@ int db_run_lib_migrations(cutils_db_t *db)
     }
 
     return db_commit(db);
+}
+
+/* --- Public API: run compiled-in library migrations --- */
+
+int db_run_lib_migrations(cutils_db_t *db)
+{
+    return run_migration_array(db, lib_migrations, "_lib/");
+}
+
+/* --- Public API: run compiled-in app migrations --- */
+
+int db_run_compiled_migrations(cutils_db_t *db, const db_migration_t *migrations)
+{
+    if (!migrations) return CUTILS_OK;
+    return run_migration_array(db, migrations, NULL);
 }
 
 /* --- Public API: run file-based app migrations --- */
