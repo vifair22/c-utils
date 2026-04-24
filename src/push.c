@@ -3,6 +3,7 @@
 #include "cutils/db.h"
 #include "cutils/error.h"
 #include "cutils/log.h"
+#include "cutils/mem.h"
 
 #include <curl/curl.h>
 #include <pthread.h>
@@ -11,6 +12,25 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* File-local scoped cleanup for CURL resources. */
+static void curl_easy_cleanup_p(CURL **c)
+{
+    if (*c) {
+        curl_easy_cleanup(*c);
+        *c = NULL;
+    }
+}
+#define CUTILS_AUTO_CURL __attribute__((cleanup(curl_easy_cleanup_p)))
+
+static void curl_free_p(char **s)
+{
+    if (*s) {
+        curl_free(*s);
+        *s = NULL;
+    }
+}
+#define CUTILS_AUTO_CURLSTR __attribute__((cleanup(curl_free_p)))
 
 #define PUSHOVER_URL     "https://api.pushover.net/1/messages.json"
 #define MAX_MSG_CHARS    1024
@@ -92,7 +112,7 @@ static int split_and_store(const char *title, const char *message,
                  (int)title_len, title, suffix);
 
         /* Build chunk string */
-        char *chunk = malloc(chunk_len + 1);
+        CUTILS_AUTOFREE char *chunk = malloc(chunk_len + 1);
         if (!chunk) return set_error(CUTILS_ERR_NOMEM, "push split alloc");
         memcpy(chunk, remaining, chunk_len);
         chunk[chunk_len] = '\0';
@@ -109,7 +129,6 @@ static int split_and_store(const char *title, const char *message,
             "failed, html, priority) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
             params, NULL);
 
-        free(chunk);
         if (rc != CUTILS_OK) return rc;
 
         remaining += chunk_len;
@@ -137,7 +156,7 @@ static send_result_t send_one(const char *token, const char *user,
     int delay = BASE_DELAY_SEC;
 
     while (attempt < MAX_RETRIES) {
-        CURL *curl = curl_easy_init();
+        CUTILS_AUTO_CURL CURL *curl = curl_easy_init();
         if (!curl) return SEND_TRANSIENT_FAIL;
 
         curl_easy_setopt(curl, CURLOPT_URL, PUSHOVER_URL);
@@ -145,8 +164,8 @@ static send_result_t send_one(const char *token, const char *user,
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
 
         char postfields[4096];
-        char *enc_title = curl_easy_escape(curl, title, 0);
-        char *enc_msg   = curl_easy_escape(curl, message, 0);
+        CUTILS_AUTO_CURLSTR char *enc_title = curl_easy_escape(curl, title, 0);
+        CUTILS_AUTO_CURLSTR char *enc_msg   = curl_easy_escape(curl, message, 0);
 
         int written = snprintf(postfields, sizeof(postfields),
                  "token=%s&user=%s&title=%s&message=%s&timestamp=%s&ttl=%s",
@@ -165,15 +184,11 @@ static send_result_t send_one(const char *token, const char *user,
                                 "&priority=%d", priority);
         (void)written;
 
-        curl_free(enc_title);
-        curl_free(enc_msg);
-
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postfields);
 
         CURLcode res = curl_easy_perform(curl);
         long http_code = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        curl_easy_cleanup(curl);
 
         if (res == CURLE_OK && http_code >= 200 && http_code < 300)
             return SEND_OK;
@@ -206,27 +221,27 @@ static void *push_worker_thread(void *arg)
     (void)arg;
 
     while (1) {
-        pthread_mutex_lock(&push_mutex);
-        while (!push_notify && !push_stop)
-            pthread_cond_wait(&push_cond, &push_mutex);
+        int stopping;
+        {
+            CUTILS_LOCK_GUARD(&push_mutex);
+            while (!push_notify && !push_stop)
+                pthread_cond_wait(&push_cond, &push_mutex);
 
-        push_notify = 0;
-        int stopping = push_stop;
-        pthread_mutex_unlock(&push_mutex);
+            push_notify = 0;
+            stopping    = push_stop;
+        }
 
         /* Process unsent messages */
         while (1) {
-            db_result_t *result = NULL;
+            CUTILS_AUTO_DBRES db_result_t *result = NULL;
             int rc = db_execute(push_db,
                 "SELECT rowid, timestamp, token, user, ttl, message, title, "
                 "html, priority "
                 "FROM push WHERE failed = 0 ORDER BY timestamp LIMIT 1",
                 NULL, &result);
 
-            if (rc != CUTILS_OK || !result || result->nrows == 0) {
-                db_result_free(result);
+            if (rc != CUTILS_OK || !result || result->nrows == 0)
                 break;
-            }
 
             const char *rowid     = result->rows[0][0];
             const char *timestamp = result->rows[0][1];
@@ -259,8 +274,6 @@ static void *push_worker_thread(void *arg)
                 log_warn("push transient failure, will retry: %s", title);
                 break; /* Back off, try again next cycle */
             }
-
-            db_result_free(result);
         }
 
         if (stopping) break;
@@ -305,11 +318,12 @@ void push_shutdown(void)
     if (!push_running) return;
     push_running = 0;
 
-    pthread_mutex_lock(&push_mutex);
-    push_stop = 1;
-    push_notify = 1;
-    pthread_cond_signal(&push_cond);
-    pthread_mutex_unlock(&push_mutex);
+    {
+        CUTILS_LOCK_GUARD(&push_mutex);
+        push_stop = 1;
+        push_notify = 1;
+        pthread_cond_signal(&push_cond);
+    }
 
     pthread_join(push_thread, NULL);
     curl_global_cleanup();
@@ -348,10 +362,11 @@ int push_send_opts(const push_opts_t *opts)
     if (rc != CUTILS_OK) return rc;
 
     /* Wake the worker */
-    pthread_mutex_lock(&push_mutex);
-    push_notify = 1;
-    pthread_cond_signal(&push_cond);
-    pthread_mutex_unlock(&push_mutex);
+    {
+        CUTILS_LOCK_GUARD(&push_mutex);
+        push_notify = 1;
+        pthread_cond_signal(&push_cond);
+    }
 
     return CUTILS_OK;
 }
