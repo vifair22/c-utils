@@ -299,6 +299,45 @@ static void test_auto_db_tx_commit_is_idempotent(void **state)
     db_close(db);
 }
 
+static void test_auto_db_tx_immediate_commit_persists(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE tx (v TEXT)"), CUTILS_OK);
+
+    {
+        CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+        assert_int_equal(cutils_db_tx_begin_immediate(db, &tx), CUTILS_OK);
+        assert_int_equal(
+            db_exec_raw(db, "INSERT INTO tx VALUES ('committed')"), CUTILS_OK);
+        assert_int_equal(db_tx_commit(&tx), CUTILS_OK);
+    }
+
+    assert_int_equal(count_rows(db), 1);
+    db_close(db);
+}
+
+static void test_auto_db_tx_immediate_rolls_back_on_early_return(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE tx (v TEXT)"), CUTILS_OK);
+
+    for (int i = 0; i < 1; i++) {
+        CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+        assert_int_equal(cutils_db_tx_begin_immediate(db, &tx), CUTILS_OK);
+        assert_int_equal(
+            db_exec_raw(db, "INSERT INTO tx VALUES ('dropped')"), CUTILS_OK);
+        break;
+    }
+
+    assert_int_equal(count_rows(db), 0);
+    db_close(db);
+}
+
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -314,6 +353,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_auto_db_tx_commit_persists, setup, teardown),
         cmocka_unit_test_setup_teardown(test_auto_db_tx_rolls_back_on_early_return, setup, teardown),
         cmocka_unit_test_setup_teardown(test_auto_db_tx_commit_is_idempotent, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_auto_db_tx_immediate_commit_persists, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_auto_db_tx_immediate_rolls_back_on_early_return, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
