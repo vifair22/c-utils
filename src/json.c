@@ -2,6 +2,9 @@
 #include "cutils/error.h"
 #include "cutils/mem.h"
 
+/* This translation unit IS the wrapper; the fence in cJSON.h exists to
+ * keep downstream consumers out of it, not us. */
+#define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
 
 #include <math.h>

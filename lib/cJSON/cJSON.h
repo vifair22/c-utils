@@ -23,6 +23,20 @@
 #ifndef cJSON__h
 #define cJSON__h
 
+/* --- c-utils fence --------------------------------------------------------
+ * cJSON is vendored here as an implementation detail of cutils/json.h.
+ * Downstream code should use cutils/json.h and never touch cJSON directly —
+ * the wrapper's ownership rules make entire bug classes (borrowed-valuestring
+ * UAFs, partial-tree leaks) structurally impossible.
+ *
+ * Legitimate direct cJSON usage (top-level-array parsing, external JSON
+ * parse, pretty-printed CLI output) is still possible but must be explicit:
+ * #define CUTILS_CJSON_ALLOW before the include, so the exception shows up
+ * in code review. */
+#ifndef CUTILS_CJSON_ALLOW
+#error "cJSON.h is internal to cutils/json.h. Use the wrapper instead, or #define CUTILS_CJSON_ALLOW before including this header if you genuinely need direct cJSON access."
+#endif
+
 #ifdef __cplusplus
 extern "C"
 {
