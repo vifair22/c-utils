@@ -1,5 +1,6 @@
 #include "cutils/db.h"
 #include "cutils/error.h"
+#include "cutils/mem.h"
 
 #include <sqlite3.h>
 #include <pthread.h>
@@ -11,6 +12,16 @@ struct cutils_db {
     sqlite3        *conn;
     pthread_mutex_t mutex;
 };
+
+/* File-local scoped cleanup for SQLite prepared statements. */
+static void sqlite3_stmt_finalize_p(sqlite3_stmt **s)
+{
+    if (*s) {
+        sqlite3_finalize(*s);
+        *s = NULL;
+    }
+}
+#define CUTILS_AUTO_STMT __attribute__((cleanup(sqlite3_stmt_finalize_p)))
 
 /* --- Internal helpers --- */
 
@@ -78,32 +89,30 @@ int db_execute(cutils_db_t *db, const char *sql, const char **params,
                db_result_t **result)
 {
     *result = NULL;
-    pthread_mutex_lock(&db->mutex);
+    CUTILS_LOCK_GUARD(&db->mutex);
+    CUTILS_AUTO_STMT sqlite3_stmt *stmt = NULL;
 
-    sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db->conn, sql, -1, &stmt, NULL);
-    if (rc != SQLITE_OK) {
-        pthread_mutex_unlock(&db->mutex);
+    if (rc != SQLITE_OK)
         return set_error(CUTILS_ERR_DB, "prepare: %s", sqlite3_errmsg(db->conn));
-    }
 
     rc = bind_params(stmt, params);
-    if (rc != CUTILS_OK) {
-        sqlite3_finalize(stmt);
-        pthread_mutex_unlock(&db->mutex);
-        return rc;
-    }
+    if (rc != CUTILS_OK) return rc;
 
     int ncols = sqlite3_column_count(stmt);
 
-    /* Collect rows into a dynamic array */
+    /* Collect rows into a dynamic array. rows and col_names are owned
+     * locally until success, then transferred into the result struct. */
     int capacity = 16;
-    int nrows = 0;
-    char ***rows = calloc((size_t)capacity, sizeof(char **));
+    int nrows    = 0;
+    char ***rows      = calloc((size_t)capacity, sizeof(char **));
+    char  **col_names = NULL;
+    db_result_t *res  = NULL;
+    int err           = CUTILS_OK;
+
     if (!rows) {
-        sqlite3_finalize(stmt);
-        pthread_mutex_unlock(&db->mutex);
-        return set_error(CUTILS_ERR_NOMEM, "db_execute: row array alloc failed");
+        err = set_error(CUTILS_ERR_NOMEM, "db_execute: row array alloc failed");
+        goto fail;
     }
 
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
@@ -111,29 +120,18 @@ int db_execute(cutils_db_t *db, const char *sql, const char **params,
             capacity *= 2;
             char ***tmp = realloc(rows, (size_t)capacity * sizeof(char **));
             if (!tmp) {
-                /* Free already-collected rows */
-                for (int r = 0; r < nrows; r++) {
-                    for (int c = 0; c < ncols; c++) free(rows[r][c]);
-                    free(rows[r]);
-                }
-                free(rows);
-                sqlite3_finalize(stmt);
-                pthread_mutex_unlock(&db->mutex);
-                return set_error(CUTILS_ERR_NOMEM, "db_execute: row realloc failed");
+                err = set_error(CUTILS_ERR_NOMEM,
+                                "db_execute: row realloc failed");
+                goto fail;
             }
             rows = tmp;
         }
 
         char **row = calloc((size_t)ncols, sizeof(char *));
         if (!row) {
-            for (int r = 0; r < nrows; r++) {
-                for (int c = 0; c < ncols; c++) free(rows[r][c]);
-                free(rows[r]);
-            }
-            free(rows);
-            sqlite3_finalize(stmt);
-            pthread_mutex_unlock(&db->mutex);
-            return set_error(CUTILS_ERR_NOMEM, "db_execute: column alloc failed");
+            err = set_error(CUTILS_ERR_NOMEM,
+                            "db_execute: column alloc failed");
+            goto fail;
         }
 
         for (int c = 0; c < ncols; c++) {
@@ -145,99 +143,84 @@ int db_execute(cutils_db_t *db, const char *sql, const char **params,
     }
 
     if (rc != SQLITE_DONE) {
-        for (int r = 0; r < nrows; r++) {
-            for (int c = 0; c < ncols; c++) free(rows[r][c]);
-            free(rows[r]);
-        }
-        free(rows);
-        sqlite3_finalize(stmt);
-        pthread_mutex_unlock(&db->mutex);
-        return set_error(CUTILS_ERR_DB, "step: %s", sqlite3_errmsg(db->conn));
+        err = set_error(CUTILS_ERR_DB, "step: %s", sqlite3_errmsg(db->conn));
+        goto fail;
     }
 
     /* Build column names */
-    char **col_names = calloc((size_t)ncols, sizeof(char *));
+    col_names = calloc((size_t)ncols, sizeof(char *));
     if (col_names) {
         for (int c = 0; c < ncols; c++)
             col_names[c] = strdup(sqlite3_column_name(stmt, c));
     }
 
-    sqlite3_finalize(stmt);
-    pthread_mutex_unlock(&db->mutex);
-
-    db_result_t *res = calloc(1, sizeof(*res));
+    res = calloc(1, sizeof(*res));
     if (!res) {
-        for (int r = 0; r < nrows; r++) {
-            for (int c = 0; c < ncols; c++) free(rows[r][c]);
-            free(rows[r]);
-        }
-        free(rows);
-        if (col_names) {
-            for (int c = 0; c < ncols; c++) free(col_names[c]);
-            free(col_names);
-        }
-        return set_error(CUTILS_ERR_NOMEM, "db_execute: result alloc failed");
+        err = set_error(CUTILS_ERR_NOMEM, "db_execute: result alloc failed");
+        goto fail;
     }
 
-    res->rows = rows;
-    res->nrows = nrows;
-    res->ncols = ncols;
-    res->col_names = col_names;
+    res->rows      = CUTILS_MOVE(rows);
+    res->nrows     = nrows;
+    res->ncols     = ncols;
+    res->col_names = CUTILS_MOVE(col_names);
     *result = res;
-
     return CUTILS_OK;
+
+fail:
+    /* rows and col_names only non-NULL if they weren't moved into res. */
+    if (rows) {
+        for (int r = 0; r < nrows; r++) {
+            if (rows[r]) {
+                for (int c = 0; c < ncols; c++) free(rows[r][c]);
+                free(rows[r]);
+            }
+        }
+        free(rows);
+    }
+    if (col_names) {
+        for (int c = 0; c < ncols; c++) free(col_names[c]);
+        free(col_names);
+    }
+    return err;
 }
 
 int db_execute_non_query(cutils_db_t *db, const char *sql, const char **params,
                          int *affected)
 {
-    pthread_mutex_lock(&db->mutex);
+    CUTILS_LOCK_GUARD(&db->mutex);
+    CUTILS_AUTO_STMT sqlite3_stmt *stmt = NULL;
 
-    sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db->conn, sql, -1, &stmt, NULL);
-    if (rc != SQLITE_OK) {
-        pthread_mutex_unlock(&db->mutex);
+    if (rc != SQLITE_OK)
         return set_error(CUTILS_ERR_DB, "prepare: %s", sqlite3_errmsg(db->conn));
-    }
 
     rc = bind_params(stmt, params);
-    if (rc != CUTILS_OK) {
-        sqlite3_finalize(stmt);
-        pthread_mutex_unlock(&db->mutex);
-        return rc;
-    }
+    if (rc != CUTILS_OK) return rc;
 
     rc = sqlite3_step(stmt);
-    if (rc != SQLITE_DONE) {
-        int err = set_error(CUTILS_ERR_DB, "step: %s", sqlite3_errmsg(db->conn));
-        sqlite3_finalize(stmt);
-        pthread_mutex_unlock(&db->mutex);
-        return err;
-    }
+    if (rc != SQLITE_DONE)
+        return set_error(CUTILS_ERR_DB, "step: %s", sqlite3_errmsg(db->conn));
 
     if (affected)
         *affected = sqlite3_changes(db->conn);
-
-    sqlite3_finalize(stmt);
-    pthread_mutex_unlock(&db->mutex);
 
     return CUTILS_OK;
 }
 
 int db_exec_raw(cutils_db_t *db, const char *sql)
 {
-    pthread_mutex_lock(&db->mutex);
+    CUTILS_LOCK_GUARD(&db->mutex);
 
     char *errmsg = NULL;
     int rc = sqlite3_exec(db->conn, sql, NULL, NULL, &errmsg);
     if (rc != SQLITE_OK) {
-        int err = set_error(CUTILS_ERR_DB, "exec: %s", errmsg ? errmsg : "unknown");
+        int err = set_error(CUTILS_ERR_DB, "exec: %s",
+                            errmsg ? errmsg : "unknown");
         if (errmsg) sqlite3_free(errmsg);
-        pthread_mutex_unlock(&db->mutex);
         return err;
     }
 
-    pthread_mutex_unlock(&db->mutex);
     return CUTILS_OK;
 }
 
