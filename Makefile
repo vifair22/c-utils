@@ -44,7 +44,8 @@ SRCS     = src/error.c \
            src/log.c \
            src/push.c \
            src/error_loop.c \
-           src/appguard.c
+           src/appguard.c \
+           src/json.c
 VENDOR   = lib/cJSON/cJSON.c
 
 # Object files routed to build/
