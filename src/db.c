@@ -298,16 +298,27 @@ int db_savepoint_rollback(cutils_db_t *db, const char *name)
 
 /* --- Scoped transaction guard --- */
 
-int cutils_db_tx_begin(cutils_db_t *db, cutils_db_tx_t *tx)
+static int tx_begin_with_sql(cutils_db_t *db, cutils_db_tx_t *tx,
+                             const char *sql)
 {
     tx->db        = db;
     tx->active    = 0;
     tx->finalized = 0;
 
-    int rc = db_begin(db);
+    int rc = db_exec_raw(db, sql);
     if (rc == CUTILS_OK)
         tx->active = 1;
     return rc;
+}
+
+int cutils_db_tx_begin(cutils_db_t *db, cutils_db_tx_t *tx)
+{
+    return tx_begin_with_sql(db, tx, "BEGIN");
+}
+
+int cutils_db_tx_begin_immediate(cutils_db_t *db, cutils_db_tx_t *tx)
+{
+    return tx_begin_with_sql(db, tx, "BEGIN IMMEDIATE");
 }
 
 int db_tx_commit(cutils_db_tx_t *tx)

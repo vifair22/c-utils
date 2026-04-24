@@ -90,18 +90,33 @@ CUTILS_MUST_USE int db_rollback(cutils_db_t *db);
  *
  * Any early return triggers the cleanup, which rolls back. Explicit
  * commit marks the transaction finalized so the cleanup is a no-op.
- */
+ *
+ * Deferred vs. immediate: cutils_db_tx_begin issues plain BEGIN, which
+ * only takes a SHARED lock on the first read and upgrades on the first
+ * write. For read-modify-write sequences where two handlers could race
+ * (SELECT, SELECT, UPDATE, UPDATE), use cutils_db_tx_begin_immediate —
+ * it acquires RESERVED at BEGIN time, so the second caller blocks at
+ * BEGIN (respecting busy_timeout) and its SELECT observes the first
+ * caller's committed state. */
 typedef struct {
     cutils_db_t *db;
     int          active;     /* 1 if BEGIN succeeded */
     int          finalized;  /* 1 once commit or rollback has run */
 } cutils_db_tx_t;
 
-/* Begin a scoped transaction. Initializes *tx and issues BEGIN.
+/* Begin a scoped deferred transaction. Initializes *tx and issues BEGIN.
  * Returns CUTILS_OK on success; on failure, tx is left inactive and
  * the cleanup will be a no-op. */
 CUTILS_MUST_USE
 int cutils_db_tx_begin(cutils_db_t *db, cutils_db_tx_t *tx);
+
+/* Begin a scoped immediate transaction. Issues BEGIN IMMEDIATE, which
+ * takes a RESERVED lock up front. Use when the transaction performs a
+ * read-before-write (row merge, check-then-update) and must serialize
+ * against concurrent writers — deferred BEGIN cannot guarantee that the
+ * SELECT observes writes committed by a racing writer. */
+CUTILS_MUST_USE
+int cutils_db_tx_begin_immediate(cutils_db_t *db, cutils_db_tx_t *tx);
 
 /* Commit a scoped transaction. On success, marks tx finalized so the
  * cleanup does not roll back. Idempotent. Returns CUTILS_OK or the
