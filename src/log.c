@@ -234,6 +234,7 @@ static void enqueue_entry(const char *timestamp, log_level_t level,
     entry->next = NULL;
 
     /* If strdup failed, return with CUTILS_AUTOFREE handling entry. */
+    /* cppcheck-suppress memleak */
     if (!entry->message) return;
 
     CUTILS_LOCK_GUARD(&log_mutex);

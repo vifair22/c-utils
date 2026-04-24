@@ -156,6 +156,10 @@ int config_init(cutils_config_t **out,
                 const config_key_t *file_keys,
                 const config_section_t *sections)
 {
+    /* Every `return` below is covered by CUTILS_AUTO_CONFIG on `cfg`.
+     * cppcheck does not model the cleanup attribute — suppress its
+     * false-positive memleak warnings across this scope. */
+    /* cppcheck-suppress-begin memleak */
     CUTILS_AUTO_CONFIG cutils_config_t *cfg = calloc(1, sizeof(*cfg));
     if (!cfg)
         return set_error(CUTILS_ERR_NOMEM, "config_init: alloc failed");
@@ -247,9 +251,10 @@ int config_init(cutils_config_t **out,
                 "required config key '%s' is missing or empty", cfg->keys[i].key);
     }
 
-    /* Transfer ownership to caller — cleanup sees NULL and skips. */
+    /* Transfer ownership to caller; cleanup sees NULL and skips. */
     *out = CUTILS_MOVE(cfg);
     return CUTILS_OK;
+    /* cppcheck-suppress-end memleak */
 }
 
 void config_free(cutils_config_t *cfg)

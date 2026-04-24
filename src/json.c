@@ -673,6 +673,8 @@ int json_resp_new(cutils_json_resp_t **out)
     CUTILS_AUTO_JSON_RESP cutils_json_resp_t *r = calloc(1, sizeof(*r));
     if (!r) return set_error(CUTILS_ERR_NOMEM, "resp alloc failed");
     r->root = cJSON_CreateObject();
+    /* CUTILS_AUTO_JSON_RESP frees r on any return. */
+    /* cppcheck-suppress memleak */
     if (!r->root) return set_error(CUTILS_ERR_NOMEM, "cJSON alloc failed");
     *out = CUTILS_MOVE(r);
     return CUTILS_OK;

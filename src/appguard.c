@@ -81,6 +81,11 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
         return NULL;
     }
 
+    /* All `return NULL;` statements below are covered by the cleanup
+     * attribute on `guard`. cppcheck does not model __attribute__((cleanup))
+     * so suppress its false-positive memleak warnings for this scope. */
+    /* cppcheck-suppress-begin memleak */
+
     /* Step 1-2: Config file (parse or generate + validate) */
     int rc = config_init(&guard->config,
                          cfg->app_name,
@@ -179,6 +184,7 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
 
     /* All steps succeeded — caller takes ownership. */
     return CUTILS_MOVE(guard);
+    /* cppcheck-suppress-end memleak */
 }
 
 /* --- Shutdown --- */
