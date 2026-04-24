@@ -36,6 +36,7 @@ VENDOR_RELAX = -Wno-conversion -Wno-sign-conversion -Wno-cast-qual \
 
 # Source files
 SRCS     = src/error.c \
+           src/mem.c \
            src/db.c \
            src/migrations.c \
            src/config.c \
