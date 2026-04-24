@@ -312,3 +312,40 @@ int db_savepoint_rollback(cutils_db_t *db, const char *name)
     snprintf(sql, sizeof(sql), "ROLLBACK TO SAVEPOINT %s", name);
     return db_exec_raw(db, sql);
 }
+
+/* --- Scoped transaction guard --- */
+
+int cutils_db_tx_begin(cutils_db_t *db, cutils_db_tx_t *tx)
+{
+    tx->db        = db;
+    tx->active    = 0;
+    tx->finalized = 0;
+
+    int rc = db_begin(db);
+    if (rc == CUTILS_OK)
+        tx->active = 1;
+    return rc;
+}
+
+int db_tx_commit(cutils_db_tx_t *tx)
+{
+    if (!tx || !tx->active || tx->finalized)
+        return CUTILS_OK;
+
+    int rc = db_commit(tx->db);
+    if (rc == CUTILS_OK)
+        tx->finalized = 1;
+    return rc;
+}
+
+void cutils_db_tx_end_p(cutils_db_tx_t *tx)
+{
+    if (!tx) return;
+    if (tx->active && !tx->finalized) {
+        /* Rollback can fail (e.g. DB closed underneath us); not much we
+         * can do in a cleanup handler. Silently attempt and move on. */
+        (void)db_rollback(tx->db);
+    }
+    tx->active    = 0;
+    tx->finalized = 1;
+}

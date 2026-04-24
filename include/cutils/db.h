@@ -68,6 +68,45 @@ int db_begin(cutils_db_t *db);
 int db_commit(cutils_db_t *db);
 int db_rollback(cutils_db_t *db);
 
+/* --- Scoped transaction guard ---
+ *
+ * Pairs BEGIN with an automatic ROLLBACK on scope exit unless
+ * db_tx_commit() has been called. Eliminates the common bug where
+ * an early return leaves a transaction dangling.
+ *
+ *   CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+ *   if (cutils_db_tx_begin(db, &tx) != CUTILS_OK) return -1;
+ *
+ *   if (db_execute_non_query(db, sql1, p1, NULL) != CUTILS_OK) return -1;
+ *   if (db_execute_non_query(db, sql2, p2, NULL) != CUTILS_OK) return -1;
+ *
+ *   return db_tx_commit(&tx);
+ *
+ * Any early return triggers the cleanup, which rolls back. Explicit
+ * commit marks the transaction finalized so the cleanup is a no-op.
+ */
+typedef struct {
+    cutils_db_t *db;
+    int          active;     /* 1 if BEGIN succeeded */
+    int          finalized;  /* 1 once commit or rollback has run */
+} cutils_db_tx_t;
+
+/* Begin a scoped transaction. Initializes *tx and issues BEGIN.
+ * Returns CUTILS_OK on success; on failure, tx is left inactive and
+ * the cleanup will be a no-op. */
+int cutils_db_tx_begin(cutils_db_t *db, cutils_db_tx_t *tx);
+
+/* Commit a scoped transaction. On success, marks tx finalized so the
+ * cleanup does not roll back. Idempotent. Returns CUTILS_OK or the
+ * underlying db_commit error. */
+int db_tx_commit(cutils_db_tx_t *tx);
+
+/* Cleanup helper invoked by CUTILS_AUTO_DB_TX.
+ * Rolls back the transaction if it was begun and never finalized. */
+void cutils_db_tx_end_p(cutils_db_tx_t *tx);
+
+#define CUTILS_AUTO_DB_TX __attribute__((cleanup(cutils_db_tx_end_p)))
+
 /* Savepoint management (used by migration runner) */
 int db_savepoint(cutils_db_t *db, const char *name);
 int db_savepoint_release(cutils_db_t *db, const char *name);
