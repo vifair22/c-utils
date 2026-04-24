@@ -1319,6 +1319,8 @@ int save_pair(cutils_db_t *db, const char *a, const char *b)
 
 `db_tx_commit` is idempotent. If it succeeds, it marks the transaction finalized so the cleanup attribute skips the rollback.
 
+`cutils_db_tx_begin` issues a deferred `BEGIN`. For a read-modify-write sequence (SELECT the current row, merge an incoming patch, UPDATE) two concurrent handlers can both pass the SELECT and race their UPDATEs. Use `cutils_db_tx_begin_immediate` instead — it issues `BEGIN IMMEDIATE`, which takes a RESERVED lock up front, so the second handler blocks at `BEGIN` (respecting the busy_timeout) and its SELECT observes the first handler's committed state. If the transaction only performs writes, the two behave identically.
+
 ### Ownership transfer — `CUTILS_MOVE`
 
 `CUTILS_MOVE(p)` returns the current value of `p` and assigns `NULL` to `p`. Useful when a pointer's ownership is passing to something else — a container, an out-parameter, another subsystem.
