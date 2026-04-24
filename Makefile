@@ -132,7 +132,6 @@ analyze: check
 	    base=$$(basename $$f .c); \
 	    $(CC) $(ANALYZE_CFLAGS) -fstack-usage -c $$f \
 	        -o $(BUILD_DIR)/analyze/$$base.o 2>/dev/null; \
-	    mv -f $$(basename $$f .c).su $(BUILD_DIR)/analyze/ 2>/dev/null; \
 	done
 	@fail=0; for su in $(BUILD_DIR)/analyze/*.su; do \
 	    [ -f "$$su" ] || continue; \
