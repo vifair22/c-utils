@@ -960,6 +960,122 @@ static void test_elem_f64_nonfinite_rejected(void **state)
 }
 
 /* ============================================================ */
+/* Array-root responses & ensure_array                           */
+/* ============================================================ */
+
+static void test_resp_new_array_finalizes_to_empty_array(void **state)
+{
+    (void)state;
+    cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
+    assert_int_equal(json_resp_new_array(&resp), CUTILS_OK);
+
+    char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
+    size_t len = 0;
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
+    assert_string_equal(buf, "[]");
+    assert_int_equal(len, 2);
+}
+
+static void test_resp_new_array_append_scalars(void **state)
+{
+    (void)state;
+    cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
+    assert_int_equal(json_resp_new_array(&resp), CUTILS_OK);
+
+    /* Empty path ("") targets the root array. */
+    assert_int_equal(json_resp_array_append_str (resp, "", "a"),   CUTILS_OK);
+    assert_int_equal(json_resp_array_append_u32 (resp, "", 42U),   CUTILS_OK);
+    assert_int_equal(json_resp_array_append_bool(resp, "", true),  CUTILS_OK);
+
+    char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
+    size_t len = 0;
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
+    assert_string_equal(buf, "[\"a\",42,true]");
+}
+
+static void test_resp_new_array_append_objects(void **state)
+{
+    (void)state;
+    cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
+    assert_int_equal(json_resp_new_array(&resp), CUTILS_OK);
+
+    const char *names[] = {"a", "b"};
+    for (int i = 0; i < 2; i++) {
+        cutils_json_elem_t elem __attribute__((cleanup(json_elem_commit_p)));
+        assert_int_equal(json_resp_array_append_begin(resp, "", &elem), CUTILS_OK);
+        assert_int_equal(json_elem_add_str(&elem, "name", names[i]),    CUTILS_OK);
+        assert_int_equal(json_elem_add_i32(&elem, "n",    i),           CUTILS_OK);
+        json_elem_commit(&elem);
+    }
+
+    char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
+    size_t len = 0;
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
+    assert_string_equal(buf, "[{\"name\":\"a\",\"n\":0},{\"name\":\"b\",\"n\":1}]");
+}
+
+static void test_resp_new_array_rejects_path_based_add(void **state)
+{
+    (void)state;
+    cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
+    assert_int_equal(json_resp_new_array(&resp), CUTILS_OK);
+
+    /* An array root has no named fields; set_at_path must fail. */
+    assert_int_equal(json_resp_add_str(resp, "field", "value"), CUTILS_ERR_JSON);
+}
+
+static void test_resp_ensure_array_creates_empty(void **state)
+{
+    (void)state;
+    cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
+
+    assert_int_equal(json_resp_ensure_array(resp, "xs"), CUTILS_OK);
+
+    char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
+    size_t len = 0;
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
+    assert_string_equal(buf, "{\"xs\":[]}");
+}
+
+static void test_resp_ensure_array_idempotent(void **state)
+{
+    (void)state;
+    cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
+    assert_int_equal(json_resp_array_append_u32(resp, "xs", 1U), CUTILS_OK);
+    assert_int_equal(json_resp_ensure_array(resp, "xs"),          CUTILS_OK);
+
+    char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
+    size_t len = 0;
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
+    /* Existing content must survive an ensure_array call. */
+    assert_string_equal(buf, "{\"xs\":[1]}");
+}
+
+static void test_resp_ensure_array_rejects_non_array(void **state)
+{
+    (void)state;
+    cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
+    assert_int_equal(json_resp_add_str(resp, "x", "str"),   CUTILS_OK);
+    assert_int_equal(json_resp_ensure_array(resp, "x"),     CUTILS_ERR_JSON);
+}
+
+static void test_resp_ensure_array_nested_path(void **state)
+{
+    (void)state;
+    cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
+    assert_int_equal(json_resp_ensure_array(resp, "errors.general_detail"), CUTILS_OK);
+
+    char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
+    size_t len = 0;
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
+    assert_string_equal(buf, "{\"errors\":{\"general_detail\":[]}}");
+}
+
+/* ============================================================ */
 /* End-to-end                                                    */
 /* ============================================================ */
 
@@ -1238,6 +1354,24 @@ int main(void)
         cmocka_unit_test_setup(test_elem_f64_nonfinite_rejected, setup_clear_error),
 
         /* End-to-end + robustness */
+        /* Array-root and ensure_array */
+        cmocka_unit_test_setup(test_resp_new_array_finalizes_to_empty_array,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_resp_new_array_append_scalars,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_resp_new_array_append_objects,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_resp_new_array_rejects_path_based_add,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_resp_ensure_array_creates_empty,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_resp_ensure_array_idempotent,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_resp_ensure_array_rejects_non_array,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_resp_ensure_array_nested_path,
+                                                                 setup_clear_error),
+
         cmocka_unit_test_setup(test_roundtrip_complex,           setup_clear_error),
         cmocka_unit_test_setup(test_null_arg_robustness,         setup_clear_error),
 
