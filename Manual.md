@@ -1228,7 +1228,168 @@ CREATE TABLE system_migrations (
 
 ---
 
-## 12. Build System
+## 12. Memory Safety Helpers
+
+c-utils leans on a small set of GCC/Clang extensions to remove the most common classes of leak, use-after-free, and "forgot to unlock the mutex" bugs by construction. Everything in this section lives in `cutils/mem.h` — it's imported by every subsystem header, so the macros are available anywhere `<cutils.h>` has been included.
+
+### The underlying mechanism
+
+All scoped cleanup in c-utils is built on `__attribute__((cleanup(...)))`, a GCC/Clang extension that runs a function when a local variable goes out of scope — via `return`, `break`, `goto`, or normal fall-through. The cleanup always runs, whichever exit path is taken. This is the same primitive that systemd's `_cleanup_*` macros and a number of other C projects rely on.
+
+Ownership handoff is expressed via `CUTILS_MOVE`, a macro that evaluates a pointer, nulls the source, and yields the original value. If the caller accidentally reuses the moved-from pointer, the result is a loud null-deref rather than a silent use-after-free.
+
+### Scoped cleanup macros
+
+Declare a variable with one of these attributes and the matching cleanup runs automatically on scope exit.
+
+| Macro | Frees | Typical use |
+|-------|-------|-------------|
+| `CUTILS_AUTOFREE` | `free()` on any malloc'd pointer | `char *`, `uint8_t *`, allocated structs |
+| `CUTILS_AUTOCLOSE` | `fclose()` on a `FILE *` | Opened files |
+| `CUTILS_AUTOCLOSE_FD` | `close()` on an int fd (if `>= 0`) | Sockets, directory fds |
+| `CUTILS_LOCK_GUARD(m)` | `pthread_mutex_unlock()` | Scoped mutex lock |
+| `CUTILS_AUTO_DBRES` | `db_result_free()` | `db_result_t *` from `db_execute` |
+| `CUTILS_AUTO_DB_TX` | `db_rollback()` unless committed | Scoped DB transaction |
+| `CUTILS_AUTO_JSON_REQ` | `json_req_free()` | `cutils_json_req_t *` |
+| `CUTILS_AUTO_JSON_RESP` | `json_resp_free()` | `cutils_json_resp_t *` |
+| `CUTILS_AUTO_JSON_ITER` | `json_iter_end()` | Stack-allocated `cutils_json_iter_t` |
+| `CUTILS_AUTO_JSON_ELEM` | Discard if not committed | Stack-allocated `cutils_json_elem_t` |
+| `CUTILS_AUTO_ERRLOOP` | `error_loop_free()` | `error_loop_t *` |
+
+#### Basic usage — `CUTILS_AUTOFREE`
+
+```c
+int process_record(int id)
+{
+    CUTILS_AUTOFREE char *buf = malloc(1024);
+    if (!buf) return -1;
+
+    if (step_one(buf) != 0) return -1;   /* buf freed automatically */
+    if (step_two(buf) != 0) return -1;   /* buf freed automatically */
+
+    return 0;                             /* buf freed automatically */
+}
+```
+
+No `free(buf)` on any exit path. Add another early return later and you still can't leak.
+
+#### Scoped mutex — `CUTILS_LOCK_GUARD`
+
+```c
+void do_work(pthread_mutex_t *m)
+{
+    CUTILS_LOCK_GUARD(m);                 /* locked here, unlocked on exit */
+    if (error_condition) return;          /* unlocked automatically */
+    do_stuff();
+}
+```
+
+Do not call `pthread_mutex_unlock` manually on a mutex protected by `CUTILS_LOCK_GUARD` within the guarded scope — the cleanup will fire a second unlock on exit.
+
+When you need to release the lock partway through a function (common for "drain queue under lock, then do work without lock"), put the locked section in a block scope:
+
+```c
+log_entry_t *batch;
+{
+    CUTILS_LOCK_GUARD(&queue_mutex);
+    batch = queue_head;
+    queue_head = NULL;
+}
+/* lock released; process batch without holding it */
+while (batch) { ... }
+```
+
+#### Scoped transaction — `CUTILS_AUTO_DB_TX`
+
+The most bug-prone pattern in DB code is forgetting `db_rollback` on an early return. `CUTILS_AUTO_DB_TX` makes rollback the default and commit explicit:
+
+```c
+int save_pair(cutils_db_t *db, const char *a, const char *b)
+{
+    CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+    int rc = cutils_db_tx_begin(db, &tx);
+    if (rc != CUTILS_OK) return rc;
+
+    if ((rc = insert(db, a)) != CUTILS_OK) return rc;  /* auto-rollback */
+    if ((rc = insert(db, b)) != CUTILS_OK) return rc;  /* auto-rollback */
+
+    return db_tx_commit(&tx);                           /* commit */
+}
+```
+
+`db_tx_commit` is idempotent. If it succeeds, it marks the transaction finalized so the cleanup attribute skips the rollback.
+
+### Ownership transfer — `CUTILS_MOVE`
+
+`CUTILS_MOVE(p)` returns the current value of `p` and assigns `NULL` to `p`. Useful when a pointer's ownership is passing to something else — a container, an out-parameter, another subsystem.
+
+```c
+int make_widget(widget_t **out)
+{
+    CUTILS_AUTOFREE widget_t *w = calloc(1, sizeof(*w));
+    if (!w) return -1;
+
+    if (load(w) != 0) return -1;           /* w freed on return */
+
+    *out = CUTILS_MOVE(w);                 /* w is NULL now; caller owns it */
+    return 0;                               /* cleanup is a no-op */
+}
+```
+
+If you later add code after `CUTILS_MOVE(w)` that tries to read `w`, you get a null-deref at runtime rather than a use-after-free. Loud beats silent.
+
+`CUTILS_MOVE` evaluates its argument twice — once to read, once to assign `NULL`. Do not pass expressions with side effects (`CUTILS_MOVE(array[i++])`).
+
+### Compile-time attributes
+
+Three convenience macros wrap GCC/Clang function attributes. They cost nothing at runtime; they just make the compiler warn about misuse at call sites.
+
+| Macro | Attribute | Purpose |
+|-------|-----------|---------|
+| `CUTILS_MUST_USE` | `warn_unused_result` | Caller must not discard the return value |
+| `CUTILS_NONNULL(n, ...)` | `nonnull(n, ...)` | Listed parameter positions can't be NULL |
+| `CUTILS_MALLOC_FN` | `malloc` | Return is a fresh, unaliased pointer |
+
+Every c-utils public function that returns a status code or owned pointer is declared `CUTILS_MUST_USE`. A caller that writes `db_execute(db, sql, NULL, &r);` without checking the return gets a compile warning.
+
+### Intentionally discarding a must-use return — `CUTILS_UNUSED`
+
+The plain `(void)` cast does not silence `warn_unused_result` in GCC. On the rare occasion where you genuinely cannot act on a failure — typically in a cleanup handler for an already-errored flow — use `CUTILS_UNUSED(expr)`:
+
+```c
+void cleanup(cutils_db_t *db)
+{
+    /* Already in the error path; rollback failure is not actionable. */
+    CUTILS_UNUSED(db_rollback(db));
+}
+```
+
+Leave a comment justifying every use. If you're reaching for `CUTILS_UNUSED` more than occasionally, the function probably shouldn't be `CUTILS_MUST_USE` to begin with.
+
+### Interaction with `goto`
+
+C forbids a `goto` from jumping forward past a declaration with a `cleanup` attribute. If you're mixing scoped cleanup with `goto cleanup`-style labels, declare cleanup-attributed variables either:
+
+- Inside a narrower scope that ends before the `goto`, or
+- Outside the range of any `goto cleanup;` — typically at the top of the function.
+
+c-utils uses both patterns; `src/migrations.c`'s `db_run_app_migrations` is a good example of declaring `CUTILS_AUTO_DB_TX tx = { 0 };` early so `goto cleanup;` statements from the directory-walk loop don't jump past it.
+
+### Dogfooding
+
+c-utils uses these macros throughout its own implementation. A non-exhaustive tour:
+
+- `db_execute` collapses five duplicate cleanup blocks into one `goto fail` using `CUTILS_LOCK_GUARD` and `CUTILS_AUTO_STMT` (file-local).
+- `db_run_app_migrations` uses `CUTILS_AUTO_DIR`, `CUTILS_AUTOCLOSE`, `CUTILS_AUTOFREE`, and `CUTILS_AUTO_DB_TX` together.
+- `config_init` uses a file-local `CUTILS_AUTO_CONFIG` + `CUTILS_MOVE` to transfer ownership to the out-parameter on success.
+- `appguard_init` uses `CUTILS_AUTO_APPGUARD` so any partial initialization failure triggers the existing idempotent shutdown sequence.
+- `push.c`'s worker uses `CUTILS_AUTO_DBRES`, `CUTILS_AUTO_CURL`, and `CUTILS_AUTO_CURLSTR` for per-send resource cleanup.
+
+The pattern for subsystem-local cleanup helpers (DIR, CURL, sqlite3_stmt, etc.) is to declare the cleanup function and macro `static` at the top of the `.c` file rather than exposing them in the public headers — this keeps the library's public surface minimal.
+
+---
+
+## 13. Build System
 
 ### Makefile targets
 
