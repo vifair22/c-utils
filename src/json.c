@@ -1,11 +1,22 @@
 #include "cutils/json.h"
 #include "cutils/error.h"
+#include "cutils/mem.h"
 
 #include "cJSON.h"
 
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* File-local scoped cleanup for cJSON trees. */
+static void cjson_delete_p(cJSON **p)
+{
+    if (*p) {
+        cJSON_Delete(*p);
+        *p = NULL;
+    }
+}
+#define CUTILS_AUTO_CJSON __attribute__((cleanup(cjson_delete_p)))
 
 /* ============================================================ */
 /* Internal types                                                */
@@ -382,27 +393,22 @@ int json_req_parse(const char *buf, size_t len, cutils_json_req_t **out)
     *out = NULL;
     if (!buf) return set_error(CUTILS_ERR_INVALID, "null buf");
 
-    cJSON *root = cJSON_ParseWithLength(buf, len);
+    CUTILS_AUTO_CJSON cJSON *root = cJSON_ParseWithLength(buf, len);
     if (!root) {
         const char *errp = cJSON_GetErrorPtr();
-        if (errp && *errp) {
+        if (errp && *errp)
             return set_error(CUTILS_ERR_JSON,
                              "JSON parse failed near: %.32s", errp);
-        }
         return set_error(CUTILS_ERR_JSON, "JSON parse failed");
     }
-    if (!cJSON_IsObject(root)) {
-        cJSON_Delete(root);
+    if (!cJSON_IsObject(root))
         return set_error(CUTILS_ERR_JSON, "JSON root is not an object");
-    }
 
-    cutils_json_req_t *req = calloc(1, sizeof(*req));
-    if (!req) {
-        cJSON_Delete(root);
-        return set_error(CUTILS_ERR_NOMEM, "req alloc failed");
-    }
-    req->root = root;
-    *out = req;
+    CUTILS_AUTO_JSON_REQ cutils_json_req_t *req = calloc(1, sizeof(*req));
+    if (!req) return set_error(CUTILS_ERR_NOMEM, "req alloc failed");
+
+    req->root = CUTILS_MOVE(root);    /* req owns root now */
+    *out      = CUTILS_MOVE(req);     /* caller owns req now */
     return CUTILS_OK;
 }
 
@@ -664,14 +670,11 @@ int json_resp_new(cutils_json_resp_t **out)
     if (!out) return set_error(CUTILS_ERR_INVALID, "null out");
     *out = NULL;
 
-    cutils_json_resp_t *r = calloc(1, sizeof(*r));
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *r = calloc(1, sizeof(*r));
     if (!r) return set_error(CUTILS_ERR_NOMEM, "resp alloc failed");
     r->root = cJSON_CreateObject();
-    if (!r->root) {
-        free(r);
-        return set_error(CUTILS_ERR_NOMEM, "cJSON alloc failed");
-    }
-    *out = r;
+    if (!r->root) return set_error(CUTILS_ERR_NOMEM, "cJSON alloc failed");
+    *out = CUTILS_MOVE(r);
     return CUTILS_OK;
 }
 
