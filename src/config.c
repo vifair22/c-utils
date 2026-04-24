@@ -36,6 +36,18 @@ static const config_section_t cutils_internal_sections[] = {
 
 /* --- Config handle --- */
 
+/* Per-key cache of DB-fetched values. One entry per key ever read; the
+ * list grows monotonically through the config's lifetime. Gives each key
+ * its own stable buffer so callers can hold `const char *` across other
+ * config_get_* calls — the original shared-buffer design silently
+ * aliased pointers when two DB-backed keys were read in sequence (see
+ * db_val_cache_get below for the mechanism). */
+typedef struct db_val_cache {
+    char                *key;
+    char                *value;  /* strdup'd from DB result */
+    struct db_val_cache *next;
+} db_val_cache_t;
+
 struct cutils_config {
     char           *app_name;      /* for env var prefix */
     char           *env_prefix;    /* uppercase: "AIRIES_UPS" */
@@ -56,6 +68,14 @@ struct cutils_config {
 
     /* DB handle (attached after DB init, NULL until then) */
     cutils_db_t    *db;
+
+    /* Per-key cache for DB-fetched values — see db_val_cache_t comment.
+     * Held through one level of indirection so a `const cutils_config_t *`
+     * caller can still mutate `*db_cache_head` (prepend a slot) without
+     * needing a const-cast on cfg: writing through the inner pointer
+     * doesn't modify the struct, it modifies the heap memory the struct
+     * points to. Allocated in config_init, freed in config_free. */
+    db_val_cache_t **db_cache_head;
 };
 
 /* --- Helpers --- */
@@ -167,8 +187,10 @@ int config_init(cutils_config_t **out,
     cfg->app_name = strdup(app_name);
     cfg->env_prefix = make_env_prefix(app_name);
     cfg->config_path = strdup(config_path ? config_path : "config.yaml");
+    cfg->db_cache_head = calloc(1, sizeof(*cfg->db_cache_head));
 
-    if (!cfg->app_name || !cfg->env_prefix || !cfg->config_path)
+    if (!cfg->app_name || !cfg->env_prefix || !cfg->config_path ||
+        !cfg->db_cache_head)
         return set_error(CUTILS_ERR_NOMEM, "config_init: string alloc failed");
 
     /* Register internal keys and sections */
@@ -266,13 +288,59 @@ void config_free(cutils_config_t *cfg)
     free(cfg->keys);
     free(cfg->sections);
     yaml_free(cfg->doc);
+
+    /* Walk and free the per-key DB value cache. */
+    if (cfg->db_cache_head) {
+        db_val_cache_t *e = *cfg->db_cache_head;
+        while (e) {
+            db_val_cache_t *next = e->next;
+            free(e->key);
+            free(e->value);
+            free(e);
+            e = next;
+        }
+        free(cfg->db_cache_head);
+    }
+
     free(cfg);
 }
 
 /* --- DB config integration --- */
 
-/* Thread-local buffer for DB config reads (avoids alloc/free churn) */
-static _Thread_local char db_val_buf[1024];
+/* Find the cache slot for `key`, creating it if missing. Returns NULL on
+ * allocation failure. The slot's `value` pointer is stable for the
+ * config's lifetime (or until the same slot is refreshed via this
+ * helper), so callers can safely hold the returned string across other
+ * config_get_* calls on different keys. */
+static db_val_cache_t *db_val_cache_slot(const cutils_config_t *cfg, const char *key)
+{
+    if (!cfg->db_cache_head) return NULL;
+    for (db_val_cache_t *e = *cfg->db_cache_head; e; e = e->next)
+        if (strcmp(e->key, key) == 0) return e;
+
+    db_val_cache_t *slot = calloc(1, sizeof(*slot));
+    if (!slot) return NULL;
+    slot->key = strdup(key);
+    if (!slot->key) { free(slot); return NULL; }
+    slot->next          = *cfg->db_cache_head;
+    *cfg->db_cache_head = slot;
+    return slot;
+}
+
+/* Invalidate (but don't remove) a cached value — the slot stays so
+ * future lookups still hit the same pointer. Called from config_set_db
+ * so the next config_get_str refetches. */
+static void db_val_cache_invalidate(const cutils_config_t *cfg, const char *key)
+{
+    if (!cfg->db_cache_head) return;
+    for (db_val_cache_t *e = *cfg->db_cache_head; e; e = e->next) {
+        if (strcmp(e->key, key) == 0) {
+            free(e->value);
+            e->value = NULL;
+            return;
+        }
+    }
+}
 
 static const char *config_get_from_db(const cutils_config_t *cfg, const char *key)
 {
@@ -286,8 +354,17 @@ static const char *config_get_from_db(const cutils_config_t *cfg, const char *ke
     if (rc != CUTILS_OK || !result || result->nrows == 0)
         return NULL;
 
-    snprintf(db_val_buf, sizeof(db_val_buf), "%s", result->rows[0][0]);
-    return db_val_buf;
+    /* Store into a per-key slot so each key has its own stable buffer.
+     * The slot is reached through cfg->db_cache_head (heap-allocated),
+     * so writing through it does not violate cfg's const-ness. */
+    db_val_cache_t *slot = db_val_cache_slot(cfg, key);
+    if (!slot) return NULL;
+
+    char *fresh = strdup(result->rows[0][0]);
+    if (!fresh) return NULL;
+    free(slot->value);
+    slot->value = fresh;
+    return slot->value;
 }
 
 int config_attach_db(cutils_config_t *cfg, cutils_db_t *db,
@@ -487,6 +564,11 @@ int config_set_db(cutils_config_t *cfg, const char *key, const char *value)
             "key '%s' is file-backed, use config_set()", key);
 
     const char *params[] = { value, key, NULL };
-    return db_execute_non_query(cfg->db,
+    int rc = db_execute_non_query(cfg->db,
         "UPDATE config SET value = ? WHERE key = ?", params, NULL);
+    if (rc != CUTILS_OK) return rc;
+
+    /* Drop any cached read so the next config_get_str refetches. */
+    db_val_cache_invalidate(cfg, key);
+    return CUTILS_OK;
 }

@@ -721,6 +721,63 @@ static void test_db_key_types(void **state)
     config_free(cfg);
 }
 
+/* Regression test: a previous implementation of config_get_from_db wrote
+ * into a single shared thread-local buffer, so reading two DB-backed
+ * keys in a row silently aliased the pointers — the saved pointer to
+ * the first value ended up pointing at the second key's value after the
+ * second read. This test pins the correct behavior. */
+static void test_get_db_str_stable_across_reads(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG, "db:\n  path: test.db\n");
+
+    cutils_config_t *cfg = NULL;
+    assert_int_equal(config_init(&cfg, "testapp", TEST_CFG,
+                                 CFG_FIRST_RUN_CONTINUE, NULL, NULL), CUTILS_OK);
+
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
+
+    const config_key_t db_keys[] = {
+        { "mode",  CFG_STRING, "command", "", CFG_STORE_DB, 0 },
+        { "delay", CFG_STRING, "5",       "", CFG_STORE_DB, 0 },
+        { NULL, 0, NULL, NULL, 0, 0 }
+    };
+    assert_int_equal(config_attach_db(cfg, db, db_keys), CUTILS_OK);
+
+    assert_int_equal(config_set_db(cfg, "mode",  "register"), CUTILS_OK);
+    assert_int_equal(config_set_db(cfg, "delay", "120"),      CUTILS_OK);
+
+    /* The aliasing bug shape: save the first read, do a second read,
+     * assert the first pointer still reads the first key's value. */
+    const char *mode = config_get_str(cfg, "mode");
+    assert_non_null(mode);
+    assert_string_equal(mode, "register");
+
+    const char *delay = config_get_str(cfg, "delay");
+    assert_non_null(delay);
+    assert_string_equal(delay, "120");
+
+    /* After the delay read, mode's pointer must still resolve to
+     * "register" — not "120". */
+    assert_string_equal(mode, "register");
+
+    /* And the two reads must hand back distinct pointers, not aliases
+     * into a shared buffer. */
+    assert_ptr_not_equal(mode, delay);
+
+    /* config_set_db invalidates the cache, and a subsequent read returns
+     * the refreshed value. The returned pointer may differ from the
+     * previous one (new strdup), but the slot remains stable. */
+    assert_int_equal(config_set_db(cfg, "mode", "none"), CUTILS_OK);
+    const char *mode2 = config_get_str(cfg, "mode");
+    assert_string_equal(mode2, "none");
+
+    db_close(db);
+    config_free(cfg);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -751,6 +808,7 @@ int main(void)
         cmocka_unit_test_teardown(test_env_prefix_special_chars, teardown),
         cmocka_unit_test_teardown(test_duplicate_section, teardown),
         cmocka_unit_test_teardown(test_db_key_types, teardown),
+        cmocka_unit_test_teardown(test_get_db_str_stable_across_reads, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
