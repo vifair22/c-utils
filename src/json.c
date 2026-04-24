@@ -680,6 +680,27 @@ int json_resp_new(cutils_json_resp_t **out)
     return CUTILS_OK;
 }
 
+int json_resp_new_array(cutils_json_resp_t **out)
+{
+    if (!out) return set_error(CUTILS_ERR_INVALID, "null out");
+    *out = NULL;
+
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *r = calloc(1, sizeof(*r));
+    if (!r) return set_error(CUTILS_ERR_NOMEM, "resp alloc failed");
+    r->root = cJSON_CreateArray();
+    /* cppcheck-suppress memleak */
+    if (!r->root) return set_error(CUTILS_ERR_NOMEM, "cJSON alloc failed");
+    *out = CUTILS_MOVE(r);
+    return CUTILS_OK;
+}
+
+int json_resp_ensure_array(cutils_json_resp_t *resp, const char *path)
+{
+    if (!resp || !path) return set_error(CUTILS_ERR_INVALID, "null arg");
+    cJSON *arr = NULL;
+    return ensure_array_at(resp->root, path, &arr);
+}
+
 void json_resp_free(cutils_json_resp_t *resp)
 {
     if (!resp) return;

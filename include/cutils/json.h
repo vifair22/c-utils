@@ -165,6 +165,36 @@ int  json_iter_get_bool(const cutils_json_iter_t *iter, const char *path, bool *
 CUTILS_MUST_USE
 int  json_resp_new     (cutils_json_resp_t **out);
 
+/* Allocate a response builder whose root is an empty array. Use for
+ * APIs that need to emit a bare top-level JSON array (e.g. event lists,
+ * telemetry points). Append to the root array with empty-string path:
+ *
+ *   CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
+ *   json_resp_new_array(&resp);
+ *   for (...) {
+ *       CUTILS_AUTO_JSON_ELEM cutils_json_elem_t e;
+ *       json_resp_array_append_begin(resp, "", &e);
+ *       json_elem_add_str(&e, "name", ...);
+ *       json_elem_commit(&e);
+ *   }
+ *
+ * Path-based scalar adders (json_resp_add_str with a non-empty path)
+ * fail on array-root responses because an array cannot hold named
+ * fields. */
+CUTILS_MUST_USE
+int  json_resp_new_array(cutils_json_resp_t **out);
+
+/* Ensure that an array exists at `path`, creating an empty one if
+ * absent. Idempotent: succeeds without modification if an array is
+ * already there. Fails if `path` resolves to a non-array value.
+ *
+ * Useful for responses whose shape must always contain a named array
+ * key even when the source data is empty — the json_resp_array_append_*
+ * family creates the array lazily on first append, but that leaves the
+ * key missing when the loop doesn't iterate. */
+CUTILS_MUST_USE
+int  json_resp_ensure_array(cutils_json_resp_t *resp, const char *path);
+
 /* Free a response builder. Safe to call with NULL. */
 void json_resp_free    (cutils_json_resp_t *resp);
 
