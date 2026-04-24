@@ -36,6 +36,7 @@ VENDOR_RELAX = -Wno-conversion -Wno-sign-conversion -Wno-cast-qual \
 
 # Source files
 SRCS     = src/error.c \
+           src/mem.c \
            src/db.c \
            src/migrations.c \
            src/config.c \
@@ -43,7 +44,8 @@ SRCS     = src/error.c \
            src/log.c \
            src/push.c \
            src/error_loop.c \
-           src/appguard.c
+           src/appguard.c \
+           src/json.c
 VENDOR   = lib/cJSON/cJSON.c
 
 # Object files routed to build/
@@ -132,7 +134,6 @@ analyze: check
 	    base=$$(basename $$f .c); \
 	    $(CC) $(ANALYZE_CFLAGS) -fstack-usage -c $$f \
 	        -o $(BUILD_DIR)/analyze/$$base.o 2>/dev/null; \
-	    mv -f $$(basename $$f .c).su $(BUILD_DIR)/analyze/ 2>/dev/null; \
 	done
 	@fail=0; for su in $(BUILD_DIR)/analyze/*.su; do \
 	    [ -f "$$su" ] || continue; \

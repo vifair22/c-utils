@@ -63,6 +63,7 @@ const char *cutils_err_name(cutils_err_t code)
     case CUTILS_ERR_NOT_FOUND: return "ERR_NOT_FOUND";
     case CUTILS_ERR_INVALID:   return "ERR_INVALID";
     case CUTILS_ERR_EXISTS:    return "ERR_EXISTS";
+    case CUTILS_ERR_JSON:      return "ERR_JSON";
     }
     return "ERR_UNKNOWN";
 }
