@@ -82,6 +82,7 @@ static void test_err_name_all_codes(void **state)
     assert_string_equal(cutils_err_name(CUTILS_ERR_MIGRATE), "ERR_MIGRATE");
     assert_string_equal(cutils_err_name(CUTILS_ERR_INVALID), "ERR_INVALID");
     assert_string_equal(cutils_err_name(CUTILS_ERR_EXISTS), "ERR_EXISTS");
+    assert_string_equal(cutils_err_name(CUTILS_ERR_JSON), "ERR_JSON");
 }
 
 int main(void)

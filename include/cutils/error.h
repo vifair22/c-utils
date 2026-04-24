@@ -20,6 +20,7 @@ typedef enum {
     CUTILS_ERR_NOT_FOUND   = -7,  /* key/record not found */
     CUTILS_ERR_INVALID     = -8,  /* invalid argument or state */
     CUTILS_ERR_EXISTS      = -9,  /* duplicate/collision */
+    CUTILS_ERR_JSON        = -10, /* JSON parse/validation error */
 } cutils_err_t;
 
 /* Maximum length of the thread-local error message buffer */
