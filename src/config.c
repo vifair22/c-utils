@@ -1,12 +1,23 @@
 #include "cutils/config.h"
 #include "cutils/db.h"
 #include "cutils/error.h"
+#include "cutils/mem.h"
 #include "config_yaml.h"
 
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Internal auto-cleanup for config handles used inside this file. */
+static void config_free_p(cutils_config_t **p)
+{
+    if (*p) {
+        config_free(*p);
+        *p = NULL;
+    }
+}
+#define CUTILS_AUTO_CONFIG __attribute__((cleanup(config_free_p)))
 
 /* --- c-utils internal keys --- */
 
@@ -145,7 +156,7 @@ int config_init(cutils_config_t **out,
                 const config_key_t *file_keys,
                 const config_section_t *sections)
 {
-    cutils_config_t *cfg = calloc(1, sizeof(*cfg));
+    CUTILS_AUTO_CONFIG cutils_config_t *cfg = calloc(1, sizeof(*cfg));
     if (!cfg)
         return set_error(CUTILS_ERR_NOMEM, "config_init: alloc failed");
 
@@ -153,20 +164,18 @@ int config_init(cutils_config_t **out,
     cfg->env_prefix = make_env_prefix(app_name);
     cfg->config_path = strdup(config_path ? config_path : "config.yaml");
 
-    if (!cfg->app_name || !cfg->env_prefix || !cfg->config_path) {
-        config_free(cfg);
+    if (!cfg->app_name || !cfg->env_prefix || !cfg->config_path)
         return set_error(CUTILS_ERR_NOMEM, "config_init: string alloc failed");
-    }
 
     /* Register internal keys and sections */
     for (int i = 0; cutils_internal_keys[i].key != NULL; i++) {
         int rc = add_key(cfg, &cutils_internal_keys[i]);
-        if (rc != CUTILS_OK) { config_free(cfg); return rc; }
+        if (rc != CUTILS_OK) return rc;
     }
 
     for (int i = 0; cutils_internal_sections[i].prefix != NULL; i++) {
         int rc = add_section(cfg, &cutils_internal_sections[i]);
-        if (rc != CUTILS_OK) { config_free(cfg); return rc; }
+        if (rc != CUTILS_OK) return rc;
     }
 
     /* Register app keys (file-backed only at this stage) */
@@ -174,64 +183,58 @@ int config_init(cutils_config_t **out,
         for (int i = 0; file_keys[i].key != NULL; i++) {
             if (file_keys[i].store != CFG_STORE_FILE) continue;
             int rc = add_key(cfg, &file_keys[i]);
-            if (rc != CUTILS_OK) { config_free(cfg); return rc; }
+            if (rc != CUTILS_OK) return rc;
         }
     }
 
     if (sections) {
         for (int i = 0; sections[i].prefix != NULL; i++) {
             int rc = add_section(cfg, &sections[i]);
-            if (rc != CUTILS_OK) { config_free(cfg); return rc; }
+            if (rc != CUTILS_OK) return rc;
         }
     }
 
     /* Check if config file exists */
-    FILE *test = fopen(cfg->config_path, "r");
-    if (!test) {
-        /* Generate template */
-        fprintf(stderr, "No config file found at '%s' — generating template.\n",
-                cfg->config_path);
+    {
+        CUTILS_AUTOCLOSE FILE *test = fopen(cfg->config_path, "r");
+        if (!test) {
+            /* Generate template */
+            fprintf(stderr, "No config file found at '%s' — generating template.\n",
+                    cfg->config_path);
 
-        /* Only include file-backed keys in template */
-        config_key_t *fkeys = calloc((size_t)cfg->nkeys, sizeof(config_key_t));
-        int nfkeys = 0;
-        if (fkeys) {
-            for (int i = 0; i < cfg->nkeys; i++) {
-                if (cfg->keys[i].store == CFG_STORE_FILE)
-                    fkeys[nfkeys++] = cfg->keys[i];
+            /* Only include file-backed keys in template */
+            CUTILS_AUTOFREE config_key_t *fkeys =
+                calloc((size_t)cfg->nkeys, sizeof(config_key_t));
+            int nfkeys = 0;
+            if (fkeys) {
+                for (int i = 0; i < cfg->nkeys; i++) {
+                    if (cfg->keys[i].store == CFG_STORE_FILE)
+                        fkeys[nfkeys++] = cfg->keys[i];
+                }
             }
+
+            int rc = yaml_generate_template(cfg->config_path,
+                                            fkeys, nfkeys,
+                                            cfg->sections, cfg->nsections);
+            if (rc != 0)
+                return set_error(CUTILS_ERR_IO, "failed to write config template");
+
+            if (first_run == CFG_FIRST_RUN_EXIT) {
+                fprintf(stderr, "Config template written to '%s'. "
+                        "Please review and restart.\n", cfg->config_path);
+                *out = NULL;
+                return CUTILS_ERR_NOT_FOUND;
+            }
+
+            /* CFG_FIRST_RUN_CONTINUE: fall through to parse the generated file */
         }
-
-        int rc = yaml_generate_template(cfg->config_path,
-                                        fkeys, nfkeys,
-                                        cfg->sections, cfg->nsections);
-        free(fkeys);
-
-        if (rc != 0) {
-            config_free(cfg);
-            return set_error(CUTILS_ERR_IO, "failed to write config template");
-        }
-
-        if (first_run == CFG_FIRST_RUN_EXIT) {
-            fprintf(stderr, "Config template written to '%s'. "
-                    "Please review and restart.\n", cfg->config_path);
-            config_free(cfg);
-            *out = NULL;
-            return CUTILS_ERR_NOT_FOUND;
-        }
-
-        /* CFG_FIRST_RUN_CONTINUE: fall through to parse the generated file */
-    } else {
-        fclose(test);
     }
 
     /* Parse the YAML file */
     cfg->doc = yaml_parse_file(cfg->config_path);
-    if (!cfg->doc) {
-        config_free(cfg);
+    if (!cfg->doc)
         return set_error(CUTILS_ERR_IO, "failed to parse config file '%s'",
                          cfg->config_path);
-    }
 
     /* Validate required keys */
     for (int i = 0; i < cfg->nkeys; i++) {
@@ -239,15 +242,13 @@ int config_init(cutils_config_t **out,
         if (!cfg->keys[i].required) continue;
 
         const char *val = yaml_get(cfg->doc, cfg->keys[i].key);
-        if (!val || val[0] == '\0') {
-            const char *key = cfg->keys[i].key;
-            config_free(cfg);
+        if (!val || val[0] == '\0')
             return set_error(CUTILS_ERR_CONFIG,
-                "required config key '%s' is missing or empty", key);
-        }
+                "required config key '%s' is missing or empty", cfg->keys[i].key);
     }
 
-    *out = cfg;
+    /* Transfer ownership to caller — cleanup sees NULL and skips. */
+    *out = CUTILS_MOVE(cfg);
     return CUTILS_OK;
 }
 
@@ -273,17 +274,14 @@ static const char *config_get_from_db(const cutils_config_t *cfg, const char *ke
     if (!cfg->db) return NULL;
 
     const char *params[] = { key, NULL };
-    db_result_t *result = NULL;
+    CUTILS_AUTO_DBRES db_result_t *result = NULL;
 
     int rc = db_execute(cfg->db, "SELECT value FROM config WHERE key = ?",
                         params, &result);
-    if (rc != CUTILS_OK || !result || result->nrows == 0) {
-        db_result_free(result);
+    if (rc != CUTILS_OK || !result || result->nrows == 0)
         return NULL;
-    }
 
     snprintf(db_val_buf, sizeof(db_val_buf), "%s", result->rows[0][0]);
-    db_result_free(result);
     return db_val_buf;
 }
 
@@ -308,19 +306,12 @@ int config_attach_db(cutils_config_t *cfg, cutils_db_t *db,
 
         /* Check if already in DB */
         const char *params[] = { db_keys[i].key, NULL };
-        db_result_t *result = NULL;
+        CUTILS_AUTO_DBRES db_result_t *result = NULL;
         int rc = db_execute(db, "SELECT key FROM config WHERE key = ?",
                             params, &result);
-        if (rc != CUTILS_OK) {
-            db_result_free(result);
-            return rc;
-        }
+        if (rc != CUTILS_OK) return rc;
 
-        if (result->nrows > 0) {
-            db_result_free(result);
-            continue;
-        }
-        db_result_free(result);
+        if (result->nrows > 0) continue;
 
         /* Insert with defaults */
         const char *type_str = "string";
@@ -350,10 +341,9 @@ int config_attach_db(cutils_config_t *cfg, cutils_db_t *db,
 const char *config_get_str(const cutils_config_t *cfg, const char *key)
 {
     /* 1. Check env var override */
-    char *envname = make_env_name(cfg->env_prefix, key);
+    CUTILS_AUTOFREE char *envname = make_env_name(cfg->env_prefix, key);
     if (envname) {
         const char *envval = getenv(envname);
-        free(envname);
         if (envval) return envval;
     }
 
