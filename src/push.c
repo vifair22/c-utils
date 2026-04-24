@@ -243,14 +243,17 @@ static void *push_worker_thread(void *arg)
 
             if (sr == SEND_OK) {
                 const char *del_params[] = { rowid, NULL };
-                db_execute_non_query(push_db,
-                    "DELETE FROM push WHERE rowid = ?", del_params, NULL);
+                /* Best-effort: if the delete fails, the row will be re-delivered
+                 * next cycle. Not catastrophic — Pushover collapses dupes. */
+                CUTILS_UNUSED(db_execute_non_query(push_db,
+                    "DELETE FROM push WHERE rowid = ?", del_params, NULL));
                 log_debug("push sent: %s", title);
             } else if (sr == SEND_PERMANENT_FAIL) {
                 const char *fail_params[] = { rowid, NULL };
-                db_execute_non_query(push_db,
+                /* Best-effort: if marking fails, the row retries next cycle. */
+                CUTILS_UNUSED(db_execute_non_query(push_db,
                     "UPDATE push SET failed = 1 WHERE rowid = ?",
-                    fail_params, NULL);
+                    fail_params, NULL));
                 log_error("push permanently failed: %s", title);
             } else {
                 log_warn("push transient failure, will retry: %s", title);

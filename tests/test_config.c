@@ -586,7 +586,7 @@ static void test_get_db_key_empty_value(void **state)
 
     /* Clear the value in DB to force fallback to default */
     const char *params[] = { "", "runtime.empty", NULL };
-    db_execute_non_query(db, "UPDATE config SET value = ? WHERE key = ?", params, NULL);
+    assert_int_equal(db_execute_non_query(db, "UPDATE config SET value = ? WHERE key = ?", params, NULL), CUTILS_OK);
 
     /* Should fall through to compiled-in default */
     assert_string_equal(config_get_str(cfg, "runtime.empty"), "fallback");

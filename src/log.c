@@ -134,10 +134,12 @@ static void write_entry_to_db(const log_entry_t *entry)
     const char *params[] = {
         entry->timestamp, entry->level, entry->func, entry->message, NULL
     };
-    db_execute_non_query(log_db,
+    /* Writer thread is fire-and-forget — a DB insert failure here would
+     * recurse if we tried to log it. Drop silently. */
+    CUTILS_UNUSED(db_execute_non_query(log_db,
         "INSERT INTO logs (timestamp, level, function, message) "
         "VALUES (?, ?, ?, ?)",
-        params, NULL);
+        params, NULL));
 }
 
 static void do_cleanup(void)
@@ -153,8 +155,9 @@ static void do_cleanup(void)
 
     const char *params[] = { cutoff, NULL };
     int affected = 0;
-    db_execute_non_query(log_db,
-        "DELETE FROM logs WHERE timestamp < ?", params, &affected);
+    /* Cleanup runs on a background thread — caller has no handle to fail. */
+    CUTILS_UNUSED(db_execute_non_query(log_db,
+        "DELETE FROM logs WHERE timestamp < ?", params, &affected));
 
     if (affected > 0) {
         char msg[128];
@@ -165,10 +168,10 @@ static void do_cleanup(void)
         get_timestamp(ts_now, sizeof(ts_now));
 
         const char *ins_params[] = { ts_now, "info", "log_cleanup", msg, NULL };
-        db_execute_non_query(log_db,
+        CUTILS_UNUSED(db_execute_non_query(log_db,
             "INSERT INTO logs (timestamp, level, function, message) "
             "VALUES (?, ?, ?, ?)",
-            ins_params, NULL);
+            ins_params, NULL));
     }
 }
 

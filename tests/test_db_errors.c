@@ -74,7 +74,7 @@ static void test_execute_constraint_violation(void **state)
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
 
-    db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)");
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)"), CUTILS_OK);
 
     const char *p1[] = { "alice", NULL };
     assert_int_equal(db_execute_non_query(db,
@@ -105,7 +105,7 @@ static void test_execute_no_params(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)"), CUTILS_OK);
 
     /* INSERT with no params */
     int affected = 0;
@@ -128,8 +128,8 @@ static void test_execute_null_column_value(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
-    db_execute_non_query(db, "INSERT INTO t (val) VALUES (NULL)", NULL, NULL);
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)"), CUTILS_OK);
+    assert_int_equal(db_execute_non_query(db, "INSERT INTO t (val) VALUES (NULL)", NULL, NULL), CUTILS_OK);
 
     db_result_t *result = NULL;
     assert_int_equal(db_execute(db, "SELECT val FROM t", NULL, &result), CUTILS_OK);
@@ -146,7 +146,7 @@ static void test_execute_non_query_affected_null(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY)"), CUTILS_OK);
 
     /* NULL affected pointer should be fine */
     assert_int_equal(db_execute_non_query(db,
@@ -160,17 +160,17 @@ static void test_savepoint_release(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)"), CUTILS_OK);
 
-    db_begin(db);
-    db_savepoint(db, "sp1");
+    assert_int_equal(db_begin(db), CUTILS_OK);
+    assert_int_equal(db_savepoint(db, "sp1"), CUTILS_OK);
     const char *p[] = { "saved", NULL };
-    db_execute_non_query(db, "INSERT INTO t (val) VALUES (?)", p, NULL);
+    assert_int_equal(db_execute_non_query(db, "INSERT INTO t (val) VALUES (?)", p, NULL), CUTILS_OK);
     assert_int_equal(db_savepoint_release(db, "sp1"), CUTILS_OK);
-    db_commit(db);
+    assert_int_equal(db_commit(db), CUTILS_OK);
 
     db_result_t *result = NULL;
-    db_execute(db, "SELECT val FROM t", NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT val FROM t", NULL, &result), CUTILS_OK);
     assert_int_equal(result->nrows, 1);
     assert_string_equal(result->rows[0][0], "saved");
     db_result_free(result);
@@ -183,14 +183,14 @@ static void test_multiple_rows(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)"), CUTILS_OK);
 
     /* Insert enough rows to trigger a realloc (> 16 initial capacity) */
     for (int i = 0; i < 20; i++) {
         char val[32];
         snprintf(val, sizeof(val), "row_%d", i);
         const char *p[] = { val, NULL };
-        db_execute_non_query(db, "INSERT INTO t (val) VALUES (?)", p, NULL);
+        assert_int_equal(db_execute_non_query(db, "INSERT INTO t (val) VALUES (?)", p, NULL), CUTILS_OK);
     }
 
     db_result_t *result = NULL;

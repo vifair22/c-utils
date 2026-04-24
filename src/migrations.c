@@ -128,14 +128,16 @@ static int apply_migration(cutils_db_t *db, const char *tracked_name,
 
     rc = db_exec_raw(db, sql);
     if (rc != CUTILS_OK) {
-        db_savepoint_rollback(db, sp_name);
+        /* Recovery path — outer batch already errored, rollback failure here
+         * has nothing to add. */
+        CUTILS_UNUSED(db_savepoint_rollback(db, sp_name));
         return set_error(CUTILS_ERR_MIGRATE, "migration %s failed: %s",
                          tracked_name, cutils_get_error());
     }
 
     rc = record_migration(db, tracked_name, checksum);
     if (rc != CUTILS_OK) {
-        db_savepoint_rollback(db, sp_name);
+        CUTILS_UNUSED(db_savepoint_rollback(db, sp_name));
         return rc;
     }
 
@@ -172,7 +174,7 @@ static int run_migration_array(cutils_db_t *db, const db_migration_t *migrations
         int applied = 0;
         rc = check_migration(db, tracked, checksum, &applied);
         if (rc != CUTILS_OK) {
-            db_rollback(db);
+            CUTILS_UNUSED(db_rollback(db));
             return rc;
         }
 
@@ -181,7 +183,7 @@ static int run_migration_array(cutils_db_t *db, const db_migration_t *migrations
         fprintf(stderr, "Migration: applying %s\n", tracked);
         rc = apply_migration(db, tracked, sql, checksum);
         if (rc != CUTILS_OK) {
-            db_rollback(db);
+            CUTILS_UNUSED(db_rollback(db));
             return rc;
         }
     }
@@ -282,7 +284,7 @@ int db_run_app_migrations(cutils_db_t *db, const char *migrations_dir)
         FILE *f = fopen(path, "r");
         if (!f) {
             rc = set_error_errno(CUTILS_ERR_IO, "open migration %s", path);
-            db_rollback(db);
+            CUTILS_UNUSED(db_rollback(db));
             goto cleanup;
         }
 
@@ -299,7 +301,7 @@ int db_run_app_migrations(cutils_db_t *db, const char *migrations_dir)
         if (!sql) {
             fclose(f);
             rc = set_error(CUTILS_ERR_NOMEM, "migration %s: alloc failed", files[i]);
-            db_rollback(db);
+            CUTILS_UNUSED(db_rollback(db));
             goto cleanup;
         }
 
@@ -315,7 +317,7 @@ int db_run_app_migrations(cutils_db_t *db, const char *migrations_dir)
         rc = check_migration(db, files[i], checksum, &applied);
         if (rc != CUTILS_OK) {
             free(sql);
-            db_rollback(db);
+            CUTILS_UNUSED(db_rollback(db));
             goto cleanup;
         }
 
@@ -329,7 +331,7 @@ int db_run_app_migrations(cutils_db_t *db, const char *migrations_dir)
         free(sql);
 
         if (rc != CUTILS_OK) {
-            db_rollback(db);
+            CUTILS_UNUSED(db_rollback(db));
             goto cleanup;
         }
     }

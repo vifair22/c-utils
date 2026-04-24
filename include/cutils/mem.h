@@ -99,6 +99,41 @@ void cutils_unlock_p(pthread_mutex_t **m);
  * Note: evaluates its argument twice. Do not pass expressions with
  * side effects (e.g. CUTILS_MOVE(array[i++])). */
 #define CUTILS_MOVE(p) \
-    ({ __typeof__(p) _cutils_mv = (p); (p) = NULL; _cutils_mv; })
+    __extension__ ({ __typeof__(p) _cutils_mv = (p); (p) = NULL; _cutils_mv; })
+
+/* --- Function attribute conveniences ---
+ *
+ * Applied to declarations in headers. The compiler uses them to catch
+ * misuse at call sites — zero runtime cost.
+ *
+ * CUTILS_MUST_USE     Warn if the caller discards the return value.
+ *                     Apply to status codes, owned pointers, and any
+ *                     return where ignoring is a bug.
+ *
+ * CUTILS_NONNULL(n)   Warn when a literal NULL is passed for the
+ *                     listed 1-based parameter positions. Only use
+ *                     where the callee truly does not tolerate NULL.
+ *
+ * CUTILS_MALLOC_FN    The return is a fresh, unaliased pointer. Helps
+ *                     the optimizer and the clang static analyzer
+ *                     track ownership across function boundaries.
+ */
+#define CUTILS_MUST_USE     __attribute__((warn_unused_result))
+#define CUTILS_NONNULL(...) __attribute__((nonnull(__VA_ARGS__)))
+#define CUTILS_MALLOC_FN    __attribute__((malloc))
+
+/* --- Intentionally discard a CUTILS_MUST_USE return value ---
+ *
+ * A plain (void) cast does not silence warn_unused_result in GCC.
+ * This macro assigns the result to a local and discards it, which
+ * does. Use it only where the caller genuinely cannot act on the
+ * failure (cleanup paths, fire-and-forget background work, etc.)
+ * and always leave a comment justifying why.
+ *
+ *   / * rollback failure in a cleanup handler is not actionable * /
+ *   CUTILS_UNUSED(db_rollback(db));
+ */
+#define CUTILS_UNUSED(expr) \
+    do { __extension__ __typeof__(expr) _cutils_u = (expr); (void)_cutils_u; } while (0)
 
 #endif

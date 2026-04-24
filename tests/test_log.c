@@ -231,7 +231,7 @@ static void test_all_levels_to_db(void **state)
 
     /* Verify all 4 levels persisted */
     db_result_t *result = NULL;
-    db_execute(db, "SELECT DISTINCT level FROM logs ORDER BY level", NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT DISTINCT level FROM logs ORDER BY level", NULL, &result), CUTILS_OK);
     assert_non_null(result);
     assert_true(result->nrows >= 4);
     db_result_free(result);
@@ -274,9 +274,9 @@ static void test_log_retention(void **state)
 
     /* Insert an old log entry manually */
     const char *params[] = { "2020-01-01 00:00:00", "info", "old", "old msg", NULL };
-    db_execute_non_query(db,
+    assert_int_equal(db_execute_non_query(db,
         "INSERT INTO logs (timestamp, level, function, message) VALUES (?, ?, ?, ?)",
-        params, NULL);
+        params, NULL), CUTILS_OK);
 
     /* Start with retention = 1 day */
     assert_int_equal(log_init(db, LOG_INFO, 1), CUTILS_OK);
@@ -288,8 +288,8 @@ static void test_log_retention(void **state)
 
     /* The old entry should have been cleaned up */
     db_result_t *result = NULL;
-    db_execute(db, "SELECT COUNT(*) FROM logs WHERE timestamp < '2021-01-01'",
-               NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT COUNT(*) FROM logs WHERE timestamp < '2021-01-01'",
+               NULL, &result), CUTILS_OK);
     assert_non_null(result);
     assert_string_equal(result->rows[0][0], "0");
     db_result_free(result);

@@ -1,6 +1,8 @@
 #ifndef CUTILS_PUSH_H
 #define CUTILS_PUSH_H
 
+#include "cutils/mem.h"
+
 /* --- Pushover notification subsystem ---
  *
  * DB-persisted notification queue with background worker thread.
@@ -17,6 +19,7 @@ typedef struct cutils_config cutils_config_t;
  * Starts the background worker thread.
  * db must be open with push table created (via migrations).
  * Returns CUTILS_OK on success. */
+CUTILS_MUST_USE
 int push_init(cutils_db_t *db, const cutils_config_t *cfg);
 
 /* Shut down the push worker. Drains pending messages first. */
@@ -25,6 +28,7 @@ void push_shutdown(void);
 /* Send a notification. The message is persisted to DB immediately
  * and delivered asynchronously by the worker thread.
  * Returns CUTILS_OK on successful enqueue. */
+CUTILS_MUST_USE
 int push_send(const char *title, const char *message);
 
 /* Builder pattern for notifications with overrides. */
@@ -47,6 +51,7 @@ typedef struct {
 #define PUSH_PRIORITY_EMERGENCY 2   /* repeats until acknowledged */
 
 /* Send with explicit options. Fields set to 0/NULL use defaults. */
+CUTILS_MUST_USE
 int push_send_opts(const push_opts_t *opts);
 
 /* Config keys that c-utils registers for Pushover.

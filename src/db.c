@@ -344,7 +344,7 @@ void cutils_db_tx_end_p(cutils_db_tx_t *tx)
     if (tx->active && !tx->finalized) {
         /* Rollback can fail (e.g. DB closed underneath us); not much we
          * can do in a cleanup handler. Silently attempt and move on. */
-        (void)db_rollback(tx->db);
+        CUTILS_UNUSED(db_rollback(tx->db));
     }
     tx->active    = 0;
     tx->finalized = 1;

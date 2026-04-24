@@ -76,7 +76,7 @@ static push_fixture_t make_fixture(int with_creds)
     assert_int_equal(db_run_lib_migrations(fix.db), CUTILS_OK);
 
     /* Need log for push_init */
-    log_init(NULL, LOG_INFO, 0);
+    assert_int_equal(log_init(NULL, LOG_INFO, 0), CUTILS_OK);
 
     return fix;
 }
@@ -119,7 +119,7 @@ static void test_push_send_no_creds(void **state)
     (void)state;
     push_fixture_t fix = make_fixture(0);
 
-    push_init(fix.db, fix.cfg);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
 
     /* Even with explicit opts, if no creds it should fail */
     push_opts_t opts = {
@@ -181,8 +181,8 @@ static void test_push_send_opts_override(void **state)
 
     /* Verify custom token/user were stored */
     db_result_t *result = NULL;
-    db_execute(fix.db, "SELECT token, user, ttl FROM push ORDER BY rowid DESC LIMIT 1",
-               NULL, &result);
+    assert_int_equal(db_execute(fix.db, "SELECT token, user, ttl FROM push ORDER BY rowid DESC LIMIT 1",
+               NULL, &result), CUTILS_OK);
     assert_non_null(result);
     assert_string_equal(result->rows[0][0], "custom_token");
     assert_string_equal(result->rows[0][1], "custom_user");
@@ -211,8 +211,8 @@ static void test_push_send_long_message_split(void **state)
 
     /* Should have been split into multiple rows */
     db_result_t *result = NULL;
-    db_execute(fix.db, "SELECT COUNT(*) FROM push WHERE title LIKE 'Split Test%'",
-               NULL, &result);
+    assert_int_equal(db_execute(fix.db, "SELECT COUNT(*) FROM push WHERE title LIKE 'Split Test%'",
+               NULL, &result), CUTILS_OK);
     assert_non_null(result);
     int parts = atoi(result->rows[0][0]);
     assert_true(parts >= 2);
@@ -266,9 +266,9 @@ static void test_push_send_html_flag(void **state)
 
     /* Verify html=1 was stored */
     db_result_t *result = NULL;
-    db_execute(fix.db,
+    assert_int_equal(db_execute(fix.db,
         "SELECT html, priority FROM push WHERE title = 'HTML Test'",
-        NULL, &result);
+        NULL, &result), CUTILS_OK);
     assert_non_null(result);
     assert_int_equal(result->nrows, 1);
     assert_string_equal(result->rows[0][0], "1");
@@ -293,9 +293,9 @@ static void test_push_send_priority(void **state)
     assert_int_equal(push_send_opts(&opts), CUTILS_OK);
 
     db_result_t *result = NULL;
-    db_execute(fix.db,
+    assert_int_equal(db_execute(fix.db,
         "SELECT priority FROM push WHERE title = 'High Priority'",
-        NULL, &result);
+        NULL, &result), CUTILS_OK);
     assert_non_null(result);
     assert_int_equal(result->nrows, 1);
     assert_string_equal(result->rows[0][0], "1");
@@ -320,9 +320,9 @@ static void test_push_send_html_and_priority(void **state)
     assert_int_equal(push_send_opts(&opts), CUTILS_OK);
 
     db_result_t *result = NULL;
-    db_execute(fix.db,
+    assert_int_equal(db_execute(fix.db,
         "SELECT html, priority FROM push WHERE title = 'Combined'",
-        NULL, &result);
+        NULL, &result), CUTILS_OK);
     assert_non_null(result);
     assert_int_equal(result->nrows, 1);
     assert_string_equal(result->rows[0][0], "1");
@@ -343,9 +343,9 @@ static void test_push_send_defaults_zero(void **state)
     assert_int_equal(push_send("Default", "Plain message"), CUTILS_OK);
 
     db_result_t *result = NULL;
-    db_execute(fix.db,
+    assert_int_equal(db_execute(fix.db,
         "SELECT html, priority FROM push WHERE title = 'Default'",
-        NULL, &result);
+        NULL, &result), CUTILS_OK);
     assert_non_null(result);
     assert_int_equal(result->nrows, 1);
     assert_string_equal(result->rows[0][0], "0");
@@ -370,9 +370,9 @@ static void test_push_send_negative_priority(void **state)
     assert_int_equal(push_send_opts(&opts), CUTILS_OK);
 
     db_result_t *result = NULL;
-    db_execute(fix.db,
+    assert_int_equal(db_execute(fix.db,
         "SELECT priority FROM push WHERE title = 'Silent'",
-        NULL, &result);
+        NULL, &result), CUTILS_OK);
     assert_non_null(result);
     assert_string_equal(result->rows[0][0], "-2");
     db_result_free(result);
