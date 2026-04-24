@@ -1,5 +1,6 @@
 #include "cutils/error_loop.h"
 #include "cutils/log.h"
+#include "cutils/mem.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -158,7 +159,7 @@ void error_loop_report(error_loop_t *det, const char *fmt, ...)
     vsnprintf(raw, sizeof(raw), fmt, ap);
     va_end(ap);
 
-    char *identity = make_identity(raw);
+    CUTILS_AUTOFREE char *identity = make_identity(raw);
     if (!identity) return;
 
     /* Same error as last time? */
@@ -169,14 +170,11 @@ void error_loop_report(error_loop_t *det, const char *fmt, ...)
     } else {
         free(det->last_identity);
         free(det->last_raw);
-        det->last_identity = identity;
-        det->last_raw = strdup(raw);
-        det->count = 1;
+        det->last_identity   = CUTILS_MOVE(identity);  /* transfer — cleanup no-op */
+        det->last_raw        = strdup(raw);
+        det->count           = 1;
         det->suppressed_until = 0;
-        identity = NULL; /* ownership transferred */
     }
-
-    free(identity);
 
     /* In cooldown? */
     time_t now = time(NULL);
