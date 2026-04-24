@@ -1050,6 +1050,93 @@ static void test_null_arg_robustness(void **state)
 /* Main                                                          */
 /* ============================================================ */
 
+/* ============================================================ */
+/* Scoped-cleanup macros                                         */
+/* ============================================================ */
+
+static void test_auto_json_req_frees_on_scope_exit(void **state)
+{
+    (void)state;
+    {
+        CUTILS_AUTO_JSON_REQ cutils_json_req_t *req = NULL;
+        assert_int_equal(
+            json_req_parse("{\"a\":1}", 7, &req), CUTILS_OK);
+        assert_non_null(req);
+        /* No explicit json_req_free — cleanup fires on block exit. */
+    }
+}
+
+static void test_auto_json_resp_frees_on_scope_exit(void **state)
+{
+    (void)state;
+    {
+        CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
+        assert_int_equal(json_resp_new(&resp), CUTILS_OK);
+        assert_non_null(resp);
+        assert_int_equal(json_resp_add_i32(resp, "x", 42), CUTILS_OK);
+        /* No explicit json_resp_free — cleanup fires on block exit. */
+    }
+}
+
+static void test_auto_json_iter_ends_on_scope_exit(void **state)
+{
+    (void)state;
+    cutils_json_req_t *req = parse_or_fail("{\"xs\":[1,2,3]}");
+    {
+        CUTILS_AUTO_JSON_ITER cutils_json_iter_t it = { 0 };
+        assert_int_equal(json_iter_begin(req, "xs", &it), CUTILS_OK);
+        assert_true(json_iter_next(&it));
+        /* Bail out before exhausting — cleanup must still release state. */
+    }
+    json_req_free(req);
+}
+
+static void test_auto_json_elem_discards_uncommitted(void **state)
+{
+    (void)state;
+    cutils_json_resp_t *resp = NULL;
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
+
+    {
+        CUTILS_AUTO_JSON_ELEM cutils_json_elem_t elem;
+        assert_int_equal(
+            json_resp_array_append_begin(resp, "items", &elem), CUTILS_OK);
+        assert_int_equal(json_elem_add_str(&elem, "k", "v"), CUTILS_OK);
+        /* No commit — cleanup must discard the element. */
+    }
+
+    char *out = NULL;
+    size_t len = 0;
+    assert_int_equal(json_resp_finalize(resp, &out, &len), CUTILS_OK);
+    /* The uncommitted element should not appear. */
+    assert_null(strstr(out, "\"k\""));
+    free(out);
+    json_resp_free(resp);
+}
+
+static void test_auto_json_elem_honors_commit(void **state)
+{
+    (void)state;
+    cutils_json_resp_t *resp = NULL;
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
+
+    {
+        CUTILS_AUTO_JSON_ELEM cutils_json_elem_t elem;
+        assert_int_equal(
+            json_resp_array_append_begin(resp, "items", &elem), CUTILS_OK);
+        assert_int_equal(json_elem_add_str(&elem, "k", "v"), CUTILS_OK);
+        json_elem_commit(&elem);  /* explicit commit on success */
+    }
+
+    char *out = NULL;
+    size_t len = 0;
+    assert_int_equal(json_resp_finalize(resp, &out, &len), CUTILS_OK);
+    assert_non_null(strstr(out, "\"k\""));
+    assert_non_null(strstr(out, "\"v\""));
+    free(out);
+    json_resp_free(resp);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1153,6 +1240,18 @@ int main(void)
         /* End-to-end + robustness */
         cmocka_unit_test_setup(test_roundtrip_complex,           setup_clear_error),
         cmocka_unit_test_setup(test_null_arg_robustness,         setup_clear_error),
+
+        /* Scoped-cleanup macros */
+        cmocka_unit_test_setup(test_auto_json_req_frees_on_scope_exit,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_auto_json_resp_frees_on_scope_exit,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_auto_json_iter_ends_on_scope_exit,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_auto_json_elem_discards_uncommitted,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_auto_json_elem_honors_commit,
+                                                                 setup_clear_error),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

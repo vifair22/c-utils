@@ -142,6 +142,14 @@ void error_loop_free(error_loop_t *det)
     free(det);
 }
 
+void error_loop_free_p(error_loop_t **det)
+{
+    if (*det) {
+        error_loop_free(*det);
+        *det = NULL;
+    }
+}
+
 void error_loop_report(error_loop_t *det, const char *fmt, ...)
 {
     char raw[2048];

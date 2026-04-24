@@ -43,6 +43,17 @@ error_loop_t *error_loop_create(int threshold, int cooldown_sec,
 /* Free a detector. */
 void error_loop_free(error_loop_t *det);
 
+/* Cleanup helper for __attribute__((cleanup(...))).
+ * Frees *det and sets *det to NULL. Use via CUTILS_AUTO_ERRLOOP. */
+void error_loop_free_p(error_loop_t **det);
+
+/* Scoped cleanup for error_loop_t *:
+ *
+ *   CUTILS_AUTO_ERRLOOP error_loop_t *det = error_loop_create(5, 300, NULL, NULL);
+ *   / * det is freed automatically on scope exit * /
+ */
+#define CUTILS_AUTO_ERRLOOP __attribute__((cleanup(error_loop_free_p)))
+
 /* Report an error from the main loop.
  * Below threshold: logs normally.
  * At threshold: fires callback, starts cooldown.

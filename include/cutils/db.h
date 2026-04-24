@@ -50,6 +50,19 @@ int db_exec_raw(cutils_db_t *db, const char *sql);
 /* Free a query result set. Safe to call with NULL. */
 void db_result_free(db_result_t *result);
 
+/* Cleanup helper for __attribute__((cleanup(...))).
+ * Frees *result and sets *result to NULL. Use via CUTILS_AUTO_DBRES. */
+void db_result_free_p(db_result_t **result);
+
+/* Scoped cleanup for db_result_t *. Declare a result variable with this
+ * attribute and db_result_free() runs automatically on scope exit:
+ *
+ *   CUTILS_AUTO_DBRES db_result_t *r = NULL;
+ *   if (db_execute(db, sql, NULL, &r) != CUTILS_OK) return -1;
+ *   / * use r — freed on any return path * /
+ */
+#define CUTILS_AUTO_DBRES __attribute__((cleanup(db_result_free_p)))
+
 /* Begin/commit/rollback transactions */
 int db_begin(cutils_db_t *db);
 int db_commit(cutils_db_t *db);

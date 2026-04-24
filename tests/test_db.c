@@ -172,6 +172,35 @@ static void test_empty_result(void **state)
     db_close(db);
 }
 
+static void test_auto_dbres_frees_on_scope_exit(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    db_exec_raw(db, "CREATE TABLE t (v TEXT)");
+    db_exec_raw(db, "INSERT INTO t VALUES ('auto')");
+
+    {
+        CUTILS_AUTO_DBRES db_result_t *r = NULL;
+        assert_int_equal(db_execute(db, "SELECT v FROM t", NULL, &r), CUTILS_OK);
+        assert_non_null(r);
+        assert_int_equal(r->nrows, 1);
+        assert_string_equal(r->rows[0][0], "auto");
+        /* No explicit db_result_free — cleanup fires on block exit.
+         * ASAN validates under make test-asan. */
+    }
+
+    db_close(db);
+}
+
+static void test_auto_dbres_null_safe(void **state)
+{
+    (void)state;
+    CUTILS_AUTO_DBRES db_result_t *r = NULL;
+    (void)r;
+    /* Cleanup must tolerate NULL without crashing. */
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -182,6 +211,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_transaction_rollback, setup, teardown),
         cmocka_unit_test_setup_teardown(test_savepoint, setup, teardown),
         cmocka_unit_test_setup_teardown(test_empty_result, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_auto_dbres_frees_on_scope_exit, setup, teardown),
+        cmocka_unit_test(test_auto_dbres_null_safe),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

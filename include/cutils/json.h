@@ -240,4 +240,21 @@ void json_iter_end_p   (cutils_json_iter_t  *p);
  * explicitly on the success path. */
 void json_elem_commit_p(cutils_json_elem_t *p);
 
+/* Scoped cleanup macros — declare handles with these attributes to get
+ * automatic cleanup on scope exit:
+ *
+ *   CUTILS_AUTO_JSON_REQ  cutils_json_req_t  *req  = NULL;
+ *   CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
+ *   CUTILS_AUTO_JSON_ITER cutils_json_iter_t  it;    / * stack object * /
+ *   CUTILS_AUTO_JSON_ELEM cutils_json_elem_t  elem;  / * stack object * /
+ *
+ * Pointer-typed handles (REQ, RESP) must be initialized to NULL.
+ * Stack-typed handles (ITER, ELEM) are initialized via the begin
+ * functions — the cleanup helpers are no-ops on uninitialized state.
+ * ELEM commits on json_elem_commit(), discards otherwise. */
+#define CUTILS_AUTO_JSON_REQ  __attribute__((cleanup(json_req_free_p)))
+#define CUTILS_AUTO_JSON_RESP __attribute__((cleanup(json_resp_free_p)))
+#define CUTILS_AUTO_JSON_ITER __attribute__((cleanup(json_iter_end_p)))
+#define CUTILS_AUTO_JSON_ELEM __attribute__((cleanup(json_elem_commit_p)))
+
 #endif

@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "cutils/error_loop.h"
+#include "cutils/mem.h"
 
 /* Track callback invocations */
 static int cb_called = 0;
@@ -296,6 +297,26 @@ static void test_normalization_nonhex_in_uuid(void **state)
     error_loop_free(det);
 }
 
+static void test_auto_errloop_frees_on_scope_exit(void **state)
+{
+    (void)state;
+    {
+        CUTILS_AUTO_ERRLOOP error_loop_t *det =
+            error_loop_create(3, 0, test_callback, NULL);
+        assert_non_null(det);
+        error_loop_report(det, "anything");
+        /* No explicit error_loop_free — cleanup on scope exit.
+         * ASAN validates under make test-asan. */
+    }
+}
+
+static void test_auto_errloop_null_safe(void **state)
+{
+    (void)state;
+    CUTILS_AUTO_ERRLOOP error_loop_t *det = NULL;
+    (void)det;
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -318,6 +339,8 @@ int main(void)
         cmocka_unit_test_setup(test_normalization_hex_followed_by_alpha, setup),
         cmocka_unit_test_setup(test_normalization_incomplete_uuid, setup),
         cmocka_unit_test_setup(test_normalization_nonhex_in_uuid, setup),
+        cmocka_unit_test_setup(test_auto_errloop_frees_on_scope_exit, setup),
+        cmocka_unit_test_setup(test_auto_errloop_null_safe, setup),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

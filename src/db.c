@@ -265,6 +265,14 @@ void db_result_free(db_result_t *result)
     free(result);
 }
 
+void db_result_free_p(db_result_t **result)
+{
+    if (*result) {
+        db_result_free(*result);
+        *result = NULL;
+    }
+}
+
 /* --- Transactions --- */
 
 int db_begin(cutils_db_t *db)
