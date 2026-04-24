@@ -34,6 +34,11 @@ CFLAGS = $(RELEASE_CFLAGS)
 VENDOR_RELAX = -Wno-conversion -Wno-sign-conversion -Wno-cast-qual \
                -Wno-double-promotion -Wno-unused-parameter
 
+# cJSON.h includes a fence that requires callers to opt in explicitly.
+# The library's own wrapper (src/json.c) and the vendored cJSON.c
+# compile legitimately — set the define for both.
+VENDOR_CJSON_ALLOW = -DCUTILS_CJSON_ALLOW
+
 # Source files
 SRCS     = src/error.c \
            src/mem.c \
@@ -76,7 +81,7 @@ $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/vendor/%.o: lib/cJSON/%.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(VENDOR_RELAX) -c $< -o $@
+	$(CC) $(CFLAGS) $(VENDOR_RELAX) $(VENDOR_CJSON_ALLOW) -c $< -o $@
 
 # Syntax check
 check:
@@ -99,7 +104,7 @@ $(TEST_DIR)/obj/%.o: src/%.c | $(TEST_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TEST_DIR)/vendor/%.o: lib/cJSON/%.c | $(TEST_DIR)
-	$(CC) $(CFLAGS) $(VENDOR_RELAX) -c $< -o $@
+	$(CC) $(CFLAGS) $(VENDOR_RELAX) $(VENDOR_CJSON_ALLOW) -c $< -o $@
 
 $(TEST_LIB): $(TEST_ALL_OBJS) | $(TEST_DIR)
 	$(AR) rcs $@ $^
