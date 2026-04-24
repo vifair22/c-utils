@@ -1,6 +1,8 @@
 #ifndef CUTILS_LOG_H
 #define CUTILS_LOG_H
 
+#include "cutils/mem.h"
+
 /* --- Logging subsystem ---
  *
  * Dual output: stdout (info/debug/warning) + stderr (error).
@@ -30,6 +32,7 @@ typedef struct cutils_db cutils_db_t;
  * db may be NULL to disable DB persistence.
  * retention_days controls auto-cleanup (0 = no cleanup).
  * level sets the minimum log level for output. */
+CUTILS_MUST_USE
 int log_init(cutils_db_t *db, log_level_t level, int retention_days);
 
 /* Shut down the logging subsystem. Drains pending writes. */

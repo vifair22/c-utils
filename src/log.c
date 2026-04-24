@@ -1,6 +1,7 @@
 #include "cutils/log.h"
 #include "cutils/db.h"
 #include "cutils/error.h"
+#include "cutils/mem.h"
 
 #include <pthread.h>
 #include <stdarg.h>
@@ -116,13 +117,12 @@ static void print_to_console(const char *timestamp, log_level_t level,
 static void fire_streams(const char *timestamp, const char *level_s,
                          const char *func, const char *message)
 {
-    pthread_mutex_lock(&stream_mutex);
+    CUTILS_LOCK_GUARD(&stream_mutex);
     for (int i = 0; i < MAX_STREAMS; i++) {
         if (log_streams[i].active && log_streams[i].fn)
             log_streams[i].fn(timestamp, level_s, func, message,
                               log_streams[i].userdata);
     }
-    pthread_mutex_unlock(&stream_mutex);
 }
 
 /* --- DB writer thread --- */
@@ -134,10 +134,12 @@ static void write_entry_to_db(const log_entry_t *entry)
     const char *params[] = {
         entry->timestamp, entry->level, entry->func, entry->message, NULL
     };
-    db_execute_non_query(log_db,
+    /* Writer thread is fire-and-forget — a DB insert failure here would
+     * recurse if we tried to log it. Drop silently. */
+    CUTILS_UNUSED(db_execute_non_query(log_db,
         "INSERT INTO logs (timestamp, level, function, message) "
         "VALUES (?, ?, ?, ?)",
-        params, NULL);
+        params, NULL));
 }
 
 static void do_cleanup(void)
@@ -153,8 +155,9 @@ static void do_cleanup(void)
 
     const char *params[] = { cutoff, NULL };
     int affected = 0;
-    db_execute_non_query(log_db,
-        "DELETE FROM logs WHERE timestamp < ?", params, &affected);
+    /* Cleanup runs on a background thread — caller has no handle to fail. */
+    CUTILS_UNUSED(db_execute_non_query(log_db,
+        "DELETE FROM logs WHERE timestamp < ?", params, &affected));
 
     if (affected > 0) {
         char msg[128];
@@ -165,10 +168,10 @@ static void do_cleanup(void)
         get_timestamp(ts_now, sizeof(ts_now));
 
         const char *ins_params[] = { ts_now, "info", "log_cleanup", msg, NULL };
-        db_execute_non_query(log_db,
+        CUTILS_UNUSED(db_execute_non_query(log_db,
             "INSERT INTO logs (timestamp, level, function, message) "
             "VALUES (?, ?, ?, ?)",
-            ins_params, NULL);
+            ins_params, NULL));
     }
 }
 
@@ -179,19 +182,20 @@ static void *log_writer_thread(void *arg)
     time_t last_cleanup = 0;
 
     while (1) {
-        pthread_mutex_lock(&log_mutex);
+        /* Drain the queue while holding the mutex; write outside the
+         * critical section so DB work doesn't block enqueuers. */
+        log_entry_t *batch;
+        int          stopping;
+        {
+            CUTILS_LOCK_GUARD(&log_mutex);
+            while (!log_queue_head && !log_stop)
+                pthread_cond_wait(&log_cond, &log_mutex);
 
-        /* Wait for entries or stop signal */
-        while (!log_queue_head && !log_stop)
-            pthread_cond_wait(&log_cond, &log_mutex);
-
-        /* Drain the queue */
-        log_entry_t *batch = log_queue_head;
-        log_queue_head = NULL;
-        log_queue_tail = NULL;
-        int stopping = log_stop;
-
-        pthread_mutex_unlock(&log_mutex);
+            batch          = log_queue_head;
+            log_queue_head = NULL;
+            log_queue_tail = NULL;
+            stopping       = log_stop;
+        }
 
         /* Write batch to DB */
         while (batch) {
@@ -220,7 +224,7 @@ static void *log_writer_thread(void *arg)
 static void enqueue_entry(const char *timestamp, log_level_t level,
                           const char *func, const char *message)
 {
-    log_entry_t *entry = calloc(1, sizeof(*entry));
+    CUTILS_AUTOFREE log_entry_t *entry = calloc(1, sizeof(*entry));
     if (!entry) return;
 
     snprintf(entry->timestamp, sizeof(entry->timestamp), "%s", timestamp);
@@ -229,19 +233,19 @@ static void enqueue_entry(const char *timestamp, log_level_t level,
     entry->message = strdup(message);
     entry->next = NULL;
 
-    if (!entry->message) {
-        free(entry);
-        return;
-    }
+    /* If strdup failed, return with CUTILS_AUTOFREE handling entry. */
+    /* cppcheck-suppress memleak */
+    if (!entry->message) return;
 
-    pthread_mutex_lock(&log_mutex);
+    CUTILS_LOCK_GUARD(&log_mutex);
+    /* Transfer ownership into the queue — CUTILS_AUTOFREE becomes a no-op. */
+    log_entry_t *q = CUTILS_MOVE(entry);
     if (log_queue_tail)
-        log_queue_tail->next = entry;
+        log_queue_tail->next = q;
     else
-        log_queue_head = entry;
-    log_queue_tail = entry;
+        log_queue_head = q;
+    log_queue_tail = q;
     pthread_cond_signal(&log_cond);
-    pthread_mutex_unlock(&log_mutex);
 }
 
 /* --- Public API --- */
@@ -271,10 +275,11 @@ void log_shutdown(void)
     log_running = 0;
 
     if (log_db) {
-        pthread_mutex_lock(&log_mutex);
-        log_stop = 1;
-        pthread_cond_signal(&log_cond);
-        pthread_mutex_unlock(&log_mutex);
+        {
+            CUTILS_LOCK_GUARD(&log_mutex);
+            log_stop = 1;
+            pthread_cond_signal(&log_cond);
+        }
 
         pthread_join(log_thread, NULL);
     }
@@ -303,28 +308,25 @@ log_level_t log_get_level(void)
 
 int log_stream_register(log_stream_fn fn, void *userdata)
 {
-    pthread_mutex_lock(&stream_mutex);
+    CUTILS_LOCK_GUARD(&stream_mutex);
     for (int i = 0; i < MAX_STREAMS; i++) {
         if (!log_streams[i].active) {
             log_streams[i].fn = fn;
             log_streams[i].userdata = userdata;
             log_streams[i].active = 1;
-            pthread_mutex_unlock(&stream_mutex);
             return i;
         }
     }
-    pthread_mutex_unlock(&stream_mutex);
     return -1;
 }
 
 void log_stream_unregister(int handle)
 {
     if (handle < 0 || handle >= MAX_STREAMS) return;
-    pthread_mutex_lock(&stream_mutex);
+    CUTILS_LOCK_GUARD(&stream_mutex);
     log_streams[handle].active = 0;
     log_streams[handle].fn = NULL;
     log_streams[handle].userdata = NULL;
-    pthread_mutex_unlock(&stream_mutex);
 }
 
 void log_write(log_level_t level, const char *func, const char *fmt, ...)

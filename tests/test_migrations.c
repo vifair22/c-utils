@@ -22,7 +22,7 @@ static int setup(void **state)
     /* Clean up migration dir */
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", TEST_MIG_DIR);
-    (void)system(cmd);
+    CUTILS_UNUSED(system(cmd));
     mkdir(TEST_MIG_DIR, 0755);
     return 0;
 }
@@ -35,7 +35,7 @@ static int teardown(void **state)
     unlink(TEST_DB "-shm");
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", TEST_MIG_DIR);
-    (void)system(cmd);
+    CUTILS_UNUSED(system(cmd));
     return 0;
 }
 
@@ -93,8 +93,8 @@ static void test_lib_migrations_idempotent(void **state)
 
     /* Count applied migrations */
     db_result_t *result = NULL;
-    db_execute(db, "SELECT COUNT(*) FROM system_migrations WHERE filename LIKE '_lib/%'",
-               NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT COUNT(*) FROM system_migrations WHERE filename LIKE '_lib/%'",
+               NULL, &result), CUTILS_OK);
     assert_int_equal(result->nrows, 1);
     int count = atoi(result->rows[0][0]);
     assert_true(count >= 3); /* config, logs, push */
@@ -108,7 +108,7 @@ static void test_app_migrations(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_run_lib_migrations(db);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
 
     write_migration("001_users.sql",
         "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);");
@@ -119,14 +119,14 @@ static void test_app_migrations(void **state)
 
     /* Verify tables */
     db_result_t *result = NULL;
-    db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='users'",
-               NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='users'",
+               NULL, &result), CUTILS_OK);
     assert_int_equal(result->nrows, 1);
     db_result_free(result);
 
     result = NULL;
-    db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='posts'",
-               NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='posts'",
+               NULL, &result), CUTILS_OK);
     assert_int_equal(result->nrows, 1);
     db_result_free(result);
 
@@ -138,7 +138,7 @@ static void test_app_migrations_idempotent(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_run_lib_migrations(db);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
 
     write_migration("001_users.sql",
         "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);");
@@ -154,7 +154,7 @@ static void test_checksum_mismatch_fails(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_run_lib_migrations(db);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
 
     write_migration("001_users.sql",
         "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);");
@@ -173,7 +173,7 @@ static void test_failed_migration_rolls_back(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_run_lib_migrations(db);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
 
     write_migration("001_good.sql",
         "CREATE TABLE good (id INTEGER PRIMARY KEY);");
@@ -184,8 +184,8 @@ static void test_failed_migration_rolls_back(void **state)
 
     /* good table should NOT exist — entire batch rolled back */
     db_result_t *result = NULL;
-    db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='good'",
-               NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='good'",
+               NULL, &result), CUTILS_OK);
     assert_int_equal(result->nrows, 0);
     db_result_free(result);
 
@@ -221,20 +221,20 @@ static void test_compiled_migrations(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_run_lib_migrations(db);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
 
     assert_int_equal(db_run_compiled_migrations(db, compiled_migrations), CUTILS_OK);
 
     /* Verify tables created */
     db_result_t *result = NULL;
-    db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='widgets'",
-               NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='widgets'",
+               NULL, &result), CUTILS_OK);
     assert_int_equal(result->nrows, 1);
     db_result_free(result);
 
     result = NULL;
-    db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='gadgets'",
-               NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='gadgets'",
+               NULL, &result), CUTILS_OK);
     assert_int_equal(result->nrows, 1);
     db_result_free(result);
 
@@ -246,16 +246,16 @@ static void test_compiled_migrations_idempotent(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_run_lib_migrations(db);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
 
     assert_int_equal(db_run_compiled_migrations(db, compiled_migrations), CUTILS_OK);
     assert_int_equal(db_run_compiled_migrations(db, compiled_migrations), CUTILS_OK);
 
     /* Count — should be exactly 2 (no _lib/ prefix) */
     db_result_t *result = NULL;
-    db_execute(db,
+    assert_int_equal(db_execute(db,
         "SELECT COUNT(*) FROM system_migrations WHERE filename NOT LIKE '_lib/%'",
-        NULL, &result);
+        NULL, &result), CUTILS_OK);
     assert_int_equal(result->nrows, 1);
     assert_int_equal(atoi(result->rows[0][0]), 2);
     db_result_free(result);
@@ -268,7 +268,7 @@ static void test_compiled_migrations_checksum_mismatch(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_run_lib_migrations(db);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
 
     assert_int_equal(db_run_compiled_migrations(db, compiled_migrations), CUTILS_OK);
 
@@ -299,7 +299,7 @@ static void test_compiled_and_file_migrations_coexist(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_run_lib_migrations(db);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
 
     /* Run compiled migrations first */
     assert_int_equal(db_run_compiled_migrations(db, compiled_migrations), CUTILS_OK);
@@ -311,14 +311,14 @@ static void test_compiled_and_file_migrations_coexist(void **state)
 
     /* All three app tables should exist */
     db_result_t *result = NULL;
-    db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='widgets'",
-               NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='widgets'",
+               NULL, &result), CUTILS_OK);
     assert_int_equal(result->nrows, 1);
     db_result_free(result);
 
     result = NULL;
-    db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='extras'",
-               NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='extras'",
+               NULL, &result), CUTILS_OK);
     assert_int_equal(result->nrows, 1);
     db_result_free(result);
 

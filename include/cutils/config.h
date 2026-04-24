@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 
+#include "cutils/mem.h"
+
 /* --- Config manager ---
  *
  * Two-store config system:
@@ -66,6 +68,7 @@ typedef struct cutils_config cutils_config_t;
  *
  * Returns CUTILS_OK, CUTILS_ERR_CONFIG (validation), or negative on error.
  * Returns CUTILS_ERR_NOT_FOUND if file was generated and first_run == EXIT. */
+CUTILS_MUST_USE
 int config_init(cutils_config_t **cfg,
                 const char *app_name,
                 const char *config_path,
@@ -95,11 +98,13 @@ int config_get_bool(const cutils_config_t *cfg, const char *key, int default_val
 /* Update a file-backed key. Rewrites the YAML file preserving comments.
  * Returns CUTILS_ERR_INVALID if the key is a hard minimum (immutable).
  * Returns CUTILS_ERR_NOT_FOUND if the key doesn't exist. */
+CUTILS_MUST_USE
 int config_set(cutils_config_t *cfg, const char *key, const char *value);
 
 /* Update a DB-backed key.
  * Returns CUTILS_ERR_NOT_FOUND if the key doesn't exist.
  * Returns CUTILS_ERR_INVALID if the key is file-backed. */
+CUTILS_MUST_USE
 int config_set_db(cutils_config_t *cfg, const char *key, const char *value);
 
 /* --- DB config integration --- */
@@ -111,6 +116,7 @@ typedef struct cutils_db cutils_db_t;
  * Seeds any new keys into the config table with their defaults.
  * Must be called after config_init() and db_open() + migrations.
  * db_keys array must be terminated with a {NULL} sentinel. */
+CUTILS_MUST_USE
 int config_attach_db(cutils_config_t *cfg, cutils_db_t *db,
                      const config_key_t *db_keys);
 

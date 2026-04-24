@@ -1,5 +1,6 @@
 #include "config_yaml.h"
 #include "cutils/config.h"
+#include "cutils/mem.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,7 +105,7 @@ yaml_doc_t *yaml_parse_file(const char *path)
     yaml_doc_t *doc = calloc(1, sizeof(*doc));
     if (!doc) return NULL;
 
-    FILE *f = fopen(path, "r");
+    CUTILS_AUTOCLOSE FILE *f = fopen(path, "r");
     if (!f) return doc; /* Empty document for missing file */
 
     char line[1024];
@@ -153,7 +154,9 @@ yaml_doc_t *yaml_parse_file(const char *path)
             if (colon) {
                 *colon = '\0';
                 char *key = kvbuf;
-                char *val = (char *)skip_whitespace(colon + 1);
+                /* Walk past whitespace on the mutable local — no const cast. */
+                char *val = colon + 1;
+                while (*val == ' ' || *val == '\t') val++;
                 strip_trailing_whitespace(key);
                 strip_comment_and_unquote(val);
                 strip_trailing_whitespace(val);
@@ -162,7 +165,6 @@ yaml_doc_t *yaml_parse_file(const char *path)
         }
     }
 
-    fclose(f);
     return doc;
 }
 
@@ -293,13 +295,12 @@ int yaml_set(yaml_doc_t *doc, const char *dotkey, const char *value)
 
 int yaml_write_file(const yaml_doc_t *doc, const char *path)
 {
-    FILE *f = fopen(path, "w");
+    CUTILS_AUTOCLOSE FILE *f = fopen(path, "w");
     if (!f) return -1;
 
     for (int i = 0; i < doc->nlines; i++)
         fprintf(f, "%s\n", doc->lines[i]);
 
-    fclose(f);
     return 0;
 }
 
@@ -312,7 +313,7 @@ int yaml_generate_template(const char *path,
     const config_key_t *keys = keys_ptr;
     const config_section_t *sections = sections_ptr;
 
-    FILE *f = fopen(path, "w");
+    CUTILS_AUTOCLOSE FILE *f = fopen(path, "w");
     if (!f) return -1;
 
     /* Track which sections we've already written */
@@ -366,6 +367,5 @@ int yaml_generate_template(const char *path,
         }
     }
 
-    fclose(f);
     return 0;
 }

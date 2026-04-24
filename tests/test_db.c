@@ -3,6 +3,7 @@
 #include <setjmp.h>
 #include <cmocka.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -63,11 +64,17 @@ static void test_select(void **state)
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
 
-    db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+    assert_int_equal(
+        db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"),
+        CUTILS_OK);
     const char *p1[] = { "alice", NULL };
     const char *p2[] = { "bob", NULL };
-    db_execute_non_query(db, "INSERT INTO t (name) VALUES (?)", p1, NULL);
-    db_execute_non_query(db, "INSERT INTO t (name) VALUES (?)", p2, NULL);
+    assert_int_equal(
+        db_execute_non_query(db, "INSERT INTO t (name) VALUES (?)", p1, NULL),
+        CUTILS_OK);
+    assert_int_equal(
+        db_execute_non_query(db, "INSERT INTO t (name) VALUES (?)", p2, NULL),
+        CUTILS_OK);
 
     db_result_t *result = NULL;
     assert_int_equal(
@@ -91,15 +98,20 @@ static void test_transaction_commit(void **state)
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
 
-    db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+    assert_int_equal(
+        db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)"),
+        CUTILS_OK);
 
     assert_int_equal(db_begin(db), CUTILS_OK);
     const char *p[] = { "inside_txn", NULL };
-    db_execute_non_query(db, "INSERT INTO t (val) VALUES (?)", p, NULL);
+    assert_int_equal(
+        db_execute_non_query(db, "INSERT INTO t (val) VALUES (?)", p, NULL),
+        CUTILS_OK);
     assert_int_equal(db_commit(db), CUTILS_OK);
 
     db_result_t *result = NULL;
-    db_execute(db, "SELECT val FROM t", NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT val FROM t", NULL, &result),
+                     CUTILS_OK);
     assert_int_equal(result->nrows, 1);
     assert_string_equal(result->rows[0][0], "inside_txn");
 
@@ -113,15 +125,20 @@ static void test_transaction_rollback(void **state)
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
 
-    db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+    assert_int_equal(
+        db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)"),
+        CUTILS_OK);
 
     assert_int_equal(db_begin(db), CUTILS_OK);
     const char *p[] = { "should_vanish", NULL };
-    db_execute_non_query(db, "INSERT INTO t (val) VALUES (?)", p, NULL);
+    assert_int_equal(
+        db_execute_non_query(db, "INSERT INTO t (val) VALUES (?)", p, NULL),
+        CUTILS_OK);
     assert_int_equal(db_rollback(db), CUTILS_OK);
 
     db_result_t *result = NULL;
-    db_execute(db, "SELECT val FROM t", NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT val FROM t", NULL, &result),
+                     CUTILS_OK);
     assert_int_equal(result->nrows, 0);
 
     db_result_free(result);
@@ -134,21 +151,28 @@ static void test_savepoint(void **state)
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
 
-    db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
-    db_begin(db);
+    assert_int_equal(
+        db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)"),
+        CUTILS_OK);
+    assert_int_equal(db_begin(db), CUTILS_OK);
 
     const char *p1[] = { "kept", NULL };
-    db_execute_non_query(db, "INSERT INTO t (val) VALUES (?)", p1, NULL);
+    assert_int_equal(
+        db_execute_non_query(db, "INSERT INTO t (val) VALUES (?)", p1, NULL),
+        CUTILS_OK);
 
-    db_savepoint(db, "sp1");
+    assert_int_equal(db_savepoint(db, "sp1"), CUTILS_OK);
     const char *p2[] = { "rolled_back", NULL };
-    db_execute_non_query(db, "INSERT INTO t (val) VALUES (?)", p2, NULL);
-    db_savepoint_rollback(db, "sp1");
+    assert_int_equal(
+        db_execute_non_query(db, "INSERT INTO t (val) VALUES (?)", p2, NULL),
+        CUTILS_OK);
+    assert_int_equal(db_savepoint_rollback(db, "sp1"), CUTILS_OK);
 
-    db_commit(db);
+    assert_int_equal(db_commit(db), CUTILS_OK);
 
     db_result_t *result = NULL;
-    db_execute(db, "SELECT val FROM t", NULL, &result);
+    assert_int_equal(db_execute(db, "SELECT val FROM t", NULL, &result),
+                     CUTILS_OK);
     assert_int_equal(result->nrows, 1);
     assert_string_equal(result->rows[0][0], "kept");
 
@@ -161,7 +185,9 @@ static void test_empty_result(void **state)
     (void)state;
     cutils_db_t *db = NULL;
     assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
-    db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+    assert_int_equal(
+        db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY)"),
+        CUTILS_OK);
 
     db_result_t *result = NULL;
     assert_int_equal(db_execute(db, "SELECT * FROM t", NULL, &result), CUTILS_OK);
@@ -169,6 +195,107 @@ static void test_empty_result(void **state)
     assert_int_equal(result->nrows, 0);
 
     db_result_free(result);
+    db_close(db);
+}
+
+static void test_auto_dbres_frees_on_scope_exit(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE t (v TEXT)"), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db, "INSERT INTO t VALUES ('auto')"),
+                     CUTILS_OK);
+
+    {
+        CUTILS_AUTO_DBRES db_result_t *r = NULL;
+        assert_int_equal(db_execute(db, "SELECT v FROM t", NULL, &r), CUTILS_OK);
+        assert_non_null(r);
+        assert_int_equal(r->nrows, 1);
+        assert_string_equal(r->rows[0][0], "auto");
+        /* No explicit db_result_free — cleanup fires on block exit.
+         * ASAN validates under make test-asan. */
+    }
+
+    db_close(db);
+}
+
+static void test_auto_dbres_null_safe(void **state)
+{
+    (void)state;
+    CUTILS_AUTO_DBRES db_result_t *r = NULL;
+    (void)r;
+    /* Cleanup must tolerate NULL without crashing. */
+}
+
+/* --- CUTILS_AUTO_DB_TX --- */
+
+static int count_rows(cutils_db_t *db)
+{
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT COUNT(*) FROM tx", NULL, &r),
+                     CUTILS_OK);
+    int n = atoi(r->rows[0][0]);
+    db_result_free(r);
+    return n;
+}
+
+static void test_auto_db_tx_commit_persists(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE tx (v TEXT)"), CUTILS_OK);
+
+    {
+        CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+        assert_int_equal(cutils_db_tx_begin(db, &tx), CUTILS_OK);
+        assert_int_equal(
+            db_exec_raw(db, "INSERT INTO tx VALUES ('committed')"), CUTILS_OK);
+        assert_int_equal(db_tx_commit(&tx), CUTILS_OK);
+    }
+
+    assert_int_equal(count_rows(db), 1);
+    db_close(db);
+}
+
+static void test_auto_db_tx_rolls_back_on_early_return(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE tx (v TEXT)"), CUTILS_OK);
+
+    for (int i = 0; i < 1; i++) {
+        CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+        assert_int_equal(cutils_db_tx_begin(db, &tx), CUTILS_OK);
+        assert_int_equal(
+            db_exec_raw(db, "INSERT INTO tx VALUES ('dropped')"), CUTILS_OK);
+        break;  /* scope exits without commit — cleanup rolls back */
+    }
+
+    assert_int_equal(count_rows(db), 0);
+    db_close(db);
+}
+
+static void test_auto_db_tx_commit_is_idempotent(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE tx (v TEXT)"), CUTILS_OK);
+
+    {
+        CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+        assert_int_equal(cutils_db_tx_begin(db, &tx), CUTILS_OK);
+        assert_int_equal(
+            db_exec_raw(db, "INSERT INTO tx VALUES ('once')"), CUTILS_OK);
+        assert_int_equal(db_tx_commit(&tx), CUTILS_OK);
+        /* Second commit is a no-op — must not error. */
+        assert_int_equal(db_tx_commit(&tx), CUTILS_OK);
+    }
+
+    assert_int_equal(count_rows(db), 1);
     db_close(db);
 }
 
@@ -182,6 +309,11 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_transaction_rollback, setup, teardown),
         cmocka_unit_test_setup_teardown(test_savepoint, setup, teardown),
         cmocka_unit_test_setup_teardown(test_empty_result, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_auto_dbres_frees_on_scope_exit, setup, teardown),
+        cmocka_unit_test(test_auto_dbres_null_safe),
+        cmocka_unit_test_setup_teardown(test_auto_db_tx_commit_persists, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_auto_db_tx_rolls_back_on_early_return, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_auto_db_tx_commit_is_idempotent, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

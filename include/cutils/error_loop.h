@@ -24,6 +24,8 @@
 
 #include <stddef.h>
 
+#include "cutils/mem.h"
+
 /* Callback fired when threshold is reached.
  * message is the raw (un-normalized) error message.
  * count is the number of consecutive occurrences. */
@@ -37,11 +39,23 @@ typedef struct error_loop error_loop_t;
  * cooldown_sec: seconds to suppress after triggering (0 = no cooldown).
  * on_loop: callback, or NULL for default (logs at error level).
  * userdata: passed to callback. */
+CUTILS_MUST_USE CUTILS_MALLOC_FN
 error_loop_t *error_loop_create(int threshold, int cooldown_sec,
                                 error_loop_fn on_loop, void *userdata);
 
 /* Free a detector. */
 void error_loop_free(error_loop_t *det);
+
+/* Cleanup helper for __attribute__((cleanup(...))).
+ * Frees *det and sets *det to NULL. Use via CUTILS_AUTO_ERRLOOP. */
+void error_loop_free_p(error_loop_t **det);
+
+/* Scoped cleanup for error_loop_t *:
+ *
+ *   CUTILS_AUTO_ERRLOOP error_loop_t *det = error_loop_create(5, 300, NULL, NULL);
+ *   / * det is freed automatically on scope exit * /
+ */
+#define CUTILS_AUTO_ERRLOOP __attribute__((cleanup(error_loop_free_p)))
 
 /* Report an error from the main loop.
  * Below threshold: logs normally.

@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "cutils/mem.h"
+
 /* --- JSON wrapper ---
  *
  * Type-safe JSON request parsing and response building.
@@ -44,6 +46,7 @@ typedef struct cutils_json_resp cutils_json_resp_t;
 /* Parse a JSON object from a buffer. Input buffer is not retained;
  * the request handle owns its own copy of the parsed data.
  * Returns CUTILS_OK on success, CUTILS_ERR_JSON on parse failure. */
+CUTILS_MUST_USE
 int json_req_parse(const char *buf, size_t len, cutils_json_req_t **out);
 
 /* Free a request handle. Safe to call with NULL. */
@@ -53,27 +56,35 @@ void json_req_free(cutils_json_req_t *req);
 
 /* Extract a required string. On success, *out is a malloc'd copy (caller frees).
  * On failure, *out is NULL. */
+CUTILS_MUST_USE
 int json_req_get_str (const cutils_json_req_t *req, const char *path, char **out);
 
 /* Same as json_req_get_str but tolerant of absence: if the path is missing,
  * succeeds with *out = NULL. Type mismatch still fails. */
+CUTILS_MUST_USE
 int json_req_get_str_opt(const cutils_json_req_t *req, const char *path, char **out);
 
 /* Numeric getters — min/max are required. Pass the type's full range for
  * unbounded fields (explicit opt-out). Fails on absence, type mismatch,
  * or out-of-range value. */
+CUTILS_MUST_USE
 int json_req_get_u32 (const cutils_json_req_t *req, const char *path,
                       uint32_t *out, uint32_t min, uint32_t max);
+CUTILS_MUST_USE
 int json_req_get_u64 (const cutils_json_req_t *req, const char *path,
                       uint64_t *out, uint64_t min, uint64_t max);
+CUTILS_MUST_USE
 int json_req_get_i32 (const cutils_json_req_t *req, const char *path,
                       int32_t *out, int32_t min, int32_t max);
+CUTILS_MUST_USE
 int json_req_get_i64 (const cutils_json_req_t *req, const char *path,
                       int64_t *out, int64_t min, int64_t max);
+CUTILS_MUST_USE
 int json_req_get_f64 (const cutils_json_req_t *req, const char *path,
                       double *out, double min, double max);
 
 /* Boolean getter. Fails on absence or type mismatch. */
+CUTILS_MUST_USE
 int json_req_get_bool(const cutils_json_req_t *req, const char *path, bool *out);
 
 /* --- Presence / structural queries --- */
@@ -85,6 +96,7 @@ bool json_req_has    (const cutils_json_req_t *req, const char *path);
 bool json_req_is_null(const cutils_json_req_t *req, const char *path);
 
 /* Length of the array at path. Returns CUTILS_ERR_JSON if absent or not an array. */
+CUTILS_MUST_USE
 int  json_req_array_len(const cutils_json_req_t *req, const char *path, size_t *out);
 
 /* --- Array iteration ---
@@ -111,6 +123,7 @@ typedef struct {
 } cutils_json_iter_t;
 
 /* Initialize iterator over the array at path. Fails if absent or not an array. */
+CUTILS_MUST_USE
 int  json_iter_begin(const cutils_json_req_t *req, const char *path,
                      cutils_json_iter_t *iter);
 
@@ -124,17 +137,24 @@ void json_iter_end  (cutils_json_iter_t *iter);
 
 /* Element getters — read fields from the current element of the iterator.
  * Paths are dot-notation relative to the element object. */
+CUTILS_MUST_USE
 int  json_iter_get_str (const cutils_json_iter_t *iter, const char *path, char **out);
+CUTILS_MUST_USE
 int  json_iter_get_u32 (const cutils_json_iter_t *iter, const char *path,
                         uint32_t *out, uint32_t min, uint32_t max);
+CUTILS_MUST_USE
 int  json_iter_get_u64 (const cutils_json_iter_t *iter, const char *path,
                         uint64_t *out, uint64_t min, uint64_t max);
+CUTILS_MUST_USE
 int  json_iter_get_i32 (const cutils_json_iter_t *iter, const char *path,
                         int32_t *out, int32_t min, int32_t max);
+CUTILS_MUST_USE
 int  json_iter_get_i64 (const cutils_json_iter_t *iter, const char *path,
                         int64_t *out, int64_t min, int64_t max);
+CUTILS_MUST_USE
 int  json_iter_get_f64 (const cutils_json_iter_t *iter, const char *path,
                         double *out, double min, double max);
+CUTILS_MUST_USE
 int  json_iter_get_bool(const cutils_json_iter_t *iter, const char *path, bool *out);
 
 /* ============================================================ */
@@ -142,6 +162,7 @@ int  json_iter_get_bool(const cutils_json_iter_t *iter, const char *path, bool *
 /* ============================================================ */
 
 /* Allocate an empty response builder (root is an empty object). */
+CUTILS_MUST_USE
 int  json_resp_new     (cutils_json_resp_t **out);
 
 /* Free a response builder. Safe to call with NULL. */
@@ -150,6 +171,7 @@ void json_resp_free    (cutils_json_resp_t *resp);
 /* Serialize the response to a malloc'd buffer (caller frees).
  * Sets *len_out to the byte length (not including the terminating NUL).
  * The builder itself is unchanged and may be further modified or freed. */
+CUTILS_MUST_USE
 int  json_resp_finalize(cutils_json_resp_t *resp, char **buf_out, size_t *len_out);
 
 /* --- Scalar adders ---
@@ -158,14 +180,14 @@ int  json_resp_finalize(cutils_json_resp_t *resp, char **buf_out, size_t *len_ou
  * All strings are copied; caller may free the source string immediately.
  * Adding at an existing path overwrites the previous value.
  */
-int  json_resp_add_str (cutils_json_resp_t *resp, const char *path, const char *val);
-int  json_resp_add_u32 (cutils_json_resp_t *resp, const char *path, uint32_t val);
-int  json_resp_add_u64 (cutils_json_resp_t *resp, const char *path, uint64_t val);
-int  json_resp_add_i32 (cutils_json_resp_t *resp, const char *path, int32_t val);
-int  json_resp_add_i64 (cutils_json_resp_t *resp, const char *path, int64_t val);
-int  json_resp_add_f64 (cutils_json_resp_t *resp, const char *path, double val);
-int  json_resp_add_bool(cutils_json_resp_t *resp, const char *path, bool val);
-int  json_resp_add_null(cutils_json_resp_t *resp, const char *path);
+CUTILS_MUST_USE int  json_resp_add_str (cutils_json_resp_t *resp, const char *path, const char *val);
+CUTILS_MUST_USE int  json_resp_add_u32 (cutils_json_resp_t *resp, const char *path, uint32_t val);
+CUTILS_MUST_USE int  json_resp_add_u64 (cutils_json_resp_t *resp, const char *path, uint64_t val);
+CUTILS_MUST_USE int  json_resp_add_i32 (cutils_json_resp_t *resp, const char *path, int32_t val);
+CUTILS_MUST_USE int  json_resp_add_i64 (cutils_json_resp_t *resp, const char *path, int64_t val);
+CUTILS_MUST_USE int  json_resp_add_f64 (cutils_json_resp_t *resp, const char *path, double val);
+CUTILS_MUST_USE int  json_resp_add_bool(cutils_json_resp_t *resp, const char *path, bool val);
+CUTILS_MUST_USE int  json_resp_add_null(cutils_json_resp_t *resp, const char *path);
 
 /* --- Array building ---
  *
@@ -185,14 +207,14 @@ int  json_resp_add_null(cutils_json_resp_t *resp, const char *path);
  */
 
 /* Append a scalar value to the array at path. Creates the array if absent. */
-int  json_resp_array_append_str (cutils_json_resp_t *resp, const char *path, const char *val);
-int  json_resp_array_append_u32 (cutils_json_resp_t *resp, const char *path, uint32_t val);
-int  json_resp_array_append_u64 (cutils_json_resp_t *resp, const char *path, uint64_t val);
-int  json_resp_array_append_i32 (cutils_json_resp_t *resp, const char *path, int32_t val);
-int  json_resp_array_append_i64 (cutils_json_resp_t *resp, const char *path, int64_t val);
-int  json_resp_array_append_f64 (cutils_json_resp_t *resp, const char *path, double val);
-int  json_resp_array_append_bool(cutils_json_resp_t *resp, const char *path, bool val);
-int  json_resp_array_append_null(cutils_json_resp_t *resp, const char *path);
+CUTILS_MUST_USE int  json_resp_array_append_str (cutils_json_resp_t *resp, const char *path, const char *val);
+CUTILS_MUST_USE int  json_resp_array_append_u32 (cutils_json_resp_t *resp, const char *path, uint32_t val);
+CUTILS_MUST_USE int  json_resp_array_append_u64 (cutils_json_resp_t *resp, const char *path, uint64_t val);
+CUTILS_MUST_USE int  json_resp_array_append_i32 (cutils_json_resp_t *resp, const char *path, int32_t val);
+CUTILS_MUST_USE int  json_resp_array_append_i64 (cutils_json_resp_t *resp, const char *path, int64_t val);
+CUTILS_MUST_USE int  json_resp_array_append_f64 (cutils_json_resp_t *resp, const char *path, double val);
+CUTILS_MUST_USE int  json_resp_array_append_bool(cutils_json_resp_t *resp, const char *path, bool val);
+CUTILS_MUST_USE int  json_resp_array_append_null(cutils_json_resp_t *resp, const char *path);
 
 /* Element builder handle — stack-allocated. */
 typedef struct {
@@ -208,6 +230,7 @@ typedef struct {
  * success path. If the element leaves scope without being committed, the
  * cleanup helper json_elem_commit_p discards it — this prevents partial
  * elements from leaking into the response when an error path bails out. */
+CUTILS_MUST_USE
 int  json_resp_array_append_begin(cutils_json_resp_t *resp, const char *path,
                                   cutils_json_elem_t *elem);
 
@@ -217,14 +240,14 @@ int  json_resp_array_append_begin(cutils_json_resp_t *resp, const char *path,
 void json_elem_commit(cutils_json_elem_t *elem);
 
 /* Element scalar adders — paths are dot-notation relative to the element. */
-int  json_elem_add_str (cutils_json_elem_t *elem, const char *path, const char *val);
-int  json_elem_add_u32 (cutils_json_elem_t *elem, const char *path, uint32_t val);
-int  json_elem_add_u64 (cutils_json_elem_t *elem, const char *path, uint64_t val);
-int  json_elem_add_i32 (cutils_json_elem_t *elem, const char *path, int32_t val);
-int  json_elem_add_i64 (cutils_json_elem_t *elem, const char *path, int64_t val);
-int  json_elem_add_f64 (cutils_json_elem_t *elem, const char *path, double val);
-int  json_elem_add_bool(cutils_json_elem_t *elem, const char *path, bool val);
-int  json_elem_add_null(cutils_json_elem_t *elem, const char *path);
+CUTILS_MUST_USE int  json_elem_add_str (cutils_json_elem_t *elem, const char *path, const char *val);
+CUTILS_MUST_USE int  json_elem_add_u32 (cutils_json_elem_t *elem, const char *path, uint32_t val);
+CUTILS_MUST_USE int  json_elem_add_u64 (cutils_json_elem_t *elem, const char *path, uint64_t val);
+CUTILS_MUST_USE int  json_elem_add_i32 (cutils_json_elem_t *elem, const char *path, int32_t val);
+CUTILS_MUST_USE int  json_elem_add_i64 (cutils_json_elem_t *elem, const char *path, int64_t val);
+CUTILS_MUST_USE int  json_elem_add_f64 (cutils_json_elem_t *elem, const char *path, double val);
+CUTILS_MUST_USE int  json_elem_add_bool(cutils_json_elem_t *elem, const char *path, bool val);
+CUTILS_MUST_USE int  json_elem_add_null(cutils_json_elem_t *elem, const char *path);
 
 /* ============================================================ */
 /* Cleanup helpers — for use with __attribute__((cleanup(...)))  */
@@ -239,5 +262,22 @@ void json_iter_end_p   (cutils_json_iter_t  *p);
  * cleanup for json_resp_array_append_begin — call json_elem_commit()
  * explicitly on the success path. */
 void json_elem_commit_p(cutils_json_elem_t *p);
+
+/* Scoped cleanup macros — declare handles with these attributes to get
+ * automatic cleanup on scope exit:
+ *
+ *   CUTILS_AUTO_JSON_REQ  cutils_json_req_t  *req  = NULL;
+ *   CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
+ *   CUTILS_AUTO_JSON_ITER cutils_json_iter_t  it;    / * stack object * /
+ *   CUTILS_AUTO_JSON_ELEM cutils_json_elem_t  elem;  / * stack object * /
+ *
+ * Pointer-typed handles (REQ, RESP) must be initialized to NULL.
+ * Stack-typed handles (ITER, ELEM) are initialized via the begin
+ * functions — the cleanup helpers are no-ops on uninitialized state.
+ * ELEM commits on json_elem_commit(), discards otherwise. */
+#define CUTILS_AUTO_JSON_REQ  __attribute__((cleanup(json_req_free_p)))
+#define CUTILS_AUTO_JSON_RESP __attribute__((cleanup(json_resp_free_p)))
+#define CUTILS_AUTO_JSON_ITER __attribute__((cleanup(json_iter_end_p)))
+#define CUTILS_AUTO_JSON_ELEM __attribute__((cleanup(json_elem_commit_p)))
 
 #endif

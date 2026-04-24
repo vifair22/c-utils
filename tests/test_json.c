@@ -630,13 +630,13 @@ static void test_resp_add_overwrites(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
     assert_int_equal(json_resp_add_u32(resp, "port", 80U), CUTILS_OK);
     assert_int_equal(json_resp_add_u32(resp, "port", 443U), CUTILS_OK);
 
     char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
     size_t len = 0;
-    json_resp_finalize(resp, &buf, &len);
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
 
     cutils_json_req_t *req = parse_or_fail(buf);
     uint32_t port = 0;
@@ -649,12 +649,12 @@ static void test_resp_add_nested_creates_intermediates(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
     assert_int_equal(json_resp_add_str(resp, "a.b.c.d", "deep"), CUTILS_OK);
 
     char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
     size_t len = 0;
-    json_resp_finalize(resp, &buf, &len);
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
 
     cutils_json_req_t *req = parse_or_fail(buf);
     char *out __attribute__((cleanup(cutils_free_p))) = NULL;
@@ -667,8 +667,8 @@ static void test_resp_add_through_non_object_errors(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
-    json_resp_add_u32(resp, "x", 1U);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
+    assert_int_equal(json_resp_add_u32(resp, "x", 1U), CUTILS_OK);
     /* Now try to add "x.y" — x is a number, can't be traversed */
     int rv = json_resp_add_str(resp, "x.y", "oops");
     assert_int_equal(rv, CUTILS_ERR_JSON);
@@ -678,7 +678,7 @@ static void test_resp_add_u64_exceeds_2to53(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
     int rv = json_resp_add_u64(resp, "n", 9007199254740993ULL);
     assert_int_equal(rv, CUTILS_ERR_JSON);
     assert_non_null(strstr(cutils_get_error(), "2^53"));
@@ -688,7 +688,7 @@ static void test_resp_add_i64_exceeds_2to53(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
     int rv = json_resp_add_i64(resp, "n", -9007199254740993LL);
     assert_int_equal(rv, CUTILS_ERR_JSON);
 }
@@ -697,7 +697,7 @@ static void test_resp_add_f64_rejects_nonfinite(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
     assert_int_equal(json_resp_add_f64(resp, "x", NAN),      CUTILS_ERR_JSON);
     assert_int_equal(json_resp_add_f64(resp, "x", INFINITY), CUTILS_ERR_JSON);
     assert_int_equal(json_resp_add_f64(resp, "x", -INFINITY),CUTILS_ERR_JSON);
@@ -711,7 +711,7 @@ static void test_resp_array_append_scalars(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
 
     assert_int_equal(json_resp_array_append_str (resp, "list", "a"),   CUTILS_OK);
     assert_int_equal(json_resp_array_append_u32 (resp, "list", 42U),   CUTILS_OK);
@@ -724,7 +724,7 @@ static void test_resp_array_append_scalars(void **state)
 
     char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
     size_t len = 0;
-    json_resp_finalize(resp, &buf, &len);
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
 
     cutils_json_req_t *req = parse_or_fail(buf);
     size_t n = 0;
@@ -737,8 +737,8 @@ static void test_resp_array_append_through_non_array_errors(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
-    json_resp_add_u32(resp, "x", 1U);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
+    assert_int_equal(json_resp_add_u32(resp, "x", 1U), CUTILS_OK);
     int rv = json_resp_array_append_str(resp, "x", "oops");
     assert_int_equal(rv, CUTILS_ERR_JSON);
 }
@@ -747,7 +747,7 @@ static void test_resp_array_append_u64_exceeds_rejected(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
     int rv = json_resp_array_append_u64(resp, "xs", 9007199254740993ULL);
     assert_int_equal(rv, CUTILS_ERR_JSON);
 }
@@ -756,7 +756,7 @@ static void test_resp_array_append_f64_nonfinite_rejected(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
     assert_int_equal(json_resp_array_append_f64(resp, "xs", NAN), CUTILS_ERR_JSON);
 }
 
@@ -768,7 +768,7 @@ static void test_elem_build_and_commit(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
 
     {
         cutils_json_elem_t elem __attribute__((cleanup(json_elem_commit_p)));
@@ -780,21 +780,21 @@ static void test_elem_build_and_commit(void **state)
 
     char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
     size_t len = 0;
-    json_resp_finalize(resp, &buf, &len);
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
 
     cutils_json_req_t *req = parse_or_fail(buf);
     size_t n = 0;
-    json_req_array_len(req, "items", &n);
+    assert_int_equal(json_req_array_len(req, "items", &n), CUTILS_OK);
     assert_int_equal(n, 1);
 
     cutils_json_iter_t it __attribute__((cleanup(json_iter_end_p)));
-    json_iter_begin(req, "items", &it);
+    assert_int_equal(json_iter_begin(req, "items", &it), CUTILS_OK);
     assert_true(json_iter_next(&it));
 
     char *name __attribute__((cleanup(cutils_free_p))) = NULL;
     uint32_t count = 0;
-    json_iter_get_str(&it, "name", &name);
-    json_iter_get_u32(&it, "count", &count, 0, 100);
+    assert_int_equal(json_iter_get_str(&it, "name", &name), CUTILS_OK);
+    assert_int_equal(json_iter_get_u32(&it, "count", &count, 0, 100), CUTILS_OK);
     assert_string_equal(name, "widget");
     assert_int_equal(count, 3);
     json_req_free(req);
@@ -804,7 +804,7 @@ static void test_elem_discarded_when_not_committed(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
 
     {
         cutils_json_elem_t elem __attribute__((cleanup(json_elem_commit_p)));
@@ -816,7 +816,7 @@ static void test_elem_discarded_when_not_committed(void **state)
     /* Array still exists (begin created it) but is empty */
     char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
     size_t len = 0;
-    json_resp_finalize(resp, &buf, &len);
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
 
     cutils_json_req_t *req = parse_or_fail(buf);
     size_t n = 123;
@@ -829,22 +829,22 @@ static void test_elem_commit_then_cleanup_noop(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
 
     {
         cutils_json_elem_t elem __attribute__((cleanup(json_elem_commit_p)));
-        json_resp_array_append_begin(resp, "items", &elem);
-        json_elem_add_u32(&elem, "x", 1U);
+        assert_int_equal(json_resp_array_append_begin(resp, "items", &elem), CUTILS_OK);
+        assert_int_equal(json_elem_add_u32(&elem, "x", 1U), CUTILS_OK);
         json_elem_commit(&elem);
         /* cleanup runs next — must be idempotent */
     }
 
     char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
     size_t len = 0;
-    json_resp_finalize(resp, &buf, &len);
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
     cutils_json_req_t *req = parse_or_fail(buf);
     size_t n = 0;
-    json_req_array_len(req, "items", &n);
+    assert_int_equal(json_req_array_len(req, "items", &n), CUTILS_OK);
     assert_int_equal(n, 1);
     json_req_free(req);
 }
@@ -853,21 +853,21 @@ static void test_elem_commit_multiple_times_idempotent(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
 
     cutils_json_elem_t elem;
-    json_resp_array_append_begin(resp, "items", &elem);
-    json_elem_add_u32(&elem, "x", 1U);
+    assert_int_equal(json_resp_array_append_begin(resp, "items", &elem), CUTILS_OK);
+    assert_int_equal(json_elem_add_u32(&elem, "x", 1U), CUTILS_OK);
     json_elem_commit(&elem);
     json_elem_commit(&elem);  /* no-op */
     json_elem_commit(&elem);  /* no-op */
 
     char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
     size_t len = 0;
-    json_resp_finalize(resp, &buf, &len);
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
     cutils_json_req_t *req = parse_or_fail(buf);
     size_t n = 0;
-    json_req_array_len(req, "items", &n);
+    assert_int_equal(json_req_array_len(req, "items", &n), CUTILS_OK);
     assert_int_equal(n, 1);
     json_req_free(req);
 }
@@ -876,10 +876,10 @@ static void test_elem_cannot_modify_after_commit(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
 
     cutils_json_elem_t elem;
-    json_resp_array_append_begin(resp, "items", &elem);
+    assert_int_equal(json_resp_array_append_begin(resp, "items", &elem), CUTILS_OK);
     json_elem_commit(&elem);
     int rv = json_elem_add_str(&elem, "late", "nope");
     assert_int_equal(rv, CUTILS_ERR_INVALID);
@@ -889,9 +889,9 @@ static void test_elem_u64_exceeds_rejected(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
     cutils_json_elem_t elem __attribute__((cleanup(json_elem_commit_p)));
-    json_resp_array_append_begin(resp, "items", &elem);
+    assert_int_equal(json_resp_array_append_begin(resp, "items", &elem), CUTILS_OK);
     int rv = json_elem_add_u64(&elem, "big", 9007199254740993ULL);
     assert_int_equal(rv, CUTILS_ERR_JSON);
 }
@@ -900,11 +900,11 @@ static void test_elem_all_scalars(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
 
     {
         cutils_json_elem_t elem __attribute__((cleanup(json_elem_commit_p)));
-        json_resp_array_append_begin(resp, "items", &elem);
+        assert_int_equal(json_resp_array_append_begin(resp, "items", &elem), CUTILS_OK);
         assert_int_equal(json_elem_add_str  (&elem, "s",   "hi"),         CUTILS_OK);
         assert_int_equal(json_elem_add_u32  (&elem, "u32", 1U),           CUTILS_OK);
         assert_int_equal(json_elem_add_u64  (&elem, "u64", 2ULL),         CUTILS_OK);
@@ -918,11 +918,11 @@ static void test_elem_all_scalars(void **state)
 
     char *buf __attribute__((cleanup(cutils_free_p))) = NULL;
     size_t len = 0;
-    json_resp_finalize(resp, &buf, &len);
+    assert_int_equal(json_resp_finalize(resp, &buf, &len), CUTILS_OK);
     cutils_json_req_t *req = parse_or_fail(buf);
 
     cutils_json_iter_t it __attribute__((cleanup(json_iter_end_p)));
-    json_iter_begin(req, "items", &it);
+    assert_int_equal(json_iter_begin(req, "items", &it), CUTILS_OK);
     assert_true(json_iter_next(&it));
 
     char *s __attribute__((cleanup(cutils_free_p))) = NULL;
@@ -932,13 +932,13 @@ static void test_elem_all_scalars(void **state)
     int64_t i64 = 0;
     double f = 0.0;
     bool b = true;
-    json_iter_get_str (&it, "s",   &s);
-    json_iter_get_u32 (&it, "u32", &u32, 0, UINT32_MAX);
-    json_iter_get_u64 (&it, "u64", &u64, 0, UINT64_MAX);
-    json_iter_get_i32 (&it, "i32", &i32, INT32_MIN, INT32_MAX);
-    json_iter_get_i64 (&it, "i64", &i64, INT64_MIN, INT64_MAX);
-    json_iter_get_f64 (&it, "f64", &f, -10.0, 10.0);
-    json_iter_get_bool(&it, "b",   &b);
+    assert_int_equal(json_iter_get_str (&it, "s",   &s), CUTILS_OK);
+    assert_int_equal(json_iter_get_u32 (&it, "u32", &u32, 0, UINT32_MAX), CUTILS_OK);
+    assert_int_equal(json_iter_get_u64 (&it, "u64", &u64, 0, UINT64_MAX), CUTILS_OK);
+    assert_int_equal(json_iter_get_i32 (&it, "i32", &i32, INT32_MIN, INT32_MAX), CUTILS_OK);
+    assert_int_equal(json_iter_get_i64 (&it, "i64", &i64, INT64_MIN, INT64_MAX), CUTILS_OK);
+    assert_int_equal(json_iter_get_f64 (&it, "f64", &f, -10.0, 10.0), CUTILS_OK);
+    assert_int_equal(json_iter_get_bool(&it, "b",   &b), CUTILS_OK);
     assert_string_equal(s, "hi");
     assert_int_equal(u32, 1);
     assert_int_equal(u64, 2);
@@ -953,9 +953,9 @@ static void test_elem_f64_nonfinite_rejected(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
     cutils_json_elem_t elem __attribute__((cleanup(json_elem_commit_p)));
-    json_resp_array_append_begin(resp, "items", &elem);
+    assert_int_equal(json_resp_array_append_begin(resp, "items", &elem), CUTILS_OK);
     assert_int_equal(json_elem_add_f64(&elem, "x", NAN), CUTILS_ERR_JSON);
 }
 
@@ -967,7 +967,7 @@ static void test_roundtrip_complex(void **state)
 {
     (void)state;
     cutils_json_resp_t *resp __attribute__((cleanup(json_resp_free_p))) = NULL;
-    json_resp_new(&resp);
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
 
     assert_int_equal(json_resp_add_str(resp, "meta.version", "1.0"), CUTILS_OK);
     assert_int_equal(json_resp_add_u32(resp, "meta.count",   2U),    CUTILS_OK);
@@ -997,13 +997,13 @@ static void test_roundtrip_complex(void **state)
     assert_int_equal(count, 2);
 
     cutils_json_iter_t it __attribute__((cleanup(json_iter_end_p)));
-    json_iter_begin(req, "ups_list", &it);
+    assert_int_equal(json_iter_begin(req, "ups_list", &it), CUTILS_OK);
     size_t idx = 0;
     while (json_iter_next(&it)) {
         char *nm __attribute__((cleanup(cutils_free_p))) = NULL;
         uint32_t rt = 0;
-        json_iter_get_str(&it, "name", &nm);
-        json_iter_get_u32(&it, "runtime_s", &rt, 0, UINT32_MAX);
+        assert_int_equal(json_iter_get_str(&it, "name", &nm), CUTILS_OK);
+        assert_int_equal(json_iter_get_u32(&it, "runtime_s", &rt, 0, UINT32_MAX), CUTILS_OK);
         assert_string_equal(nm, names[idx]);
         assert_int_equal(rt, runt[idx]);
         idx++;
@@ -1049,6 +1049,93 @@ static void test_null_arg_robustness(void **state)
 /* ============================================================ */
 /* Main                                                          */
 /* ============================================================ */
+
+/* ============================================================ */
+/* Scoped-cleanup macros                                         */
+/* ============================================================ */
+
+static void test_auto_json_req_frees_on_scope_exit(void **state)
+{
+    (void)state;
+    {
+        CUTILS_AUTO_JSON_REQ cutils_json_req_t *req = NULL;
+        assert_int_equal(
+            json_req_parse("{\"a\":1}", 7, &req), CUTILS_OK);
+        assert_non_null(req);
+        /* No explicit json_req_free — cleanup fires on block exit. */
+    }
+}
+
+static void test_auto_json_resp_frees_on_scope_exit(void **state)
+{
+    (void)state;
+    {
+        CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
+        assert_int_equal(json_resp_new(&resp), CUTILS_OK);
+        assert_non_null(resp);
+        assert_int_equal(json_resp_add_i32(resp, "x", 42), CUTILS_OK);
+        /* No explicit json_resp_free — cleanup fires on block exit. */
+    }
+}
+
+static void test_auto_json_iter_ends_on_scope_exit(void **state)
+{
+    (void)state;
+    cutils_json_req_t *req = parse_or_fail("{\"xs\":[1,2,3]}");
+    {
+        CUTILS_AUTO_JSON_ITER cutils_json_iter_t it = { 0 };
+        assert_int_equal(json_iter_begin(req, "xs", &it), CUTILS_OK);
+        assert_true(json_iter_next(&it));
+        /* Bail out before exhausting — cleanup must still release state. */
+    }
+    json_req_free(req);
+}
+
+static void test_auto_json_elem_discards_uncommitted(void **state)
+{
+    (void)state;
+    cutils_json_resp_t *resp = NULL;
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
+
+    {
+        CUTILS_AUTO_JSON_ELEM cutils_json_elem_t elem;
+        assert_int_equal(
+            json_resp_array_append_begin(resp, "items", &elem), CUTILS_OK);
+        assert_int_equal(json_elem_add_str(&elem, "k", "v"), CUTILS_OK);
+        /* No commit — cleanup must discard the element. */
+    }
+
+    char *out = NULL;
+    size_t len = 0;
+    assert_int_equal(json_resp_finalize(resp, &out, &len), CUTILS_OK);
+    /* The uncommitted element should not appear. */
+    assert_null(strstr(out, "\"k\""));
+    free(out);
+    json_resp_free(resp);
+}
+
+static void test_auto_json_elem_honors_commit(void **state)
+{
+    (void)state;
+    cutils_json_resp_t *resp = NULL;
+    assert_int_equal(json_resp_new(&resp), CUTILS_OK);
+
+    {
+        CUTILS_AUTO_JSON_ELEM cutils_json_elem_t elem;
+        assert_int_equal(
+            json_resp_array_append_begin(resp, "items", &elem), CUTILS_OK);
+        assert_int_equal(json_elem_add_str(&elem, "k", "v"), CUTILS_OK);
+        json_elem_commit(&elem);  /* explicit commit on success */
+    }
+
+    char *out = NULL;
+    size_t len = 0;
+    assert_int_equal(json_resp_finalize(resp, &out, &len), CUTILS_OK);
+    assert_non_null(strstr(out, "\"k\""));
+    assert_non_null(strstr(out, "\"v\""));
+    free(out);
+    json_resp_free(resp);
+}
 
 int main(void)
 {
@@ -1153,6 +1240,18 @@ int main(void)
         /* End-to-end + robustness */
         cmocka_unit_test_setup(test_roundtrip_complex,           setup_clear_error),
         cmocka_unit_test_setup(test_null_arg_robustness,         setup_clear_error),
+
+        /* Scoped-cleanup macros */
+        cmocka_unit_test_setup(test_auto_json_req_frees_on_scope_exit,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_auto_json_resp_frees_on_scope_exit,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_auto_json_iter_ends_on_scope_exit,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_auto_json_elem_discards_uncommitted,
+                                                                 setup_clear_error),
+        cmocka_unit_test_setup(test_auto_json_elem_honors_commit,
+                                                                 setup_clear_error),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

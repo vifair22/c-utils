@@ -1,7 +1,10 @@
 #include "cutils/mem.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <pthread.h>
 
 void cutils_free_p(void *p)
 {
@@ -13,4 +16,26 @@ void cutils_free_p(void *p)
     free(ptr);
     ptr = NULL;
     memcpy(p, &ptr, sizeof(ptr));
+}
+
+void cutils_fclose_p(FILE **f)
+{
+    if (*f) {
+        fclose(*f);
+        *f = NULL;
+    }
+}
+
+void cutils_close_fd_p(int *fd)
+{
+    if (*fd >= 0) {
+        close(*fd);
+        *fd = -1;
+    }
+}
+
+void cutils_unlock_p(pthread_mutex_t **m)
+{
+    if (*m)
+        pthread_mutex_unlock(*m);
 }

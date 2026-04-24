@@ -3,6 +3,7 @@
 #include "cutils/db.h"
 #include "cutils/error.h"
 #include "cutils/log.h"
+#include "cutils/mem.h"
 #include "cutils/push.h"
 
 #include <errno.h>
@@ -11,6 +12,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* File-local scoped cleanup so appguard_init can return NULL on any
+ * failure step and the guard (with whatever partial state it holds)
+ * is shut down correctly. appguard_shutdown is idempotent and only
+ * tears down subsystems that have their *_started flag set, so it
+ * works on any partially-initialized guard. */
+static void appguard_shutdown_p(appguard_t **g)
+{
+    if (*g) {
+        appguard_shutdown(*g);
+        *g = NULL;
+    }
+}
+#define CUTILS_AUTO_APPGUARD __attribute__((cleanup(appguard_shutdown_p)))
 
 struct appguard {
     cutils_config_t *config;
@@ -60,11 +75,16 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
         return NULL;
     }
 
-    appguard_t *guard = calloc(1, sizeof(*guard));
+    CUTILS_AUTO_APPGUARD appguard_t *guard = calloc(1, sizeof(*guard));
     if (!guard) {
         fprintf(stderr, "appguard_init: allocation failed\n");
         return NULL;
     }
+
+    /* All `return NULL;` statements below are covered by the cleanup
+     * attribute on `guard`. cppcheck does not model __attribute__((cleanup))
+     * so suppress its false-positive memleak warnings for this scope. */
+    /* cppcheck-suppress-begin memleak */
 
     /* Step 1-2: Config file (parse or generate + validate) */
     int rc = config_init(&guard->config,
@@ -75,37 +95,27 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
                          cfg->sections);
 
     if (rc == CUTILS_ERR_NOT_FOUND) {
-        /* Template generated, first_run = EXIT */
-        free(guard);
+        /* Template generated, first_run = EXIT — silent cleanup. */
         return NULL;
     }
     if (rc != CUTILS_OK) {
         fprintf(stderr, "appguard: config init failed: %s\n", cutils_get_error());
-        free(guard);
         return NULL;
     }
-
-    /* Register c-utils optional sections */
-    /* (sections are registered during config_init via the sections param,
-     *  but c-utils's own optional sections need to be added too) */
 
     /* Step 3: Open DB */
     const char *db_path = config_get_str(guard->config, "db.path");
     rc = db_open(&guard->db, db_path);
     if (rc != CUTILS_OK) {
         fprintf(stderr, "appguard: DB open failed: %s\n", cutils_get_error());
-        config_free(guard->config);
-        free(guard);
         return NULL;
     }
 
     /* Step 4: Run lib migrations */
     rc = db_run_lib_migrations(guard->db);
     if (rc != CUTILS_OK) {
-        fprintf(stderr, "appguard: lib migrations failed: %s\n", cutils_get_error());
-        db_close(guard->db);
-        config_free(guard->config);
-        free(guard);
+        fprintf(stderr, "appguard: lib migrations failed: %s\n",
+                cutils_get_error());
         return NULL;
     }
 
@@ -115,9 +125,6 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
         if (rc != CUTILS_OK) {
             fprintf(stderr, "appguard: compiled migrations failed: %s\n",
                     cutils_get_error());
-            db_close(guard->db);
-            config_free(guard->config);
-            free(guard);
             return NULL;
         }
     }
@@ -126,10 +133,8 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
     if (cfg->migrations_dir) {
         rc = db_run_app_migrations(guard->db, cfg->migrations_dir);
         if (rc != CUTILS_OK) {
-            fprintf(stderr, "appguard: app migrations failed: %s\n", cutils_get_error());
-            db_close(guard->db);
-            config_free(guard->config);
-            free(guard);
+            fprintf(stderr, "appguard: app migrations failed: %s\n",
+                    cutils_get_error());
             return NULL;
         }
     }
@@ -137,10 +142,8 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
     /* Step 6: Attach DB config + seed defaults */
     rc = config_attach_db(guard->config, guard->db, cfg->db_keys);
     if (rc != CUTILS_OK) {
-        fprintf(stderr, "appguard: DB config attach failed: %s\n", cutils_get_error());
-        db_close(guard->db);
-        config_free(guard->config);
-        free(guard);
+        fprintf(stderr, "appguard: DB config attach failed: %s\n",
+                cutils_get_error());
         return NULL;
     }
 
@@ -150,7 +153,7 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
     /* Check if log level is overridden in config */
     const char *log_level_str = config_get_str(guard->config, "log.level");
     if (log_level_str && log_level_str[0]) {
-        if (strcmp(log_level_str, "debug") == 0)   level = LOG_DEBUG;
+        if (strcmp(log_level_str, "debug") == 0)        level = LOG_DEBUG;
         else if (strcmp(log_level_str, "info") == 0)    level = LOG_INFO;
         else if (strcmp(log_level_str, "warning") == 0) level = LOG_WARNING;
         else if (strcmp(log_level_str, "error") == 0)   level = LOG_ERROR;
@@ -159,9 +162,6 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
     rc = log_init(guard->db, level, cfg->log_retention_days);
     if (rc != CUTILS_OK) {
         fprintf(stderr, "appguard: log init failed: %s\n", cutils_get_error());
-        db_close(guard->db);
-        config_free(guard->config);
-        free(guard);
         return NULL;
     }
     guard->log_started = 1;
@@ -182,7 +182,9 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
     /* Step 9: Install signal handlers */
     install_signal_handlers(guard);
 
-    return guard;
+    /* All steps succeeded — caller takes ownership. */
+    return CUTILS_MOVE(guard);
+    /* cppcheck-suppress-end memleak */
 }
 
 /* --- Shutdown --- */

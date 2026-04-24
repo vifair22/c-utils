@@ -1,11 +1,22 @@
 #include "cutils/db.h"
 #include "cutils/error.h"
+#include "cutils/mem.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <openssl/sha.h>
+
+/* File-local scoped cleanup for DIR handles. */
+static void closedir_p(DIR **d)
+{
+    if (*d) {
+        closedir(*d);
+        *d = NULL;
+    }
+}
+#define CUTILS_AUTO_DIR __attribute__((cleanup(closedir_p)))
 
 /* --- SHA256 checksum helper --- */
 
@@ -80,7 +91,7 @@ static int check_migration(cutils_db_t *db, const char *tracked_name,
 {
     *applied = 0;
     const char *params[] = { tracked_name, NULL };
-    db_result_t *result = NULL;
+    CUTILS_AUTO_DBRES db_result_t *result = NULL;
 
     int rc = db_execute(db,
         "SELECT checksum FROM system_migrations WHERE filename = ?",
@@ -89,16 +100,13 @@ static int check_migration(cutils_db_t *db, const char *tracked_name,
 
     if (result->nrows > 0) {
         const char *stored = result->rows[0][0];
-        if (strcmp(stored, checksum) != 0) {
-            db_result_free(result);
+        if (strcmp(stored, checksum) != 0)
             return set_error(CUTILS_ERR_MIGRATE,
                 "checksum mismatch for %s: expected %s, got %s",
                 tracked_name, stored, checksum);
-        }
         *applied = 1;
     }
 
-    db_result_free(result);
     return CUTILS_OK;
 }
 
@@ -128,14 +136,16 @@ static int apply_migration(cutils_db_t *db, const char *tracked_name,
 
     rc = db_exec_raw(db, sql);
     if (rc != CUTILS_OK) {
-        db_savepoint_rollback(db, sp_name);
+        /* Recovery path — outer batch already errored, rollback failure here
+         * has nothing to add. */
+        CUTILS_UNUSED(db_savepoint_rollback(db, sp_name));
         return set_error(CUTILS_ERR_MIGRATE, "migration %s failed: %s",
                          tracked_name, cutils_get_error());
     }
 
     rc = record_migration(db, tracked_name, checksum);
     if (rc != CUTILS_OK) {
-        db_savepoint_rollback(db, sp_name);
+        CUTILS_UNUSED(db_savepoint_rollback(db, sp_name));
         return rc;
     }
 
@@ -151,7 +161,8 @@ static int run_migration_array(cutils_db_t *db, const db_migration_t *migrations
     int rc = db_exec_raw(db, TRACKING_TABLE_SQL);
     if (rc != CUTILS_OK) return rc;
 
-    rc = db_begin(db);
+    CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+    rc = cutils_db_tx_begin(db, &tx);
     if (rc != CUTILS_OK) return rc;
 
     for (int i = 0; migrations[i].name != NULL; i++) {
@@ -171,22 +182,16 @@ static int run_migration_array(cutils_db_t *db, const db_migration_t *migrations
 
         int applied = 0;
         rc = check_migration(db, tracked, checksum, &applied);
-        if (rc != CUTILS_OK) {
-            db_rollback(db);
-            return rc;
-        }
+        if (rc != CUTILS_OK) return rc;   /* tx auto-rolls-back */
 
         if (applied) continue;
 
         fprintf(stderr, "Migration: applying %s\n", tracked);
         rc = apply_migration(db, tracked, sql, checksum);
-        if (rc != CUTILS_OK) {
-            db_rollback(db);
-            return rc;
-        }
+        if (rc != CUTILS_OK) return rc;   /* tx auto-rolls-back */
     }
 
-    return db_commit(db);
+    return db_tx_commit(&tx);
 }
 
 /* --- Public API: run compiled-in library migrations --- */
@@ -218,24 +223,24 @@ int db_run_app_migrations(cutils_db_t *db, const char *migrations_dir)
 {
     if (!migrations_dir) return CUTILS_OK;
 
-    DIR *dir = opendir(migrations_dir);
+    CUTILS_AUTO_DIR DIR *dir = opendir(migrations_dir);
     if (!dir) return CUTILS_OK; /* No directory = no migrations */
 
     /* Ensure tracking table exists */
     int rc = db_exec_raw(db, TRACKING_TABLE_SQL);
-    if (rc != CUTILS_OK) {
-        closedir(dir);
-        return rc;
-    }
+    if (rc != CUTILS_OK) return rc;
 
-    /* Collect .sql filenames */
+    /* tx is declared before any goto to cleanup: — C forbids goto-ing past
+     * a cleanup-attributed declaration. Zero-initialized so the cleanup
+     * is a no-op until cutils_db_tx_begin() activates it. */
+    CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+
+    /* Collect .sql filenames. files is freed at the cleanup label. */
     int capacity = 16;
-    int count = 0;
+    int count    = 0;
     char **files = calloc((size_t)capacity, sizeof(char *));
-    if (!files) {
-        closedir(dir);
+    if (!files)
         return set_error(CUTILS_ERR_NOMEM, "migration file list alloc failed");
-    }
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
@@ -247,64 +252,51 @@ int db_run_app_migrations(cutils_db_t *db, const char *migrations_dir)
             capacity *= 2;
             char **tmp = realloc(files, (size_t)capacity * sizeof(char *));
             if (!tmp) {
-                for (int i = 0; i < count; i++) free(files[i]);
-                free(files);
-                closedir(dir);
-                return set_error(CUTILS_ERR_NOMEM, "migration file list realloc");
+                rc = set_error(CUTILS_ERR_NOMEM, "migration file list realloc");
+                goto cleanup;
             }
             files = tmp;
         }
         files[count++] = strdup(entry->d_name);
     }
-    closedir(dir);
 
     if (count == 0) {
-        free(files);
-        return CUTILS_OK;
+        rc = CUTILS_OK;
+        goto cleanup;
     }
 
     /* Sort lexically */
     qsort(files, (size_t)count, sizeof(char *), cmp_strings);
 
     /* Apply migrations in a single transaction */
-    rc = db_begin(db);
-    if (rc != CUTILS_OK) {
-        for (int i = 0; i < count; i++) free(files[i]);
-        free(files);
-        return rc;
-    }
+    rc = cutils_db_tx_begin(db, &tx);
+    if (rc != CUTILS_OK) goto cleanup;
 
     for (int i = 0; i < count; i++) {
         /* Read file contents */
         char path[512];
         snprintf(path, sizeof(path), "%s/%s", migrations_dir, files[i]);
 
-        FILE *f = fopen(path, "r");
+        CUTILS_AUTOCLOSE FILE *f = fopen(path, "r");
         if (!f) {
             rc = set_error_errno(CUTILS_ERR_IO, "open migration %s", path);
-            db_rollback(db);
-            goto cleanup;
+            goto cleanup;          /* tx auto-rolls-back */
         }
 
         fseek(f, 0, SEEK_END);
         long fsize = ftell(f);
         fseek(f, 0, SEEK_SET);
 
-        if (fsize <= 0) {
-            fclose(f);
-            continue;
-        }
+        if (fsize <= 0) continue;
 
-        char *sql = malloc((size_t)fsize + 1);
+        CUTILS_AUTOFREE char *sql = malloc((size_t)fsize + 1);
         if (!sql) {
-            fclose(f);
-            rc = set_error(CUTILS_ERR_NOMEM, "migration %s: alloc failed", files[i]);
-            db_rollback(db);
-            goto cleanup;
+            rc = set_error(CUTILS_ERR_NOMEM, "migration %s: alloc failed",
+                           files[i]);
+            goto cleanup;          /* tx auto-rolls-back */
         }
 
         size_t nread = fread(sql, 1, (size_t)fsize, f);
-        fclose(f);
         sql[nread] = '\0';
 
         /* Compute checksum */
@@ -313,28 +305,16 @@ int db_run_app_migrations(cutils_db_t *db, const char *migrations_dir)
 
         int applied = 0;
         rc = check_migration(db, files[i], checksum, &applied);
-        if (rc != CUTILS_OK) {
-            free(sql);
-            db_rollback(db);
-            goto cleanup;
-        }
+        if (rc != CUTILS_OK) goto cleanup;   /* tx auto-rolls-back */
 
-        if (applied) {
-            free(sql);
-            continue;
-        }
+        if (applied) continue;
 
         fprintf(stderr, "Migration: applying %s\n", files[i]);
         rc = apply_migration(db, files[i], sql, checksum);
-        free(sql);
-
-        if (rc != CUTILS_OK) {
-            db_rollback(db);
-            goto cleanup;
-        }
+        if (rc != CUTILS_OK) goto cleanup;   /* tx auto-rolls-back */
     }
 
-    rc = db_commit(db);
+    rc = db_tx_commit(&tx);
 
 cleanup:
     for (int i = 0; i < count; i++) free(files[i]);
