@@ -32,7 +32,7 @@ typedef struct {
     const char             *app_name;        /* "airies-ups" — used for env var prefix */
 
     /* Config */
-    const char             *config_path;     /* NULL = "config.yaml" next to binary */
+    const char             *config_path;     /* NULL = $<APP>_CONFIG_PATH if set, else "config.yaml" in CWD */
     config_first_run_t      on_first_run;    /* CFG_FIRST_RUN_EXIT (default) or CONTINUE */
     const config_key_t     *file_keys;       /* app file-backed keys, NULL-terminated */
     const config_key_t     *db_keys;         /* app DB-backed keys, NULL-terminated */
