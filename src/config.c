@@ -186,12 +186,37 @@ int config_init(cutils_config_t **out,
 
     cfg->app_name = strdup(app_name);
     cfg->env_prefix = make_env_prefix(app_name);
-    cfg->config_path = strdup(config_path ? config_path : "config.yaml");
     cfg->db_cache_head = calloc(1, sizeof(*cfg->db_cache_head));
 
-    if (!cfg->app_name || !cfg->env_prefix || !cfg->config_path ||
-        !cfg->db_cache_head)
+    if (!cfg->app_name || !cfg->env_prefix || !cfg->db_cache_head)
         return set_error(CUTILS_ERR_NOMEM, "config_init: string alloc failed");
+
+    /* Resolve the config file path. Precedence:
+     *   1. Caller-supplied config_path (explicit intent wins).
+     *   2. <APP>_CONFIG_PATH env var — lets containers and packages
+     *      relocate the YAML without recompiling (Docker volumes,
+     *      /etc/<pkg>/<pkg>.yaml in a .deb, etc.).
+     *   3. Literal "config.yaml" in CWD (legacy behavior).
+     * The path is interpreted by fopen, so relative paths still resolve
+     * against CWD — the env var is for the absolute-path case. */
+    const char *resolved = config_path;
+    CUTILS_AUTOFREE char *env_name = NULL;
+    if (!resolved) {
+        size_t plen = strlen(cfg->env_prefix);
+        env_name = malloc(plen + sizeof("CONFIG_PATH"));
+        if (!env_name)
+            return set_error(CUTILS_ERR_NOMEM,
+                             "config_init: env name alloc failed");
+        memcpy(env_name, cfg->env_prefix, plen);
+        memcpy(env_name + plen, "CONFIG_PATH", sizeof("CONFIG_PATH"));
+        const char *env_val = getenv(env_name);
+        if (env_val && *env_val)
+            resolved = env_val;
+    }
+    cfg->config_path = strdup(resolved ? resolved : "config.yaml");
+    if (!cfg->config_path)
+        return set_error(CUTILS_ERR_NOMEM,
+                         "config_init: config_path alloc failed");
 
     /* Register internal keys and sections */
     for (int i = 0; cutils_internal_keys[i].key != NULL; i++) {

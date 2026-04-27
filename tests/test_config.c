@@ -778,6 +778,53 @@ static void test_get_db_str_stable_across_reads(void **state)
     config_free(cfg);
 }
 
+/* <APP>_CONFIG_PATH env var resolves the YAML path when the caller
+ * passes config_path=NULL. An explicit non-NULL config_path arg always
+ * wins — the env var is a fallback, not an override of caller intent.
+ * Both ordering matter: containers/packages set the env var to relocate
+ * the file; tests and apps that pin a path keep working unchanged. */
+#define TEST_CFG_ENV "/tmp/cutils_test_config_envpath.yaml"
+
+static int teardown_envpath(void **state)
+{
+    (void)state;
+    unsetenv("TESTAPP_CONFIG_PATH");
+    unlink(TEST_CFG_ENV);
+    unlink(TEST_CFG);
+    unlink(TEST_DB);
+    unlink(TEST_DB "-wal");
+    unlink(TEST_DB "-shm");
+    return 0;
+}
+
+static void test_init_env_config_path(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG_ENV,
+        "db:\n"
+        "  path: env_path.db\n");
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: arg_path.db\n");
+
+    /* Env var takes effect when caller passes NULL. */
+    setenv("TESTAPP_CONFIG_PATH", TEST_CFG_ENV, 1);
+    cutils_config_t *cfg_env = NULL;
+    assert_int_equal(config_init(&cfg_env, "testapp", NULL,
+                                 CFG_FIRST_RUN_CONTINUE, NULL, NULL),
+                     CUTILS_OK);
+    assert_string_equal(config_get_str(cfg_env, "db.path"), "env_path.db");
+    config_free(cfg_env);
+
+    /* Explicit config_path arg wins over the env var. */
+    cutils_config_t *cfg_arg = NULL;
+    assert_int_equal(config_init(&cfg_arg, "testapp", TEST_CFG,
+                                 CFG_FIRST_RUN_CONTINUE, NULL, NULL),
+                     CUTILS_OK);
+    assert_string_equal(config_get_str(cfg_arg, "db.path"), "arg_path.db");
+    config_free(cfg_arg);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -809,6 +856,7 @@ int main(void)
         cmocka_unit_test_teardown(test_duplicate_section, teardown),
         cmocka_unit_test_teardown(test_db_key_types, teardown),
         cmocka_unit_test_teardown(test_get_db_str_stable_across_reads, teardown),
+        cmocka_unit_test_teardown(test_init_env_config_path, teardown_envpath),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
