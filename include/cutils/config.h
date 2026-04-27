@@ -61,7 +61,8 @@ typedef struct cutils_config cutils_config_t;
  * Merges c-utils internal keys with app-provided keys and sections.
  * Loads (or generates) the YAML config file.
  * app_name is used for env var prefix (uppercase + underscore).
- * config_path is the YAML file path (NULL = "config.yaml" next to binary).
+ * config_path is the YAML file path. When NULL, falls back to the
+ * $<APP>_CONFIG_PATH env var if set, then to "config.yaml" in CWD.
  *
  * file_keys and sections may be NULL if the app has no file-backed config.
  * Both arrays must be terminated with a {NULL} sentinel entry.
