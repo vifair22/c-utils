@@ -160,17 +160,37 @@ static void print_to_console(const char *timestamp, log_level_t level,
     }
 }
 
-/* --- Stream fan-out --- */
+/* --- Stream fan-out ---
+ *
+ * Snapshot the active slots under the lock into a stack-local array,
+ * then release the lock before calling user callbacks. Holding the
+ * lock across the callback would self-deadlock if the callback
+ * re-entered log_* (fire_streams would try to re-lock the
+ * non-recursive stream_mutex), and any slow callback would block
+ * every other producer on the same lock.
+ *
+ * Trade-off: log_stream_unregister may now return while a concurrent
+ * fire_streams still holds a snapshot of the just-unregistered slot,
+ * so the callback can fire briefly after unregister. Apps that
+ * unregister at runtime must keep userdata alive until any in-flight
+ * log_* calls have returned. */
 
 static void fire_streams(const char *timestamp, const char *level_s,
                          const char *func, const char *message)
 {
-    CUTILS_LOCK_GUARD(&stream_mutex);
-    for (int i = 0; i < MAX_STREAMS; i++) {
-        if (log_streams[i].active && log_streams[i].fn)
-            log_streams[i].fn(timestamp, level_s, func, message,
-                              log_streams[i].userdata);
+    log_stream_slot_t snapshot[MAX_STREAMS];
+    int nactive = 0;
+
+    {
+        CUTILS_LOCK_GUARD(&stream_mutex);
+        for (int i = 0; i < MAX_STREAMS; i++) {
+            if (log_streams[i].active && log_streams[i].fn)
+                snapshot[nactive++] = log_streams[i];
+        }
     }
+
+    for (int i = 0; i < nactive; i++)
+        snapshot[i].fn(timestamp, level_s, func, message, snapshot[i].userdata);
 }
 
 /* --- DB writer thread --- */

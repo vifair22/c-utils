@@ -415,6 +415,61 @@ static void test_log_retention(void **state)
     db_close(db);
 }
 
+/* --- Stream callback re-entry: must not deadlock on the registry lock --- */
+
+static int reentry_cb_calls = 0;
+
+static void reentry_inner_cb(const char *timestamp, const char *level,
+                              const char *func, const char *message,
+                              void *userdata)
+{
+    (void)timestamp; (void)level; (void)func; (void)message; (void)userdata;
+    reentry_cb_calls++;
+}
+
+static void reentry_outer_cb(const char *timestamp, const char *level,
+                              const char *func, const char *message,
+                              void *userdata)
+{
+    (void)timestamp; (void)level; (void)func; (void)message; (void)userdata;
+    reentry_cb_calls++;
+    /* Re-enter log_* from inside a stream callback. Pre-fix, fire_streams
+     * held stream_mutex across the callback, so this log_warn would
+     * try to lock the same non-recursive mutex and deadlock. With the
+     * snapshot-then-fire-unlocked design, this completes normally. */
+    static int reentered = 0;
+    if (!reentered) {
+        reentered = 1;
+        log_warn("re-entry from stream callback");
+        reentered = 0;
+    }
+}
+
+static void test_stream_callback_reentry_no_deadlock(void **state)
+{
+    (void)state;
+    reentry_cb_calls = 0;
+
+    assert_int_equal(log_init(NULL, LOG_INFO, 0), CUTILS_OK);
+
+    int h_outer = log_stream_register(reentry_outer_cb, NULL);
+    int h_inner = log_stream_register(reentry_inner_cb, NULL);
+    assert_true(h_outer >= 0 && h_inner >= 0);
+
+    /* If the lock-during-callback bug were still present this hangs
+     * forever and CI eventually times out the runner. */
+    log_info("trigger fan-out");
+
+    /* Outer fires twice (once for "trigger fan-out", once for the
+     * nested "re-entry..."), inner fires twice on each fan-out, plus
+     * any extra. Just assert it ran more than once. */
+    assert_true(reentry_cb_calls >= 2);
+
+    log_stream_unregister(h_outer);
+    log_stream_unregister(h_inner);
+    log_shutdown();
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -434,6 +489,7 @@ int main(void)
         cmocka_unit_test_teardown(test_systemd_mode_format, teardown),
         cmocka_unit_test_teardown(test_systemd_mode_setter, teardown),
         cmocka_unit_test_teardown(test_log_retention, teardown),
+        cmocka_unit_test_teardown(test_stream_callback_reentry_no_deadlock, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
