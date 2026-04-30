@@ -5,6 +5,7 @@
 #include "config_yaml.h"
 
 #include <ctype.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,6 +77,17 @@ struct cutils_config {
      * doesn't modify the struct, it modifies the heap memory the struct
      * points to. Allocated in config_init, freed in config_free. */
     db_val_cache_t **db_cache_head;
+
+    /* Serializes every public read/write entry point so concurrent
+     * callers don't tear the keys array, the YAML doc, or the DB
+     * cache list. Recursive so config_get_int / config_get_bool can
+     * call config_get_str under the same lock without self-deadlocking.
+     *
+     * Heap-allocated through a pointer so callers holding a
+     * `const cutils_config_t *` (read API) can lock without a
+     * const-cast on the mutex itself — the pointee is non-const even
+     * when the pointer-in-cfg is const-propagated. */
+    pthread_mutex_t *mutex;
 };
 
 /* --- Helpers --- */
@@ -183,6 +195,28 @@ int config_init(cutils_config_t **out,
     CUTILS_AUTO_CONFIG cutils_config_t *cfg = calloc(1, sizeof(*cfg));
     if (!cfg)
         return set_error(CUTILS_ERR_NOMEM, "config_init: alloc failed");
+
+    /* Recursive so config_get_int / config_get_bool can take the lock
+     * and then call config_get_str under the same hold. */
+    cfg->mutex = malloc(sizeof(*cfg->mutex));
+    if (!cfg->mutex)
+        return set_error(CUTILS_ERR_NOMEM, "config_init: mutex alloc failed");
+    {
+        pthread_mutexattr_t mattr;
+        if (pthread_mutexattr_init(&mattr) != 0) {
+            free(cfg->mutex);
+            cfg->mutex = NULL;
+            return set_error(CUTILS_ERR, "config_init: mutexattr init failed");
+        }
+        pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
+        int mrc = pthread_mutex_init(cfg->mutex, &mattr);
+        pthread_mutexattr_destroy(&mattr);
+        if (mrc != 0) {
+            free(cfg->mutex);
+            cfg->mutex = NULL;
+            return set_error(CUTILS_ERR, "config_init: mutex init failed");
+        }
+    }
 
     cfg->app_name = strdup(app_name);
     cfg->env_prefix = make_env_prefix(app_name);
@@ -327,6 +361,11 @@ void config_free(cutils_config_t *cfg)
         free(cfg->db_cache_head);
     }
 
+    if (cfg->mutex) {
+        pthread_mutex_destroy(cfg->mutex);
+        free(cfg->mutex);
+    }
+
     free(cfg);
 }
 
@@ -395,6 +434,8 @@ static const char *config_get_from_db(const cutils_config_t *cfg, const char *ke
 int config_attach_db(cutils_config_t *cfg, cutils_db_t *db,
                      const config_key_t *db_keys)
 {
+    CUTILS_LOCK_GUARD(cfg->mutex);
+
     cfg->db = db;
 
     if (!db_keys) return CUTILS_OK;
@@ -447,6 +488,14 @@ int config_attach_db(cutils_config_t *cfg, cutils_db_t *db,
 
 const char *config_get_str(const cutils_config_t *cfg, const char *key)
 {
+    /* Cast away const on the mutex pointer. Locking is non-mutating from
+     * the caller's perspective (a "logically const" config). The lock
+     * protects the YAML doc walk, the keys-array walk in
+     * config_get_key_def, and the DB cache mutation inside
+     * config_get_from_db. cfg->mutex is recursive so config_get_int /
+     * config_get_bool can hold it across this call. */
+    CUTILS_LOCK_GUARD(cfg->mutex);
+
     /* 1. Check env var override */
     CUTILS_AUTOFREE char *envname = make_env_name(cfg->env_prefix, key);
     if (envname) {
@@ -504,6 +553,8 @@ int config_get_bool(const cutils_config_t *cfg, const char *key, int default_val
 
 int config_set(cutils_config_t *cfg, const char *key, const char *value)
 {
+    CUTILS_LOCK_GUARD(cfg->mutex);
+
     /* Check key exists */
     int found = 0;
     for (int i = 0; i < cfg->nkeys; i++) {
@@ -539,6 +590,7 @@ int config_set(cutils_config_t *cfg, const char *key, const char *value)
 
 int config_has_key(const cutils_config_t *cfg, const char *key)
 {
+    CUTILS_LOCK_GUARD(cfg->mutex);
     for (int i = 0; i < cfg->nkeys; i++) {
         if (strcmp(cfg->keys[i].key, key) == 0)
             return 1;
@@ -548,6 +600,8 @@ int config_has_key(const cutils_config_t *cfg, const char *key)
 
 const config_key_t *config_get_key_def(const cutils_config_t *cfg, const char *key)
 {
+    /* Recursive mutex — config_get_str holds it across the call below. */
+    CUTILS_LOCK_GUARD(cfg->mutex);
     for (int i = 0; i < cfg->nkeys; i++) {
         if (strcmp(cfg->keys[i].key, key) == 0)
             return &cfg->keys[i];
@@ -557,6 +611,7 @@ const config_key_t *config_get_key_def(const cutils_config_t *cfg, const char *k
 
 int config_file_key_count(const cutils_config_t *cfg)
 {
+    CUTILS_LOCK_GUARD(cfg->mutex);
     int count = 0;
     for (int i = 0; i < cfg->nkeys; i++) {
         if (cfg->keys[i].store == CFG_STORE_FILE)
@@ -567,6 +622,7 @@ int config_file_key_count(const cutils_config_t *cfg)
 
 int config_db_key_count(const cutils_config_t *cfg)
 {
+    CUTILS_LOCK_GUARD(cfg->mutex);
     int count = 0;
     for (int i = 0; i < cfg->nkeys; i++) {
         if (cfg->keys[i].store == CFG_STORE_DB)
@@ -577,6 +633,8 @@ int config_db_key_count(const cutils_config_t *cfg)
 
 int config_set_db(cutils_config_t *cfg, const char *key, const char *value)
 {
+    CUTILS_LOCK_GUARD(cfg->mutex);
+
     if (!cfg->db)
         return set_error(CUTILS_ERR_INVALID, "DB not attached to config");
 
