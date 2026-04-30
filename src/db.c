@@ -45,7 +45,18 @@ int db_open(cutils_db_t **db, const char *path)
     if (!d)
         return set_error(CUTILS_ERR_NOMEM, "db_open: allocation failed");
 
-    if (pthread_mutex_init(&d->mutex, NULL) != 0) {
+    /* Recursive so a thread that holds the mutex across a tx scope (see
+     * cutils_db_tx_begin) can still call db_execute or db_exec_raw inside
+     * that scope without self-deadlocking on the per-call lock guard. */
+    pthread_mutexattr_t mattr;
+    if (pthread_mutexattr_init(&mattr) != 0) {
+        free(d);
+        return set_error(CUTILS_ERR, "db_open: mutexattr init failed");
+    }
+    pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
+    int mrc = pthread_mutex_init(&d->mutex, &mattr);
+    pthread_mutexattr_destroy(&mattr);
+    if (mrc != 0) {
         free(d);
         return set_error(CUTILS_ERR, "db_open: mutex init failed");
     }
@@ -296,7 +307,16 @@ int db_savepoint_rollback(cutils_db_t *db, const char *name)
     return db_exec_raw(db, sql);
 }
 
-/* --- Scoped transaction guard --- */
+/* --- Scoped transaction guard ---
+ *
+ * The tx scope holds db->mutex from BEGIN through COMMIT or ROLLBACK so
+ * that no other thread can interleave its queries into the active
+ * transaction (SQLite tracks transactions per-connection — without the
+ * extended lock hold, a parallel writer's INSERT would land inside this
+ * thread's tx and be rolled back on early return).
+ *
+ * The mutex is recursive (see db_open), so db_execute and db_exec_raw
+ * calls inside the scope re-enter the lock counter cleanly. */
 
 static int tx_begin_with_sql(cutils_db_t *db, cutils_db_tx_t *tx,
                              const char *sql)
@@ -305,10 +325,19 @@ static int tx_begin_with_sql(cutils_db_t *db, cutils_db_tx_t *tx,
     tx->active    = 0;
     tx->finalized = 0;
 
+    /* Acquire the +1 hold that spans the whole tx. db_exec_raw below
+     * takes its own +1 internally and releases on return, leaving our
+     * hold in place. */
+    pthread_mutex_lock(&db->mutex);
+
     int rc = db_exec_raw(db, sql);
-    if (rc == CUTILS_OK)
-        tx->active = 1;
-    return rc;
+    if (rc != CUTILS_OK) {
+        pthread_mutex_unlock(&db->mutex);
+        return rc;
+    }
+
+    tx->active = 1;
+    return CUTILS_OK;
 }
 
 int cutils_db_tx_begin(cutils_db_t *db, cutils_db_tx_t *tx)
@@ -327,8 +356,13 @@ int db_tx_commit(cutils_db_tx_t *tx)
         return CUTILS_OK;
 
     int rc = db_commit(tx->db);
-    if (rc == CUTILS_OK)
+    if (rc == CUTILS_OK) {
         tx->finalized = 1;
+        /* Release the hold acquired in tx_begin_with_sql. On commit
+         * failure we leave it held so cutils_db_tx_end_p can still
+         * issue a rollback under the same exclusive scope. */
+        pthread_mutex_unlock(&tx->db->mutex);
+    }
     return rc;
 }
 
@@ -339,6 +373,10 @@ void cutils_db_tx_end_p(cutils_db_tx_t *tx)
         /* Rollback can fail (e.g. DB closed underneath us); not much we
          * can do in a cleanup handler. Silently attempt and move on. */
         CUTILS_UNUSED(db_rollback(tx->db));
+        /* Always release the hold we took in tx_begin_with_sql, even if
+         * rollback failed — leaving the mutex locked would wedge every
+         * other thread on this connection. */
+        pthread_mutex_unlock(&tx->db->mutex);
     }
     tx->active    = 0;
     tx->finalized = 1;
