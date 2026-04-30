@@ -5,8 +5,13 @@
 
 /* --- Logging subsystem ---
  *
- * Dual output: stdout (info/debug/warning) + stderr (error).
- * Colored console output via ANSI escape codes.
+ * Default console output: stdout (info/debug/warning) + stderr (error),
+ * colored with ANSI escape codes when both streams are TTYs and NO_COLOR
+ * is unset.
+ *
+ * Systemd mode (see log_set_systemd_mode): all output to stdout, no
+ * timestamp, no color, RFC 5424 priority prefix per line.
+ *
  * Async SQLite persistence via background writer thread.
  * Multiple stream callback registrations for live log fan-out.
  * Configurable retention with automatic cleanup. */
@@ -43,6 +48,27 @@ void log_set_level(log_level_t level);
 
 /* Get the current log level. */
 log_level_t log_get_level(void);
+
+/* Enable or disable systemd-native console output. When enabled, the
+ * console writer:
+ *   - drops the timestamp (journald stamps each line on receive)
+ *   - drops ANSI color (journald stores escapes as literal bytes —
+ *     garbage in --no-pager / grep / log forwarders)
+ *   - sends every line to stdout (no stream split — stream-default
+ *     priority becomes redundant)
+ *   - prefixes each line with <N>, the RFC 5424 syslog priority,
+ *     which journald parses and strips: 7=DEBUG, 6=INFO, 4=WARNING,
+ *     3=ERROR
+ *
+ * Format: <N>[function] message\n
+ *
+ * AppGuard calls this automatically when log_systemd_autodetect is set
+ * in appguard_config_t and JOURNAL_STREAM is present in the environment.
+ * Direct callers can flip it for testing or non-AppGuard integrations. */
+void log_set_systemd_mode(int enabled);
+
+/* Returns nonzero if systemd mode is active. */
+int log_get_systemd_mode(void);
 
 /* Register a stream callback. Returns a handle for unregistering.
  * userdata is passed through to the callback. Max 8 callbacks. */
