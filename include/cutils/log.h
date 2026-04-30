@@ -71,10 +71,20 @@ void log_set_systemd_mode(int enabled);
 int log_get_systemd_mode(void);
 
 /* Register a stream callback. Returns a handle for unregistering.
- * userdata is passed through to the callback. Max 8 callbacks. */
+ * userdata is passed through to the callback. Max 8 callbacks.
+ *
+ * Callbacks fire from the calling thread of every log_* call that
+ * passes the level filter, with the registry lock NOT held. This
+ * means a callback may itself call log_* without self-deadlocking,
+ * and a slow callback does not block other producers — but it also
+ * means log_stream_unregister can return while a concurrent fan-out
+ * still holds a snapshot of the just-unregistered slot. Apps that
+ * unregister at runtime must keep userdata alive until any in-flight
+ * log_* calls on other threads have returned. */
 int log_stream_register(log_stream_fn fn, void *userdata);
 
-/* Unregister a stream callback by handle. */
+/* Unregister a stream callback by handle. See log_stream_register
+ * for the userdata-lifetime caveat under concurrent log_* calls. */
 void log_stream_unregister(int handle);
 
 /* --- Logging macros ---
