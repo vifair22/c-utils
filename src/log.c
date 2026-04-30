@@ -258,6 +258,13 @@ int log_init(cutils_db_t *db, log_level_t level, int retention_days)
     log_stop = 0;
     log_running = 1;
 
+    /* Force line-buffered stdout. glibc switches to fully-buffered (4KB block)
+     * when stdout isn't a TTY, which under Docker/pipes causes INFO/DEBUG lines
+     * to sit in the buffer until it fills while stderr (always unbuffered)
+     * flushes immediately — interleaving errors ahead of context. No-op on a
+     * TTY (already line-buffered). */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     memset(log_streams, 0, sizeof(log_streams));
 
     if (db) {
