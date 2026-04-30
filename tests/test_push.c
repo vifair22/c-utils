@@ -3,9 +3,11 @@
 #include <setjmp.h>
 #include <cmocka.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cutils/push.h"
@@ -502,6 +504,64 @@ static void test_concurrent_push_send_multi_part_atomic(void **state)
     free_fixture(&fix);
 }
 
+/* --- push_init must drain rows left from a previous run --- */
+
+static _Atomic int drain_signal_seen = 0;
+
+static void drain_log_cb(const char *ts, const char *level, const char *func,
+                         const char *msg, void *userdata)
+{
+    (void)ts; (void)level; (void)msg; (void)userdata;
+    /* The worker emits log_warn "push transient failure" or log_error
+     * "push permanently failed" after attempting to send. Either log
+     * proves it iterated through a row at startup. */
+    if (func && strcmp(func, "push_worker_thread") == 0)
+        atomic_store(&drain_signal_seen, 1);
+}
+
+static void test_push_init_drains_preexisting_rows(void **state)
+{
+    (void)state;
+    push_fixture_t fix = make_fixture(1);
+    atomic_store(&drain_signal_seen, 0);
+
+    /* Pre-populate a row directly — simulates a row left over from a
+     * previous run that crashed before delivery. */
+    const char *params[] = {
+        "12345", "tok", "usr", "86400",
+        "preexisting", "leftover", "0", "0", "0", NULL
+    };
+    assert_int_equal(db_execute_non_query(fix.db,
+        "INSERT INTO push (timestamp, token, user, ttl, message, title, "
+        "failed, html, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params, NULL), CUTILS_OK);
+
+    int h = log_stream_register(drain_log_cb, NULL);
+    assert_true(h >= 0);
+
+    /* push_init starts the worker. Pre-fix, push_notify was left at
+     * 0, so the worker hit cond_wait immediately and never noticed
+     * the pre-existing row. Post-fix, push_notify is 1 at init, so
+     * the worker's first iteration drains. */
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+
+    /* Poll up to 30s for the worker to attempt delivery. Network
+     * round-trip to api.pushover.net is well under that ceiling for
+     * a 4xx; even a transient failure path emits a log_warn that
+     * trips the signal. Pre-fix: signal never raised, test fails. */
+    int got = 0;
+    for (int i = 0; i < 300; i++) {
+        if (atomic_load(&drain_signal_seen)) { got = 1; break; }
+        struct timespec ts = { 0, 100 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    assert_true(got);
+
+    log_stream_unregister(h);
+    push_shutdown();
+    free_fixture(&fix);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -520,6 +580,7 @@ int main(void)
         cmocka_unit_test_teardown(test_push_send_negative_priority, teardown),
         cmocka_unit_test_teardown(test_push_send_after_shutdown_rejected, teardown),
         cmocka_unit_test_teardown(test_concurrent_push_send_multi_part_atomic, teardown),
+        cmocka_unit_test_teardown(test_push_init_drains_preexisting_rows, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
