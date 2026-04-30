@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <setjmp.h>
 #include <cmocka.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -417,6 +418,90 @@ static void test_push_send_after_shutdown_rejected(void **state)
     free_fixture(&fix);
 }
 
+/* --- Concurrent multi-part sends must not interleave chunks --- */
+
+typedef struct {
+    char        marker;   /* 'A' or 'B' */
+    push_opts_t opts;
+} chunk_thread_arg_t;
+
+static void *chunk_sender(void *p)
+{
+    chunk_thread_arg_t *a = p;
+    assert_int_equal(push_send_opts(&a->opts), CUTILS_OK);
+    return NULL;
+}
+
+static void test_concurrent_push_send_multi_part_atomic(void **state)
+{
+    (void)state;
+    /* No-creds fixture: push_init succeeds, but push_running stays 0
+     * so the worker thread never starts. We get push_db set without
+     * the worker draining rows behind us. */
+    push_fixture_t fix = make_fixture(0);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+
+    /* Build two distinguishable >1024-char messages that split into 3+ chunks.
+     * 2500 'A's / 'B's with newlines as split points. */
+    char msg_a[2500];
+    char msg_b[2500];
+    memset(msg_a, 'A', sizeof(msg_a) - 1);
+    memset(msg_b, 'B', sizeof(msg_b) - 1);
+    msg_a[sizeof(msg_a) - 1] = '\0';
+    msg_b[sizeof(msg_b) - 1] = '\0';
+    for (int i = 800; i < 2400; i += 800) {
+        msg_a[i] = '\n';
+        msg_b[i] = '\n';
+    }
+
+    chunk_thread_arg_t arg_a = {
+        .marker = 'A',
+        .opts = { .title = "A", .message = msg_a,
+                  .token = "tok", .user = "usr" },
+    };
+    chunk_thread_arg_t arg_b = {
+        .marker = 'B',
+        .opts = { .title = "B", .message = msg_b,
+                  .token = "tok", .user = "usr" },
+    };
+
+    pthread_t tA, tB;
+    pthread_create(&tA, NULL, chunk_sender, &arg_a);
+    pthread_create(&tB, NULL, chunk_sender, &arg_b);
+    pthread_join(tA, NULL);
+    pthread_join(tB, NULL);
+
+    /* Walk the queue in rowid order. The first message we see (A or B)
+     * must have ALL its chunks before any chunk of the other — proving
+     * the per-send tx serialized the inserts. */
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(fix.db,
+        "SELECT title FROM push ORDER BY rowid", NULL, &r), CUTILS_OK);
+    assert_non_null(r);
+    assert_true(r->nrows >= 6);  /* 3+ parts each */
+
+    char first = r->rows[0][0][0];
+    int  switched = 0;
+    for (int i = 1; i < r->nrows; i++) {
+        char c = r->rows[i][0][0];
+        if (c != first) {
+            switched = 1;
+        } else if (switched) {
+            /* Came back to the first sender's chunks after switching to
+             * the other — that's interleaving. Pre-fix this would
+             * trigger; post-fix it must not. */
+            db_result_free(r);
+            push_shutdown();
+            free_fixture(&fix);
+            fail_msg("multi-part chunks interleaved across concurrent senders");
+        }
+    }
+
+    db_result_free(r);
+    push_shutdown();
+    free_fixture(&fix);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -434,6 +519,7 @@ int main(void)
         cmocka_unit_test_teardown(test_push_send_defaults_zero, teardown),
         cmocka_unit_test_teardown(test_push_send_negative_priority, teardown),
         cmocka_unit_test_teardown(test_push_send_after_shutdown_rejected, teardown),
+        cmocka_unit_test_teardown(test_concurrent_push_send_multi_part_atomic, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
