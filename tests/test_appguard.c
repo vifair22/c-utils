@@ -2,9 +2,13 @@
 #include <stddef.h>
 #include <setjmp.h>
 #include <cmocka.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cutils/appguard.h"
@@ -702,6 +706,56 @@ static void test_retention_days(void **state)
     appguard_shutdown(guard);
 }
 
+/* --- Signal-driven shutdown: SIGTERM in a child process --- */
+
+static void test_sigterm_clean_exit(void **state)
+{
+    (void)state;
+
+    /* Set up the config in the parent so the child inherits the file. */
+    write_file(TEST_CFG, "db:\n  path: " TEST_DB "\n");
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child: init appguard, wait for SIGTERM, exit. */
+        appguard_config_t cfg = {
+            .app_name = "testguard",
+            .config_path = TEST_CFG,
+            .on_first_run = CFG_FIRST_RUN_CONTINUE,
+            .log_level = LOG_ERROR,
+        };
+        appguard_t *guard = appguard_init(&cfg);
+        if (!guard) _exit(2);
+
+        /* Block until the signal_watcher catches SIGTERM and _exit's
+         * us. pause() returns -1/EINTR if our thread receives a signal,
+         * but with the new design SIGTERM is masked here and only the
+         * watcher thread receives it. The watcher then _exit(0)s the
+         * process from a regular thread context — no UB. */
+        while (1) pause();
+        _exit(3); /* unreachable */
+    }
+
+    assert_true(pid > 0);
+
+    /* Give the child time to finish appguard_init and arm the watcher. */
+    struct timespec gap = { 0, 300 * 1000 * 1000 };
+    nanosleep(&gap, NULL);
+
+    assert_int_equal(kill(pid, SIGTERM), 0);
+
+    int status = -1;
+    int wait_rc = waitpid(pid, &status, 0);
+    assert_int_equal(wait_rc, pid);
+
+    /* signal_watcher calls _exit(0) — child exits normally with 0,
+     * not killed by the signal. That's the whole point of the fix:
+     * pre-fix the handler ran async-signal-unsafe code; post-fix the
+     * watcher runs in a normal thread context and exits cleanly. */
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -733,6 +787,7 @@ int main(void)
         cmocka_unit_test_teardown(test_systemd_autodetect_on_with_env, teardown),
         cmocka_unit_test_teardown(test_systemd_autodetect_on_no_env, teardown),
         cmocka_unit_test_teardown(test_retention_days, teardown),
+        cmocka_unit_test_teardown(test_sigterm_clean_exit, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
