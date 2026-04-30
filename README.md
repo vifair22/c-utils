@@ -9,7 +9,7 @@ Shared C application framework. Static library providing config management, SQLi
 | **Error** | `cutils/error.h` | Thread-local error buffer with enum return codes |
 | **DB** | `cutils/db.h` | Mutex-protected SQLite connection (WAL mode), migration runner |
 | **Config** | `cutils/config.h` | Two-store config (YAML file + SQLite), env var overrides |
-| **Log** | `cutils/log.h` | Async logging to console + SQLite, configurable retention |
+| **Log** | `cutils/log.h` | Async logging to console (TTY-aware color, optional systemd-native mode) + SQLite, configurable retention |
 | **Push** | `cutils/push.h` | Background Pushover notification worker with retry |
 | **Error Loop** | `cutils/error_loop.h` | Detects repeating errors with message normalization |
 | **AppGuard** | `cutils/appguard.h` | Lifecycle manager, orchestrates init/shutdown of all subsystems |
@@ -104,12 +104,13 @@ int main(int argc, char **argv)
     appguard_set_argv(argc, argv);
 
     appguard_config_t cfg = {
-        .app_name          = "my-app",
-        .on_first_run      = CFG_FIRST_RUN_EXIT,
-        .file_keys         = file_keys,
-        .sections          = sections,
-        .log_level         = LOG_INFO,
-        .log_retention_days = 30,
+        .app_name               = "my-app",
+        .on_first_run           = CFG_FIRST_RUN_EXIT,
+        .file_keys              = file_keys,
+        .sections               = sections,
+        .log_level              = LOG_INFO,
+        .log_retention_days     = 30,
+        .log_systemd_autodetect = 1,  /* journald-aware console output when run under systemd */
     };
 
     appguard_t *guard = appguard_init(&cfg);
