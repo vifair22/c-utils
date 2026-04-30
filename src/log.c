@@ -47,6 +47,13 @@ static log_level_t      log_min_level    = LOG_INFO;
 static int              log_retention    = 0;
 static int              log_running      = 0;
 
+/* Output formatting flags — cached once at log_init.
+ * Color is emitted only when the chosen stream is a TTY AND NO_COLOR is unset.
+ * Sniffing once avoids per-call getenv/isatty overhead. */
+static int              stdout_is_tty    = 0;
+static int              stderr_is_tty    = 0;
+static int              no_color_env     = 0;
+
 /* Writer thread */
 static pthread_t        log_thread;
 static pthread_mutex_t  log_mutex     = PTHREAD_MUTEX_INITIALIZER;
@@ -100,16 +107,21 @@ static void print_to_console(const char *timestamp, log_level_t level,
                              const char *func, const char *message)
 {
     FILE *out = (level >= LOG_ERROR) ? stderr : stdout;
-    const char *color = level_color(level);
-    int has_color = color[0] != '\0';
+    int is_tty = (out == stderr) ? stderr_is_tty : stdout_is_tty;
+    int use_color = is_tty && !no_color_env;
 
-    fprintf(out, COLOR_BLUE "%s" COLOR_RESET " " COLOR_BOLD "[%s]" COLOR_RESET " ",
-            timestamp, func);
-
-    if (has_color)
-        fprintf(out, "%s%s" COLOR_RESET "\n", color, message);
-    else
-        fprintf(out, "%s\n", message);
+    if (use_color) {
+        const char *color = level_color(level);
+        int has_msg_color = color[0] != '\0';
+        fprintf(out, COLOR_BLUE "%s" COLOR_RESET " " COLOR_BOLD "[%s]" COLOR_RESET " ",
+                timestamp, func);
+        if (has_msg_color)
+            fprintf(out, "%s%s" COLOR_RESET "\n", color, message);
+        else
+            fprintf(out, "%s\n", message);
+    } else {
+        fprintf(out, "%s [%s] %s\n", timestamp, func, message);
+    }
 }
 
 /* --- Stream fan-out --- */
@@ -264,6 +276,16 @@ int log_init(cutils_db_t *db, log_level_t level, int retention_days)
      * flushes immediately — interleaving errors ahead of context. No-op on a
      * TTY (already line-buffered). */
     setvbuf(stdout, NULL, _IOLBF, 0);
+
+    /* Cache TTY state and NO_COLOR for the console writer. Sniffing once
+     * here means a stream redirected after init still uses the init-time
+     * decision — a deliberate trade for not paying isatty/getenv per log. */
+    stdout_is_tty = isatty(STDOUT_FILENO);
+    stderr_is_tty = isatty(STDERR_FILENO);
+    {
+        const char *nc = getenv("NO_COLOR");
+        no_color_env = (nc != NULL && nc[0] != '\0');
+    }
 
     memset(log_streams, 0, sizeof(log_streams));
 
