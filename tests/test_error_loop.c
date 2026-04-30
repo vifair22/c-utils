@@ -3,7 +3,9 @@
 #include <stdint.h>
 #include <setjmp.h>
 #include <cmocka.h>
+#include <pthread.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #include "cutils/error_loop.h"
@@ -317,6 +319,55 @@ static void test_auto_errloop_null_safe(void **state)
     (void)det;
 }
 
+/* --- Concurrency regression: shared detector across threads --- */
+
+static atomic_int concurrent_cb_calls = 0;
+
+static void concurrent_callback(const char *message, int count, void *userdata)
+{
+    (void)message; (void)count; (void)userdata;
+    atomic_fetch_add(&concurrent_cb_calls, 1);
+}
+
+typedef struct {
+    error_loop_t *det;
+    int           iterations;
+} concurrent_arg_t;
+
+static void *concurrent_reporter(void *p)
+{
+    concurrent_arg_t *a = p;
+    for (int i = 0; i < a->iterations; i++)
+        error_loop_report(a->det, "shared error %d", 0);
+    return NULL;
+}
+
+static void test_concurrent_reporters_no_corruption(void **state)
+{
+    (void)state;
+    atomic_store(&concurrent_cb_calls, 0);
+
+    /* Large cooldown so the threshold callback fires at most once across
+     * all reporters — proves the lock keeps count consistent. */
+    error_loop_t *det = error_loop_create(50, 9999,
+                                          concurrent_callback, NULL);
+    assert_non_null(det);
+
+    enum { NTHREADS = 4, ITERATIONS = 1000 };
+    pthread_t threads[NTHREADS];
+    concurrent_arg_t arg = { .det = det, .iterations = ITERATIONS };
+
+    for (int i = 0; i < NTHREADS; i++)
+        pthread_create(&threads[i], NULL, concurrent_reporter, &arg);
+    for (int i = 0; i < NTHREADS; i++)
+        pthread_join(threads[i], NULL);
+
+    /* All reports were the same identity, so threshold fires exactly once. */
+    assert_int_equal(atomic_load(&concurrent_cb_calls), 1);
+
+    error_loop_free(det);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -341,6 +392,7 @@ int main(void)
         cmocka_unit_test_setup(test_normalization_nonhex_in_uuid, setup),
         cmocka_unit_test_setup(test_auto_errloop_frees_on_scope_exit, setup),
         cmocka_unit_test_setup(test_auto_errloop_null_safe, setup),
+        cmocka_unit_test_setup(test_concurrent_reporters_no_corruption, setup),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
