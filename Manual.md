@@ -744,7 +744,9 @@ The macros capture `__func__` automatically and accept `printf`-style format str
 
 ### Console output
 
-Console output is colored with ANSI escape codes:
+Format: `YYYY-MM-DD HH:MM:SS.mmm [function_name] message`
+
+ANSI color is applied when the chosen output stream is a TTY and the [`NO_COLOR`](https://no-color.org) environment variable is unset:
 
 - Timestamp in bold blue
 - Function name in bold
@@ -752,7 +754,34 @@ Console output is colored with ANSI escape codes:
 - Warning messages in yellow
 - Debug messages in cyan
 
-Format: `YYYY-MM-DD HH:MM:SS.mmm [function_name] message`
+When stdout/stderr is piped, redirected, or running under Docker (no TTY), colors are suppressed automatically — output stays plain so `grep`, log files, and log forwarders see clean text. There is no force-color override.
+
+stdout is forced to line-buffered mode at log init. Without this, glibc switches to fully-buffered (4KB block) when stdout isn't a TTY, causing INFO/DEBUG lines to sit in the buffer while stderr (always unbuffered) flushes immediately. `docker logs -f` and similar would show errors instantly with their context arriving in batches.
+
+### Systemd-native console output
+
+When the application runs under systemd as a service, opt into journald-aware formatting via `appguard_config_t.log_systemd_autodetect`:
+
+```c
+appguard_config_t cfg = {
+    .app_name = "airies-ups",
+    .log_systemd_autodetect = 1,
+    /* ... */
+};
+```
+
+AppGuard checks `JOURNAL_STREAM` (set by systemd when stdio is wired to journald) at init. If present, the console writer switches to:
+
+- No timestamp — journald stamps each line on receive
+- No ANSI color — journald stores escapes as literal bytes (garbage in `--no-pager` / forwarders)
+- All output to stdout (the stdout/stderr split becomes redundant)
+- `<N>` priority prefix per line (RFC 5424 numeric): `<7>` debug, `<6>` info, `<4>` warning, `<3>` error
+
+Format: `<N>[function_name] message`
+
+journald parses and strips `<N>`, then exposes it as `PRIORITY=N` so `journalctl -p err -u <unit>` filters to ERROR-only — proper four-level filtering instead of the two-bucket stdout/stderr default.
+
+The flag is opt-in: same binary running under a plain shell (no `JOURNAL_STREAM`) keeps the standard formatter automatically. Database persistence and stream callbacks are unaffected — only the console writer changes.
 
 ### Database persistence
 

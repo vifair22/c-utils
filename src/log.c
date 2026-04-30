@@ -54,6 +54,11 @@ static int              stdout_is_tty    = 0;
 static int              stderr_is_tty    = 0;
 static int              no_color_env     = 0;
 
+/* Systemd-native output mode. See log_set_systemd_mode() for the full
+ * format. Cleared on log_init; AppGuard sets it after sniffing
+ * JOURNAL_STREAM. Tests may flip it directly. */
+static int              log_systemd_mode = 0;
+
 /* Writer thread */
 static pthread_t        log_thread;
 static pthread_mutex_t  log_mutex     = PTHREAD_MUTEX_INITIALIZER;
@@ -101,11 +106,31 @@ static const char *level_color(log_level_t level)
     return "";
 }
 
+/* RFC 5424 syslog priority for systemd's <N> prefix. journald parses
+ * and strips this; lets `journalctl -p err` filter precisely instead
+ * of relying on stream-default priority. */
+static int level_priority(log_level_t level)
+{
+    switch (level) {
+    case LOG_DEBUG:   return 7;
+    case LOG_INFO:    return 6;
+    case LOG_WARNING: return 4;
+    case LOG_ERROR:   return 3;
+    }
+    return 6;
+}
+
 /* --- Console output --- */
 
 static void print_to_console(const char *timestamp, log_level_t level,
                              const char *func, const char *message)
 {
+    if (log_systemd_mode) {
+        /* All to stdout, <N> priority prefix, no timestamp, no color. */
+        fprintf(stdout, "<%d>[%s] %s\n", level_priority(level), func, message);
+        return;
+    }
+
     FILE *out = (level >= LOG_ERROR) ? stderr : stdout;
     int is_tty = (out == stderr) ? stderr_is_tty : stdout_is_tty;
     int use_color = is_tty && !no_color_env;
@@ -333,6 +358,16 @@ void log_set_level(log_level_t level)
 log_level_t log_get_level(void)
 {
     return log_min_level;
+}
+
+void log_set_systemd_mode(int enabled)
+{
+    log_systemd_mode = enabled ? 1 : 0;
+}
+
+int log_get_systemd_mode(void)
+{
+    return log_systemd_mode;
 }
 
 int log_stream_register(log_stream_fn fn, void *userdata)

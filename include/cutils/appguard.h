@@ -43,6 +43,13 @@ typedef struct {
     int                     log_retention_days; /* 0 = no cleanup */
     log_level_t             log_level;       /* minimum log level */
 
+    /* When 1, AppGuard checks getenv("JOURNAL_STREAM") at init and, if set,
+     * switches the log subsystem's console writer into systemd-native mode
+     * (no timestamp, no color, all stdout, <N> priority prefix). DB writer
+     * and stream callbacks are unaffected. The same binary running outside
+     * systemd retains the standard formatter. */
+    int                     log_systemd_autodetect;
+
     /* App migrations (compiled runs first if both are set) */
     const db_migration_t   *migrations;      /* compiled-in app migrations, NULL = none */
     const char             *migrations_dir;  /* path to app .sql migrations, NULL = none */

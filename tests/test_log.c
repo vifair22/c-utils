@@ -332,6 +332,55 @@ static void test_no_color_env_suppresses_escapes(void **state)
     assert_non_null(strstr(buf, "no escapes please"));
 }
 
+/* --- Systemd mode --- */
+
+static void emit_all_four_levels(void)
+{
+    assert_int_equal(log_init(NULL, LOG_DEBUG, 0), CUTILS_OK);
+    log_write(LOG_DEBUG,   "fn", "d-msg");
+    log_write(LOG_INFO,    "fn", "i-msg");
+    log_write(LOG_WARNING, "fn", "w-msg");
+    log_write(LOG_ERROR,   "fn", "e-msg");
+    log_shutdown();
+}
+
+static void test_systemd_mode_format(void **state)
+{
+    /* Verify the systemd-mode formatter:
+     *   - <N> priority prefix per RFC 5424 (7/6/4/3 = debug/info/warning/error)
+     *   - no timestamp (no "20" digit prefix that the standard format produces)
+     *   - no ANSI escapes
+     *   - all four levels, including ERROR, appear in stdout (proving the
+     *     stream split was dropped — captured fd is stdout only) */
+    (void)state;
+    log_set_systemd_mode(1);
+
+    char buf[4096];
+    capture_console("/tmp/cutils_test_log_systemd.txt", buf, sizeof(buf),
+                    emit_all_four_levels);
+
+    log_set_systemd_mode(0);
+
+    assert_non_null(strstr(buf, "<7>[fn] d-msg"));
+    assert_non_null(strstr(buf, "<6>[fn] i-msg"));
+    assert_non_null(strstr(buf, "<4>[fn] w-msg"));
+    assert_non_null(strstr(buf, "<3>[fn] e-msg"));
+    assert_null(strchr(buf, '\033'));
+    assert_null(strstr(buf, "20")); /* no year-prefixed timestamp */
+}
+
+static void test_systemd_mode_setter(void **state)
+{
+    (void)state;
+    log_set_systemd_mode(0);
+    assert_int_equal(log_get_systemd_mode(), 0);
+    log_set_systemd_mode(1);
+    assert_int_equal(log_get_systemd_mode(), 1);
+    log_set_systemd_mode(42); /* nonzero is truthy */
+    assert_int_equal(log_get_systemd_mode(), 1);
+    log_set_systemd_mode(0);
+}
+
 /* --- DB with retention --- */
 
 static void test_log_retention(void **state)
@@ -382,6 +431,8 @@ int main(void)
         cmocka_unit_test_teardown(test_streams_with_db, teardown),
         cmocka_unit_test_teardown(test_no_escapes_when_not_tty, teardown),
         cmocka_unit_test_teardown(test_no_color_env_suppresses_escapes, teardown),
+        cmocka_unit_test_teardown(test_systemd_mode_format, teardown),
+        cmocka_unit_test_teardown(test_systemd_mode_setter, teardown),
         cmocka_unit_test_teardown(test_log_retention, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
