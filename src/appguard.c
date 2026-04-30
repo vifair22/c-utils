@@ -7,6 +7,7 @@
 #include "cutils/push.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,37 +34,79 @@ struct appguard {
     int              push_started;
     int              log_started;
     int              shutdown_called;
+    pthread_t        signal_thread;
+    int              signal_thread_started;
 };
 
 /* Saved argv for restart */
 static int    saved_argc = 0;
 static char **saved_argv = NULL;
 
-/* --- Signal handling --- */
+/* --- Signal handling ---
+ *
+ * The pre-fix design used sigaction with a handler that called
+ * fprintf, pthread_mutex_lock (via appguard_shutdown → log_info), and
+ * other non-async-signal-safe primitives — explicit UB by POSIX, and
+ * a deadlock waiting to happen in a multi-threaded program where the
+ * signal could land on a thread already holding a c-utils mutex.
+ *
+ * Replacement design: at appguard_init, block SIGINT/SIGTERM/SIGUSR1
+ * process-wide via pthread_sigmask. All subsequently-spawned threads
+ * (log writer, push worker, app threads) inherit this mask, so the
+ * dedicated signal_watcher thread is the only one that receives the
+ * signals. The watcher uses sigwait — synchronous, regular thread
+ * context — and can legally call any function. SIGUSR1 is reserved
+ * as the "wake the watcher for normal shutdown" sentinel. */
 
-static appguard_t *signal_guard = NULL;
-
-static void signal_handler(int sig)
+static void appguard_signal_set(sigset_t *out)
 {
+    sigemptyset(out);
+    sigaddset(out, SIGINT);
+    sigaddset(out, SIGTERM);
+    sigaddset(out, SIGUSR1);
+}
+
+static void *signal_watcher(void *arg)
+{
+    appguard_t *guard = arg;
+    sigset_t    set;
+    appguard_signal_set(&set);
+
+    int sig = 0;
+    if (sigwait(&set, &sig) != 0)
+        return NULL;
+
+    if (sig == SIGUSR1) {
+        /* appguard_shutdown is driving teardown from the main thread
+         * — leave it to do the work and just exit the watcher. */
+        return NULL;
+    }
+
+    /* SIGINT or SIGTERM: drive the exit ourselves. We're a regular
+     * thread, so locking primitives and fprintf are legal. We don't
+     * call appguard_shutdown — it would try to join us and self-
+     * deadlock. We also skip free() of the guard/config; the kernel
+     * reclaims memory on _exit, and an in-flight main-thread reader
+     * might still be touching them. We do still drain the subsystem
+     * queues so users' last log lines and notifications get through. */
     const char *name = (sig == SIGINT) ? "SIGINT" : "SIGTERM";
     fprintf(stderr, "\nReceived %s, shutting down...\n", name);
-    if (signal_guard)
-        appguard_shutdown(signal_guard);
+
+    if (guard->push_started) push_shutdown();
+    if (guard->log_started)  log_shutdown();
+    if (guard->db)           db_close(guard->db);
+
     _exit(0);
 }
 
-static void install_signal_handlers(appguard_t *guard)
+static int install_signal_watcher(appguard_t *guard)
 {
-    signal_guard = guard;
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    /* Mask was set process-wide at the top of appguard_init; this is
+     * purely the watcher-thread spawn step. */
+    if (pthread_create(&guard->signal_thread, NULL, signal_watcher, guard) != 0)
+        return -1;
+    guard->signal_thread_started = 1;
+    return 0;
 }
 
 /* --- Init --- */
@@ -73,6 +116,18 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
     if (!cfg || !cfg->app_name) {
         fprintf(stderr, "appguard_init: app_name is required\n");
         return NULL;
+    }
+
+    /* Block SIGINT/SIGTERM/SIGUSR1 BEFORE any thread is spawned so the
+     * subsequently-created log writer, push worker, and signal_watcher
+     * all inherit this mask. The watcher is then the only thread the
+     * kernel can deliver these signals to. Done first thing so a
+     * signal arriving during init still lands on the watcher (or sits
+     * pending until it's spawned in step 9). */
+    {
+        sigset_t set;
+        appguard_signal_set(&set);
+        pthread_sigmask(SIG_BLOCK, &set, NULL);
     }
 
     CUTILS_AUTO_APPGUARD appguard_t *guard = calloc(1, sizeof(*guard));
@@ -186,8 +241,12 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
         }
     }
 
-    /* Step 9: Install signal handlers */
-    install_signal_handlers(guard);
+    /* Step 9: Spawn signal watcher thread (sigwait-based, see file header). */
+    if (install_signal_watcher(guard) != 0) {
+        log_warn("signal watcher spawn failed: %s",
+                 "shutdown via SIGINT/SIGTERM will not drain subsystems");
+        /* Non-fatal: app continues without graceful signal handling. */
+    }
 
     /* All steps succeeded — caller takes ownership. */
     return CUTILS_MOVE(guard);
@@ -200,6 +259,18 @@ void appguard_shutdown(appguard_t *guard)
 {
     if (!guard || guard->shutdown_called) return;
     guard->shutdown_called = 1;
+
+    /* Stop the signal watcher BEFORE tearing down subsystems so it
+     * doesn't race us on push/log/db cleanup. SIGUSR1 wakes its
+     * sigwait; the watcher returns and is joined here. If a real
+     * SIGINT/SIGTERM races our SIGUSR1, the watcher takes the exit
+     * path and _exits — pthread_join is moot since the process is
+     * gone, which is the same outcome the user expected from Ctrl-C. */
+    if (guard->signal_thread_started) {
+        pthread_kill(guard->signal_thread, SIGUSR1);
+        pthread_join(guard->signal_thread, NULL);
+        guard->signal_thread_started = 0;
+    }
 
     log_info("c-utils shutting down");
 
@@ -216,7 +287,6 @@ void appguard_shutdown(appguard_t *guard)
     if (guard->config)
         config_free(guard->config);
 
-    signal_guard = NULL;
     free(guard);
 }
 
@@ -240,9 +310,16 @@ int appguard_restart(appguard_t *guard)
 
     appguard_shutdown(guard);
 
-    /* Reset signal handlers to default before exec */
-    signal(SIGINT, SIG_DFL);
-    signal(SIGTERM, SIG_DFL);
+    /* Restore default signal disposition for the execv'd process. The
+     * mask we set in appguard_init is inherited across execve, so
+     * unblock here — otherwise the new process starts with SIGINT and
+     * SIGTERM blocked until its own appguard_init reblocks them, which
+     * would mask any signal arriving in that gap. */
+    {
+        sigset_t set;
+        appguard_signal_set(&set);
+        pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+    }
 
     execv(saved_argv[0], saved_argv);
 
