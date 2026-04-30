@@ -316,7 +316,14 @@ int push_init(cutils_db_t *db, const cutils_config_t *cfg)
     atomic_store(&push_db, db);
     atomic_store(&push_cfg, cfg);
     push_stop = 0;
-    push_notify = 0;
+    /* Kick the worker into draining on its first iteration. The push
+     * table can hold rows from a previous (possibly crashed) run that
+     * never got delivered — the header explicitly promises "messages
+     * survive crashes — the worker picks up unsent messages on
+     * restart". With push_notify left at 0, the worker would park on
+     * cond_wait at startup and only drain once a fresh push_send came
+     * in, contradicting that contract. */
+    push_notify = 1;
     atomic_store(&push_running, 1);
 
     /* Verify creds are configured */
