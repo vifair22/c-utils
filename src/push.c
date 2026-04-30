@@ -67,12 +67,23 @@ static size_t discard_cb(void *ptr, size_t size, size_t nmemb, void *userdata)
     return size * nmemb;
 }
 
-/* --- Message splitting --- */
+/* --- Message splitting ---
+ *
+ * All chunks of a multi-part message are inserted under a single
+ * transaction so concurrent push_send calls can't interleave each
+ * other's chunks (Pushover would deliver "A 1/2", "B 1/2", "A 2/2",
+ * "B 2/2" otherwise). The worker drains by rowid (insertion order),
+ * not by timestamp, so the per-part timestamp offset that the
+ * pre-fix code added is now unnecessary — every chunk uses the same
+ * caller-provided timestamp. */
 
 static int split_and_store(const char *title, const char *message,
                            const char *token, const char *user,
                            int ttl, int timestamp, int html, int priority)
 {
+    cutils_db_t *db = atomic_load(&push_db);
+    if (!db) return set_error(CUTILS_ERR_INVALID, "push not initialized");
+
     size_t msglen = strlen(message);
     char ts_str[32], ttl_str[16], html_str[4], pri_str[4];
     snprintf(ts_str, sizeof(ts_str), "%d", timestamp);
@@ -85,11 +96,15 @@ static int split_and_store(const char *title, const char *message,
             ts_str, token, user, ttl_str, message, title,
             html_str, pri_str, NULL
         };
-        return db_execute_non_query(push_db,
+        return db_execute_non_query(db,
             "INSERT INTO push (timestamp, token, user, ttl, message, title, "
             "failed, html, priority) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
             params, NULL);
     }
+
+    CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+    int rc = cutils_db_tx_begin(db, &tx);
+    if (rc != CUTILS_OK) return rc;
 
     /* Split on newline boundaries */
     const char *remaining = message;
@@ -126,14 +141,11 @@ static int split_and_store(const char *title, const char *message,
         memcpy(chunk, remaining, chunk_len);
         chunk[chunk_len] = '\0';
 
-        char part_ts[32];
-        snprintf(part_ts, sizeof(part_ts), "%d", timestamp + part);
-
         const char *params[] = {
-            part_ts, token, user, ttl_str, chunk, part_title,
+            ts_str, token, user, ttl_str, chunk, part_title,
             html_str, pri_str, NULL
         };
-        int rc = db_execute_non_query(push_db,
+        rc = db_execute_non_query(db,
             "INSERT INTO push (timestamp, token, user, ttl, message, title, "
             "failed, html, priority) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
             params, NULL);
@@ -145,7 +157,7 @@ static int split_and_store(const char *title, const char *message,
         part++;
     }
 
-    return CUTILS_OK;
+    return db_tx_commit(&tx);
 }
 
 /* --- Send with retry --- */
@@ -243,10 +255,16 @@ static void *push_worker_thread(void *arg)
         /* Process unsent messages */
         while (1) {
             CUTILS_AUTO_DBRES db_result_t *result = NULL;
+            /* ORDER BY rowid: strict insertion order. Two push_send
+             * calls in the same wall-clock second used to collide on
+             * timestamp; rowid is monotonic per the autoincrement PK
+             * so multi-part messages always reach the receiver in
+             * order, and concurrent senders never interleave parts
+             * (split_and_store inserts all chunks under one tx). */
             int rc = db_execute(push_db,
                 "SELECT rowid, timestamp, token, user, ttl, message, title, "
                 "html, priority "
-                "FROM push WHERE failed = 0 ORDER BY timestamp LIMIT 1",
+                "FROM push WHERE failed = 0 ORDER BY rowid LIMIT 1",
                 NULL, &result);
 
             if (rc != CUTILS_OK || !result || result->nrows == 0)
