@@ -5,6 +5,7 @@
 
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,16 +41,26 @@ typedef struct {
     int           active;
 } log_stream_slot_t;
 
-/* --- Module state --- */
+/* --- Module state ---
+ *
+ * Globals read by every log_write call (potentially from any thread)
+ * and written by log_init / log_shutdown / log_set_level on the main
+ * thread are declared _Atomic. Per C11, plain-int read/write across
+ * threads is a data race even when the value is naturally aligned and
+ * word-sized; the compiler is free to tear, reorder, or hoist. _Atomic
+ * gives well-defined seq-cst semantics with no measurable cost on x86
+ * for word-sized types. */
 
-static cutils_db_t     *log_db           = NULL;
-static log_level_t      log_min_level    = LOG_INFO;
-static int              log_retention    = 0;
-static int              log_running      = 0;
+static _Atomic(cutils_db_t *) log_db           = NULL;
+static _Atomic log_level_t    log_min_level    = LOG_INFO;
+static int                    log_retention    = 0;  /* writer-thread only */
+static _Atomic int            log_running      = 0;
 
 /* Output formatting flags — cached once at log_init.
  * Color is emitted only when the chosen stream is a TTY AND NO_COLOR is unset.
- * Sniffing once avoids per-call getenv/isatty overhead. */
+ * Sniffing once avoids per-call getenv/isatty overhead. Set before the
+ * writer thread is spawned and never modified again — pthread_create's
+ * synchronization makes a plain read in the worker safe. */
 static int              stdout_is_tty    = 0;
 static int              stderr_is_tty    = 0;
 static int              no_color_env     = 0;
@@ -57,7 +68,7 @@ static int              no_color_env     = 0;
 /* Systemd-native output mode. See log_set_systemd_mode() for the full
  * format. Cleared on log_init; AppGuard sets it after sniffing
  * JOURNAL_STREAM. Tests may flip it directly. */
-static int              log_systemd_mode = 0;
+static _Atomic int      log_systemd_mode = 0;
 
 /* Writer thread */
 static pthread_t        log_thread;
@@ -166,14 +177,15 @@ static void fire_streams(const char *timestamp, const char *level_s,
 
 static void write_entry_to_db(const log_entry_t *entry)
 {
-    if (!log_db) return;
+    cutils_db_t *db = atomic_load(&log_db);
+    if (!db) return;
 
     const char *params[] = {
         entry->timestamp, entry->level, entry->func, entry->message, NULL
     };
     /* Writer thread is fire-and-forget — a DB insert failure here would
      * recurse if we tried to log it. Drop silently. */
-    CUTILS_UNUSED(db_execute_non_query(log_db,
+    CUTILS_UNUSED(db_execute_non_query(db,
         "INSERT INTO logs (timestamp, level, function, message) "
         "VALUES (?, ?, ?, ?)",
         params, NULL));
@@ -181,7 +193,8 @@ static void write_entry_to_db(const log_entry_t *entry)
 
 static void do_cleanup(void)
 {
-    if (!log_db || log_retention <= 0) return;
+    cutils_db_t *db = atomic_load(&log_db);
+    if (!db || log_retention <= 0) return;
 
     char cutoff[32];
     time_t now = time(NULL);
@@ -193,7 +206,7 @@ static void do_cleanup(void)
     const char *params[] = { cutoff, NULL };
     int affected = 0;
     /* Cleanup runs on a background thread — caller has no handle to fail. */
-    CUTILS_UNUSED(db_execute_non_query(log_db,
+    CUTILS_UNUSED(db_execute_non_query(db,
         "DELETE FROM logs WHERE timestamp < ?", params, &affected));
 
     if (affected > 0) {
@@ -205,7 +218,7 @@ static void do_cleanup(void)
         get_timestamp(ts_now, sizeof(ts_now));
 
         const char *ins_params[] = { ts_now, "info", "log_cleanup", msg, NULL };
-        CUTILS_UNUSED(db_execute_non_query(log_db,
+        CUTILS_UNUSED(db_execute_non_query(db,
             "INSERT INTO logs (timestamp, level, function, message) "
             "VALUES (?, ?, ?, ?)",
             ins_params, NULL));
@@ -289,11 +302,11 @@ static void enqueue_entry(const char *timestamp, log_level_t level,
 
 int log_init(cutils_db_t *db, log_level_t level, int retention_days)
 {
-    log_db = db;
-    log_min_level = level;
+    atomic_store(&log_db, db);
+    atomic_store(&log_min_level, level);
     log_retention = retention_days;
     log_stop = 0;
-    log_running = 1;
+    atomic_store(&log_running, 1);
 
     /* Force line-buffered stdout. glibc switches to fully-buffered (4KB block)
      * when stdout isn't a TTY, which under Docker/pipes causes INFO/DEBUG lines
@@ -325,10 +338,10 @@ int log_init(cutils_db_t *db, log_level_t level, int retention_days)
 
 void log_shutdown(void)
 {
-    if (!log_running) return;
-    log_running = 0;
+    if (!atomic_load(&log_running)) return;
+    atomic_store(&log_running, 0);
 
-    if (log_db) {
+    if (atomic_load(&log_db)) {
         {
             CUTILS_LOCK_GUARD(&log_mutex);
             log_stop = 1;
@@ -352,22 +365,22 @@ void log_shutdown(void)
 
 void log_set_level(log_level_t level)
 {
-    log_min_level = level;
+    atomic_store(&log_min_level, level);
 }
 
 log_level_t log_get_level(void)
 {
-    return log_min_level;
+    return atomic_load(&log_min_level);
 }
 
 void log_set_systemd_mode(int enabled)
 {
-    log_systemd_mode = enabled ? 1 : 0;
+    atomic_store(&log_systemd_mode, enabled ? 1 : 0);
 }
 
 int log_get_systemd_mode(void)
 {
-    return log_systemd_mode;
+    return atomic_load(&log_systemd_mode);
 }
 
 int log_stream_register(log_stream_fn fn, void *userdata)
@@ -395,7 +408,7 @@ void log_stream_unregister(int handle)
 
 void log_write(log_level_t level, const char *func, const char *fmt, ...)
 {
-    if (level < log_min_level) return;
+    if (level < atomic_load(&log_min_level)) return;
 
     char timestamp[32];
     get_timestamp(timestamp, sizeof(timestamp));
@@ -412,7 +425,11 @@ void log_write(log_level_t level, const char *func, const char *fmt, ...)
     /* Stream callbacks */
     fire_streams(timestamp, level_str(level), func, message);
 
-    /* DB persistence (async) */
-    if (log_db && log_running)
+    /* DB persistence (async). Both gates are atomic so the load is
+     * defined under concurrent shutdown — and even if shutdown sets
+     * log_running=0 between the two loads, we just skip the enqueue
+     * (the writer thread is still alive draining its existing queue
+     * since shutdown hasn't joined it yet). */
+    if (atomic_load(&log_db) && atomic_load(&log_running))
         enqueue_entry(timestamp, level, func, message);
 }

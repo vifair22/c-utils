@@ -7,6 +7,7 @@
 
 #include <curl/curl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,16 +40,24 @@ static void curl_free_p(char **s)
 #define BASE_DELAY_SEC   1
 #define DEFAULT_TTL      86400
 
-/* --- Module state --- */
+/* --- Module state ---
+ *
+ * push_db / push_cfg are read by push_send (any caller thread) and
+ * written by push_init / push_shutdown — atomic load/store gives
+ * defined semantics under concurrent shutdown. push_running is the
+ * outer "is the worker alive" gate for push_shutdown; also atomic.
+ *
+ * push_stop and push_notify are accessed only under push_mutex (the
+ * cond-var pair), so plain int is correct. */
 
-static cutils_db_t           *push_db     = NULL;
-static const cutils_config_t *push_cfg    = NULL;
-static pthread_t              push_thread;
-static pthread_mutex_t        push_mutex  = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t         push_cond   = PTHREAD_COND_INITIALIZER;
-static int                    push_stop   = 0;
-static int                    push_running = 0;
-static int                    push_notify = 0;  /* new message signal */
+static _Atomic(cutils_db_t *)            push_db      = NULL;
+static _Atomic(const cutils_config_t *)  push_cfg     = NULL;
+static pthread_t                         push_thread;
+static pthread_mutex_t                   push_mutex   = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t                    push_cond    = PTHREAD_COND_INITIALIZER;
+static int                               push_stop    = 0;  /* push_mutex */
+static _Atomic int                       push_running = 0;
+static int                               push_notify  = 0;  /* push_mutex */
 
 /* --- curl write callback (discard response body) --- */
 
@@ -286,18 +295,18 @@ static void *push_worker_thread(void *arg)
 
 int push_init(cutils_db_t *db, const cutils_config_t *cfg)
 {
-    push_db = db;
-    push_cfg = cfg;
+    atomic_store(&push_db, db);
+    atomic_store(&push_cfg, cfg);
     push_stop = 0;
     push_notify = 0;
-    push_running = 1;
+    atomic_store(&push_running, 1);
 
     /* Verify creds are configured */
     const char *token = config_get_str(cfg, PUSH_CONFIG_TOKEN);
     const char *user  = config_get_str(cfg, PUSH_CONFIG_USER);
     if (!token || !token[0] || !user || !user[0]) {
         log_info("Pushover not configured, notifications disabled");
-        push_running = 0;
+        atomic_store(&push_running, 0);
         return CUTILS_OK;
     }
 
@@ -305,7 +314,7 @@ int push_init(cutils_db_t *db, const cutils_config_t *cfg)
 
     int rc = pthread_create(&push_thread, NULL, push_worker_thread, NULL);
     if (rc != 0) {
-        push_running = 0;
+        atomic_store(&push_running, 0);
         return set_error(CUTILS_ERR, "failed to create push worker thread");
     }
 
@@ -315,8 +324,8 @@ int push_init(cutils_db_t *db, const cutils_config_t *cfg)
 
 void push_shutdown(void)
 {
-    if (!push_running) return;
-    push_running = 0;
+    if (!atomic_load(&push_running)) return;
+    atomic_store(&push_running, 0);
 
     {
         CUTILS_LOCK_GUARD(&push_mutex);
@@ -340,7 +349,7 @@ int push_send(const char *title, const char *message)
 
 int push_send_opts(const push_opts_t *opts)
 {
-    if (!push_db)
+    if (!atomic_load(&push_db))
         return set_error(CUTILS_ERR_INVALID, "push not initialized");
 
     const char *token = opts->token;
@@ -348,10 +357,11 @@ int push_send_opts(const push_opts_t *opts)
     int ttl           = opts->ttl > 0 ? opts->ttl : DEFAULT_TTL;
     int timestamp     = opts->timestamp > 0 ? opts->timestamp : (int)time(NULL);
 
+    const cutils_config_t *cfg = atomic_load(&push_cfg);
     if (!token || !token[0])
-        token = config_get_str(push_cfg, PUSH_CONFIG_TOKEN);
+        token = config_get_str(cfg, PUSH_CONFIG_TOKEN);
     if (!user || !user[0])
-        user = config_get_str(push_cfg, PUSH_CONFIG_USER);
+        user = config_get_str(cfg, PUSH_CONFIG_USER);
 
     if (!token || !token[0] || !user || !user[0])
         return set_error(CUTILS_ERR_CONFIG, "Pushover credentials not configured");
