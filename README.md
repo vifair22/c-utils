@@ -20,6 +20,16 @@ Shared C application framework. Static library providing config management, SQLi
 
 Include `<cutils.h>` for everything, or individual headers for specific subsystems.
 
+## API stability
+
+c-utils 1.0.0 commits to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at the public-header level:
+
+- **Patch** versions (1.0.x) — bug fixes, no API or ABI changes.
+- **Minor** versions (1.x.0) — additive only: new functions, struct fields appended, new enum values. Existing consumer code keeps compiling and linking.
+- **Major** versions (2.0.0+) — may break ABI or API. Migration notes will land in `CHANGELOG.md`.
+
+The public surface is everything reachable through `<cutils/*.h>`. Headers in `src/` and the vendored `lib/cJSON/` copy are implementation details.
+
 ## Dependencies
 
 **Build-time:**
