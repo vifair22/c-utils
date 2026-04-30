@@ -5,6 +5,16 @@ BUILD_DIR   = build
 TEST_DIR    = build-test
 STACK_LIMIT = 65536
 
+# Version embedding. release_version is the source of truth for the semver;
+# build timestamp is captured in UTC at make-invocation time; BUILD_TYPE is
+# overridden per-target below. The composed string is `-D`-injected so the
+# library exposes it via cutils_version() at runtime.
+RELEASE_VERSION       := $(shell tr -d '[:space:]' < release_version)
+BUILD_TIMESTAMP       := $(shell date -u +%Y%m%d.%H%M)
+BUILD_TYPE            ?= release
+CUTILS_VERSION_STRING  = $(RELEASE_VERSION)_$(BUILD_TIMESTAMP).$(BUILD_TYPE)
+VERSION_DEFINE         = -DCUTILS_VERSION_STRING=\"$(CUTILS_VERSION_STRING)\"
+
 # Warning flags (shared across all variants)
 WARN_FLAGS  = -Wall -Wextra -Wpedantic -Wshadow -Wunused -Wunused-function \
               -Wunused-variable -Wunused-parameter -Wunused-result \
@@ -19,7 +29,8 @@ HARDEN_FLAGS = -fstack-protector-strong -fstack-clash-protection
 # Common flags (all variants)
 COMMON_CFLAGS = -std=c11 -D_POSIX_C_SOURCE=200809L \
                 $(WARN_FLAGS) $(HARDEN_FLAGS) \
-                -Iinclude -Ilib/cJSON
+                -Iinclude -Ilib/cJSON \
+                $(VERSION_DEFINE)
 
 # Build variants
 RELEASE_CFLAGS = $(COMMON_CFLAGS) -O2
@@ -50,7 +61,8 @@ SRCS     = src/error.c \
            src/push.c \
            src/error_loop.c \
            src/appguard.c \
-           src/json.c
+           src/json.c \
+           src/version.c
 VENDOR   = lib/cJSON/cJSON.c
 
 # Object files routed to build/
@@ -62,11 +74,14 @@ ALL_OBJS    = $(SRC_OBJS) $(VENDOR_OBJS)
 $(BUILD_DIR)/$(LIB): $(ALL_OBJS) | $(BUILD_DIR)
 	$(AR) rcs $@ $^
 
-# Build variants
+# Build variants — each target stamps BUILD_TYPE so cutils_version() reflects
+# how the library was built (release / debug / asan / coverage).
 debug: CFLAGS = $(DEBUG_CFLAGS)
+debug: BUILD_TYPE = debug
 debug: clean-lib $(BUILD_DIR)/$(LIB)
 
 asan: CFLAGS = $(ASAN_CFLAGS)
+asan: BUILD_TYPE = asan
 asan: clean-lib $(BUILD_DIR)/$(LIB)
 
 # Directories
@@ -113,24 +128,48 @@ $(TEST_DIR)/bin/%: tests/%.c $(TEST_LIB) | $(TEST_DIR)
 	$(CC) $(CFLAGS) -Isrc $< -o $@ $(TEST_LIBS)
 
 test: CFLAGS = $(DEBUG_CFLAGS)
+test: BUILD_TYPE = debug
 test: $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "=== $$t ==="; ./$$t || exit 1; done
 
+# CI variant. cmocka's XML output replaces stdout, so this lives separately
+# from `make test` to keep the local-developer experience stdout-driven.
+# Per-binary JUnit XML feeds GitLab's MR Tests tab via artifacts:reports:junit.
+test-junit: CFLAGS = $(DEBUG_CFLAGS)
+test-junit: BUILD_TYPE = debug
+test-junit: clean-test $(TEST_BINS)
+	@mkdir -p $(TEST_DIR)/junit
+	@for t in $(TEST_BINS); do \
+	    name=$$(basename $$t); \
+	    echo "=== $$name (junit) ==="; \
+	    CMOCKA_MESSAGE_OUTPUT=xml \
+	    CMOCKA_XML_FILE=$(TEST_DIR)/junit/$$name.junit.xml \
+	    ./$$t || exit 1; \
+	done
+
 test-asan: CFLAGS = $(ASAN_CFLAGS)
+test-asan: BUILD_TYPE = asan
 test-asan: TEST_LIBS += -fsanitize=address
 test-asan: clean-test $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "=== $$t (asan) ==="; ./$$t || exit 1; done
 
-# Coverage
+# Coverage. Cobertura XML feeds GitLab's MR diff-view per-file annotations;
+# --fail-under-line 80 enforces the project-wide coverage floor (current
+# baseline ~93%, leaves comfortable headroom).
 coverage: CFLAGS = $(COV_CFLAGS)
+coverage: BUILD_TYPE = coverage
 coverage: TEST_LIBS += --coverage
 coverage: clean-test $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "=== $$t (cov) ==="; ./$$t || exit 1; done
-	@gcovr --root . --object-directory $(TEST_DIR) --filter 'src/' --print-summary
+	@mkdir -p $(TEST_DIR)/coverage
+	@gcovr --root . --object-directory $(TEST_DIR) --filter 'src/' \
+	    --print-summary \
+	    --cobertura $(TEST_DIR)/coverage/cobertura.xml \
+	    --fail-under-line 80
 	@gcovr --root . --object-directory $(TEST_DIR) --filter 'src/' --branches --print-summary 2>/dev/null || true
 
 # Static analysis
-ANALYZE_CFLAGS = -std=c11 -D_POSIX_C_SOURCE=200809L $(WARN_FLAGS) -O2 -Iinclude -Ilib/cJSON
+ANALYZE_CFLAGS = -std=c11 -D_POSIX_C_SOURCE=200809L $(WARN_FLAGS) -O2 -Iinclude -Ilib/cJSON $(VERSION_DEFINE)
 
 analyze: check
 	@echo "=== stack-usage ==="
@@ -165,7 +204,7 @@ analyze: check
 # Linting
 lint:
 	@echo "=== clang-tidy ==="
-	@clang-tidy $(SRCS) -- -std=c11 -D_POSIX_C_SOURCE=200809L -Iinclude -Ilib/cJSON 2>&1 | \
+	@clang-tidy $(SRCS) -- -std=c11 -D_POSIX_C_SOURCE=200809L -Iinclude -Ilib/cJSON $(VERSION_DEFINE) 2>&1 | \
 	    grep -E "warning:|error:" || echo "clang-tidy: OK"
 
 # Clean
@@ -177,4 +216,4 @@ clean-test:
 
 clean: clean-lib clean-test
 
-.PHONY: check test test-asan coverage debug asan analyze lint clean clean-lib clean-test
+.PHONY: check test test-junit test-asan coverage debug asan analyze lint clean clean-lib clean-test

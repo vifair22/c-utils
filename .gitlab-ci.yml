@@ -1,0 +1,209 @@
+# c-utils CI pipeline.
+#
+# Stages:
+#   test    – cmocka unit tests, JUnit reports for the MR Tests tab
+#   analyze – stack-usage, gcc-fanalyzer, cppcheck, clang-tidy, coverage
+#   release – auto-tag on release_version bump, GitLab Release on semver tag
+#
+# Targets debian:trixie to match the Debian environments where consumer
+# projects (airies-ups, etc.) actually ship. No cross-compile, no .deb
+# packaging, no docker image — c-utils is a static library distributed via
+# git clone.
+
+stages:
+  - test
+  - analyze
+  - release
+
+variables:
+  DEBIAN_FRONTEND: noninteractive
+
+# Run pipelines on:
+#   - merge requests (the real pre-merge gate)
+#   - master pushes (post-merge verification + release:auto-tag)
+#   - semver tag pushes (release:stable creates the GitLab Release)
+# Plain feature-branch pushes without an open MR do NOT trigger a pipeline.
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "master"'
+    - if: '$CI_COMMIT_TAG'
+
+# Shared toolchain for build-touching jobs (test, analyze, coverage).
+.deps_build: &deps_build
+  - apt-get update -qq
+  - apt-get install -y --no-install-recommends
+      build-essential pkg-config ca-certificates
+      libcmocka-dev libsqlite3-dev libcurl4-openssl-dev libssl-dev
+
+test:
+  stage: test
+  image: debian:trixie
+  tags:
+    - docker
+  before_script:
+    - *deps_build
+  script:
+    - make test-junit
+  artifacts:
+    when: always
+    paths:
+      - build-test/junit/
+    reports:
+      junit: build-test/junit/*.junit.xml
+    expire_in: 1 week
+
+analyze:
+  stage: analyze
+  image: debian:trixie
+  tags:
+    - docker
+  needs:
+    - test
+  before_script:
+    - *deps_build
+    - apt-get install -y --no-install-recommends cppcheck clang-tidy
+  script:
+    - make analyze
+    - make lint
+
+# Cobertura artifact drives the per-file coverage annotations in the MR diff
+# view; the `coverage:` regex below feeds the pipeline-view percentage and
+# the project's default coverage badge.
+coverage:
+  stage: analyze
+  image: debian:trixie
+  tags:
+    - docker
+  needs:
+    - test
+  before_script:
+    - *deps_build
+    - apt-get install -y --no-install-recommends gcovr
+  script:
+    - make coverage
+  coverage: '/^lines: (\d+\.\d+)%/'
+  artifacts:
+    when: always
+    paths:
+      - build-test/coverage/
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: build-test/coverage/cobertura.xml
+    expire_in: 1 week
+
+# Auto-tag stable releases off a `release_version` bump on master. When the
+# semver string in release_version changes since the previous master
+# commit, this job creates `v<semver>` via the GitLab API at the current
+# SHA. The new tag triggers a pipeline whose release:stable job creates
+# the actual Release — so the tagged commit is guaranteed to have already
+# passed test/analyze/coverage on master.
+#
+# Requires CI variable RELEASE_TAG_TOKEN: a Project Access Token with `api`
+# scope. CI_JOB_TOKEN cannot create tags via the API. The job fails loudly
+# if the variable is missing rather than silently skipping.
+#
+# Critical: master must use a true merge commit (merge_method=merge in
+# project settings). If master fast-forwards, `git show HEAD~1:release_version`
+# returns the already-bumped value, the diff is empty, and no tag is created.
+release:auto-tag:
+  stage: release
+  # alpine/git's ENTRYPOINT is `git`, so a plain `image: alpine/git:latest`
+  # makes CI's `sh -c "<step_script>"` resolve as `git sh -c "..."` and die
+  # with `'sh' is not a git command`. Override the entrypoint so the runner
+  # can invoke /bin/sh normally; the image still has `git` on PATH.
+  image:
+    name: alpine/git:latest
+    entrypoint: [""]
+  tags:
+    - docker
+  needs:
+    - test
+    - analyze
+    - coverage
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      set -eu
+      PREV=$(git show HEAD~1:release_version 2>/dev/null | tr -d '[:space:]' || echo "")
+      CURR=$(tr -d '[:space:]' < release_version)
+      if [ "$PREV" = "$CURR" ]; then
+          echo "release_version unchanged ($CURR); no tag to create."
+          exit 0
+      fi
+      echo "release_version bumped: ${PREV:-<none>} -> $CURR"
+
+      TAG="v${CURR}"
+      # Idempotent: a re-run of the same master commit (e.g. retry after a
+      # transient failure) finds the tag already at the same SHA and exits
+      # cleanly instead of erroring.
+      if curl --silent --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+              "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags/${TAG}" \
+              >/dev/null 2>&1; then
+          echo "Tag $TAG already exists; nothing to do."
+          exit 0
+      fi
+
+      if [ -z "${RELEASE_TAG_TOKEN:-}" ]; then
+          echo "ERROR: RELEASE_TAG_TOKEN is not set." >&2
+          echo "Create a Project Access Token with 'api' scope and add it" >&2
+          echo "as a masked, protected CI variable named RELEASE_TAG_TOKEN." >&2
+          exit 1
+      fi
+
+      curl --fail --silent --show-error --request POST \
+           --header "PRIVATE-TOKEN: $RELEASE_TAG_TOKEN" \
+           --data-urlencode "tag_name=${TAG}" \
+           --data-urlencode "ref=${CI_COMMIT_SHA}" \
+           --data-urlencode "message=Tag ${TAG} from release_version bump (auto)" \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags"
+      echo
+      echo "Tag $TAG created at ${CI_COMMIT_SHORT_SHA}. release:stable will run in the tag pipeline."
+
+# Materialize the GitLab Release on every semver tag. Description is pulled
+# from the matching CHANGELOG section so the release page surfaces the
+# actual changes rather than a boilerplate string. Falls back to boilerplate
+# if no entry matches.
+release:stable:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  tags:
+    - docker
+  needs:
+    - test
+    - analyze
+    - coverage
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+  script:
+    - |
+      set -eu
+      VER="${CI_COMMIT_TAG#v}"
+      # Extract the section starting at "## [VER]" until the next "## ["
+      # header. Skips the header line itself; everything until the next
+      # version section is the body of the entry.
+      awk -v ver="$VER" '
+          $0 ~ "^## \\[" ver "\\]" { capture=1; next }
+          capture && /^## \[/      { exit }
+          capture                  { print }
+      ' CHANGELOG.md > release_notes.md
+      # Trim leading and trailing blank lines for clean rendering.
+      awk '
+          NF    { for (i=0; i<blanks; i++) print ""; print; found=1; blanks=0; next }
+          found { blanks++ }
+      ' release_notes.md > release_notes.tmp && mv release_notes.tmp release_notes.md
+      if [ ! -s release_notes.md ]; then
+          echo "Stable release of c-utils $CI_COMMIT_TAG." > release_notes.md
+          echo "WARNING: no CHANGELOG entry for $VER; falling back to boilerplate" >&2
+      fi
+      echo "--- release notes ---"
+      cat release_notes.md
+      echo "--- end ---"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: '$CI_COMMIT_TAG'
+    description: ./release_notes.md
