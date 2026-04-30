@@ -371,6 +371,13 @@ void log_shutdown(void)
         pthread_join(log_thread, NULL);
     }
 
+    /* Clear log_db AFTER the writer thread has been joined. The atomic
+     * store closes the late-call window: any log_write entering
+     * concurrently from another thread now sees NULL and skips the
+     * enqueue (and the writer is already gone, so the queue would
+     * never be drained anyway). */
+    atomic_store(&log_db, (cutils_db_t *)NULL);
+
     /* Free any remaining entries */
     log_entry_t *entry = log_queue_head;
     while (entry) {

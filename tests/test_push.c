@@ -388,6 +388,35 @@ static void test_push_shutdown_without_init(void **state)
     push_shutdown();
 }
 
+/* --- Post-shutdown call must be rejected, not silently enqueued --- */
+
+static void test_push_send_after_shutdown_rejected(void **state)
+{
+    (void)state;
+    push_fixture_t fix = make_fixture(1);
+
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+    push_shutdown();
+
+    /* Post-shutdown push_db is now NULL — sends must fail with
+     * CUTILS_ERR_INVALID instead of inserting into the queue with
+     * no live worker to drain. */
+    push_opts_t opts = {
+        .title = "post-shutdown",
+        .message = "should not enqueue",
+    };
+    assert_int_equal(push_send_opts(&opts), CUTILS_ERR_INVALID);
+
+    /* Verify no row was inserted. */
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(fix.db, "SELECT COUNT(*) FROM push",
+                                NULL, &r), CUTILS_OK);
+    assert_string_equal(r->rows[0][0], "0");
+    db_result_free(r);
+
+    free_fixture(&fix);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -404,6 +433,7 @@ int main(void)
         cmocka_unit_test_teardown(test_push_send_html_and_priority, teardown),
         cmocka_unit_test_teardown(test_push_send_defaults_zero, teardown),
         cmocka_unit_test_teardown(test_push_send_negative_priority, teardown),
+        cmocka_unit_test_teardown(test_push_send_after_shutdown_rejected, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
