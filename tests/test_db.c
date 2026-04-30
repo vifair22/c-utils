@@ -2,9 +2,11 @@
 #include <stddef.h>
 #include <setjmp.h>
 #include <cmocka.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cutils/db.h"
@@ -338,6 +340,74 @@ static void test_auto_db_tx_immediate_rolls_back_on_early_return(void **state)
 }
 
 
+/* --- Concurrency regression: tx scope must hold the mutex --- */
+
+typedef struct {
+    cutils_db_t *db;
+} race_arg_t;
+
+static void *race_tx_thread(void *p)
+{
+    race_arg_t *a = p;
+    {
+        CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+        assert_int_equal(cutils_db_tx_begin(a->db, &tx), CUTILS_OK);
+        const char *params[] = { "a", NULL };
+        assert_int_equal(
+            db_execute_non_query(a->db, "INSERT INTO race (v) VALUES (?)",
+                                 params, NULL), CUTILS_OK);
+        /* Hold the tx open long enough for the writer thread to attempt
+         * its INSERT. Without the lock-held-across-tx fix, that INSERT
+         * lands inside this tx and is rolled back along with row 'a'. */
+        struct timespec ts = { 0, 200 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+        /* Falls out of scope without commit — auto-cleanup rolls back. */
+    }
+    return NULL;
+}
+
+static void *race_writer_thread(void *p)
+{
+    race_arg_t *a = p;
+    const char *params[] = { "b", NULL };
+    assert_int_equal(
+        db_execute_non_query(a->db, "INSERT INTO race (v) VALUES (?)",
+                             params, NULL), CUTILS_OK);
+    return NULL;
+}
+
+static void test_tx_holds_mutex_against_concurrent_writer(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE race (v TEXT)"), CUTILS_OK);
+
+    race_arg_t arg = { .db = db };
+    pthread_t tA, tB;
+
+    pthread_create(&tA, NULL, race_tx_thread, &arg);
+
+    /* Let tA enter its tx scope before tB starts. */
+    struct timespec gap = { 0, 50 * 1000 * 1000 };
+    nanosleep(&gap, NULL);
+
+    pthread_create(&tB, NULL, race_writer_thread, &arg);
+
+    pthread_join(tA, NULL);
+    pthread_join(tB, NULL);
+
+    /* Only tB's row should survive — tA rolled back. */
+    db_result_t *r = NULL;
+    assert_int_equal(
+        db_execute(db, "SELECT v FROM race", NULL, &r), CUTILS_OK);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "b");
+    db_result_free(r);
+
+    db_close(db);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -355,6 +425,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_auto_db_tx_commit_is_idempotent, setup, teardown),
         cmocka_unit_test_setup_teardown(test_auto_db_tx_immediate_commit_persists, setup, teardown),
         cmocka_unit_test_setup_teardown(test_auto_db_tx_immediate_rolls_back_on_early_return, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tx_holds_mutex_against_concurrent_writer, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
