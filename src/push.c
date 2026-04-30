@@ -336,6 +336,13 @@ void push_shutdown(void)
 
     pthread_join(push_thread, NULL);
     curl_global_cleanup();
+
+    /* Clear handles AFTER the worker has been joined. Late push_send
+     * callers now see push_db == NULL and get CUTILS_ERR_INVALID
+     * ("push not initialized") instead of inserting rows into a queue
+     * with no live worker to drain them. */
+    atomic_store(&push_db, (cutils_db_t *)NULL);
+    atomic_store(&push_cfg, (const cutils_config_t *)NULL);
 }
 
 int push_send(const char *title, const char *message)
