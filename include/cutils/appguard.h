@@ -68,7 +68,10 @@ void appguard_shutdown(appguard_t *guard);
 
 /* Clean restart: graceful shutdown then exec's the process with original argv.
  * Call appguard_set_argv() early in main() to enable this.
- * Does not return on success. Returns -1 if argv was not set. */
+ * On success, does not return.
+ * On failure (argv not set, or execv failed), shuts down the guard and
+ * returns -1. The guard pointer is invalid after this call regardless of
+ * return value — callers should not dereference it again. */
 int appguard_restart(appguard_t *guard);
 
 /* Store argc/argv for restart. Call once from main() before appguard_init(). */

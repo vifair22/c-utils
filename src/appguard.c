@@ -232,6 +232,7 @@ int appguard_restart(appguard_t *guard)
 {
     if (!saved_argv || saved_argc < 1) {
         fprintf(stderr, "appguard_restart: argv not set (call appguard_set_argv first)\n");
+        appguard_shutdown(guard);
         return -1;
     }
 
