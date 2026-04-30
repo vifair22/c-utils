@@ -3,6 +3,7 @@
 #include <setjmp.h>
 #include <cmocka.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -582,6 +583,103 @@ static void test_init_default_log_level(void **state)
     appguard_shutdown(guard);
 }
 
+/* --- Systemd auto-detect --- */
+
+/* These tests mutate JOURNAL_STREAM. Save/restore to keep them hermetic. */
+static void with_journal_stream(const char *value, void (*fn)(void))
+{
+    char *saved = getenv("JOURNAL_STREAM");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    if (value) setenv("JOURNAL_STREAM", value, 1);
+    else       unsetenv("JOURNAL_STREAM");
+
+    fn();
+
+    if (saved_copy) {
+        setenv("JOURNAL_STREAM", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        unsetenv("JOURNAL_STREAM");
+    }
+}
+
+static void run_autodetect_off_no_env(void)
+{
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n");
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+        .log_systemd_autodetect = 0,
+    };
+    appguard_t *guard = appguard_init(&cfg);
+    assert_non_null(guard);
+    assert_int_equal(log_get_systemd_mode(), 0);
+    appguard_shutdown(guard);
+    log_set_systemd_mode(0);
+}
+
+static void test_systemd_autodetect_off(void **state)
+{
+    (void)state;
+    /* Even if JOURNAL_STREAM is set, opt-out means no mode change. */
+    with_journal_stream("8:12345", run_autodetect_off_no_env);
+}
+
+static void run_autodetect_on_with_env(void)
+{
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n");
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+        .log_systemd_autodetect = 1,
+    };
+    appguard_t *guard = appguard_init(&cfg);
+    assert_non_null(guard);
+    assert_int_equal(log_get_systemd_mode(), 1);
+    appguard_shutdown(guard);
+    log_set_systemd_mode(0);
+}
+
+static void test_systemd_autodetect_on_with_env(void **state)
+{
+    (void)state;
+    with_journal_stream("8:12345", run_autodetect_on_with_env);
+}
+
+static void run_autodetect_on_no_env(void)
+{
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n");
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+        .log_systemd_autodetect = 1,
+    };
+    appguard_t *guard = appguard_init(&cfg);
+    assert_non_null(guard);
+    /* Opt-in but no JOURNAL_STREAM → mode stays off. */
+    assert_int_equal(log_get_systemd_mode(), 0);
+    appguard_shutdown(guard);
+    log_set_systemd_mode(0);
+}
+
+static void test_systemd_autodetect_on_no_env(void **state)
+{
+    (void)state;
+    with_journal_stream(NULL, run_autodetect_on_no_env);
+}
+
 /* --- Retention days --- */
 
 static void test_retention_days(void **state)
@@ -631,6 +729,9 @@ int main(void)
         cmocka_unit_test_teardown(test_init_compiled_and_file_migrations, teardown),
         cmocka_unit_test_teardown(test_init_pushover_with_creds, teardown),
         cmocka_unit_test_teardown(test_init_default_log_level, teardown),
+        cmocka_unit_test_teardown(test_systemd_autodetect_off, teardown),
+        cmocka_unit_test_teardown(test_systemd_autodetect_on_with_env, teardown),
+        cmocka_unit_test_teardown(test_systemd_autodetect_on_no_env, teardown),
         cmocka_unit_test_teardown(test_retention_days, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

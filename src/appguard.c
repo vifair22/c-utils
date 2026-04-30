@@ -166,6 +166,13 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
     }
     guard->log_started = 1;
 
+    /* Systemd console mode: opted in by the app, gated on whether our
+     * stdio is actually wired to journald. JOURNAL_STREAM is set by
+     * systemd specifically for this detection (format: "device:inode"
+     * of the journal socket). */
+    if (cfg->log_systemd_autodetect && getenv("JOURNAL_STREAM") != NULL)
+        log_set_systemd_mode(1);
+
     log_info("c-utils initialized for %s", cfg->app_name);
 
     /* Step 8: Start push worker (if enabled) */
@@ -225,6 +232,7 @@ int appguard_restart(appguard_t *guard)
 {
     if (!saved_argv || saved_argc < 1) {
         fprintf(stderr, "appguard_restart: argv not set (call appguard_set_argv first)\n");
+        appguard_shutdown(guard);
         return -1;
     }
 

@@ -3,6 +3,7 @@
 #include <setjmp.h>
 #include <cmocka.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -263,6 +264,123 @@ static void test_streams_with_db(void **state)
     db_close(db);
 }
 
+/* --- Console output formatting (color suppression) --- */
+
+/* Capture stdout into a file while running fn(), then read the file back
+ * into buf. Used to assert what the console writer actually emits. */
+static void capture_console(const char *path, char *buf, size_t buflen,
+                            void (*fn)(void))
+{
+    fflush(stdout);
+    int saved = dup(STDOUT_FILENO);
+    {
+        FILE *f = fopen(path, "w");
+        assert_non_null(f);
+        dup2(fileno(f), STDOUT_FILENO);
+        fclose(f);
+    }
+
+    fn();
+    fflush(stdout);
+
+    dup2(saved, STDOUT_FILENO);
+    close(saved);
+
+    FILE *f = fopen(path, "r");
+    assert_non_null(f);
+    size_t n = fread(buf, 1, buflen - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+    unlink(path);
+}
+
+static void emit_one_info_line(void)
+{
+    assert_int_equal(log_init(NULL, LOG_INFO, 0), CUTILS_OK);
+    log_write(LOG_INFO, "test", "no escapes please");
+    log_shutdown();
+}
+
+static void test_no_escapes_when_not_tty(void **state)
+{
+    /* Test env pipes stdout to cmocka's harness, so isatty() is false.
+     * Even with NO_COLOR unset, the TTY check alone must suppress escapes. */
+    (void)state;
+    unsetenv("NO_COLOR");
+
+    char buf[4096];
+    capture_console("/tmp/cutils_test_log_notty.txt", buf, sizeof(buf),
+                    emit_one_info_line);
+
+    assert_null(strchr(buf, '\033'));
+    assert_non_null(strstr(buf, "no escapes please"));
+    assert_non_null(strstr(buf, "[test]"));
+}
+
+static void test_no_color_env_suppresses_escapes(void **state)
+{
+    (void)state;
+    setenv("NO_COLOR", "1", 1);
+
+    char buf[4096];
+    capture_console("/tmp/cutils_test_log_nocolor.txt", buf, sizeof(buf),
+                    emit_one_info_line);
+
+    unsetenv("NO_COLOR");
+
+    assert_null(strchr(buf, '\033'));
+    assert_non_null(strstr(buf, "no escapes please"));
+}
+
+/* --- Systemd mode --- */
+
+static void emit_all_four_levels(void)
+{
+    assert_int_equal(log_init(NULL, LOG_DEBUG, 0), CUTILS_OK);
+    log_write(LOG_DEBUG,   "fn", "d-msg");
+    log_write(LOG_INFO,    "fn", "i-msg");
+    log_write(LOG_WARNING, "fn", "w-msg");
+    log_write(LOG_ERROR,   "fn", "e-msg");
+    log_shutdown();
+}
+
+static void test_systemd_mode_format(void **state)
+{
+    /* Verify the systemd-mode formatter:
+     *   - <N> priority prefix per RFC 5424 (7/6/4/3 = debug/info/warning/error)
+     *   - no timestamp (no "20" digit prefix that the standard format produces)
+     *   - no ANSI escapes
+     *   - all four levels, including ERROR, appear in stdout (proving the
+     *     stream split was dropped — captured fd is stdout only) */
+    (void)state;
+    log_set_systemd_mode(1);
+
+    char buf[4096];
+    capture_console("/tmp/cutils_test_log_systemd.txt", buf, sizeof(buf),
+                    emit_all_four_levels);
+
+    log_set_systemd_mode(0);
+
+    assert_non_null(strstr(buf, "<7>[fn] d-msg"));
+    assert_non_null(strstr(buf, "<6>[fn] i-msg"));
+    assert_non_null(strstr(buf, "<4>[fn] w-msg"));
+    assert_non_null(strstr(buf, "<3>[fn] e-msg"));
+    assert_null(strchr(buf, '\033'));
+    assert_null(strstr(buf, "20")); /* no year-prefixed timestamp */
+}
+
+static void test_systemd_mode_setter(void **state)
+{
+    (void)state;
+    log_set_systemd_mode(0);
+    assert_int_equal(log_get_systemd_mode(), 0);
+    log_set_systemd_mode(1);
+    assert_int_equal(log_get_systemd_mode(), 1);
+    log_set_systemd_mode(42); /* nonzero is truthy */
+    assert_int_equal(log_get_systemd_mode(), 1);
+    log_set_systemd_mode(0);
+}
+
 /* --- DB with retention --- */
 
 static void test_log_retention(void **state)
@@ -311,6 +429,10 @@ int main(void)
         cmocka_unit_test_teardown(test_all_levels, teardown),
         cmocka_unit_test_teardown(test_all_levels_to_db, teardown),
         cmocka_unit_test_teardown(test_streams_with_db, teardown),
+        cmocka_unit_test_teardown(test_no_escapes_when_not_tty, teardown),
+        cmocka_unit_test_teardown(test_no_color_env_suppresses_escapes, teardown),
+        cmocka_unit_test_teardown(test_systemd_mode_format, teardown),
+        cmocka_unit_test_teardown(test_systemd_mode_setter, teardown),
         cmocka_unit_test_teardown(test_log_retention, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

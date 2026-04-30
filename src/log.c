@@ -47,6 +47,18 @@ static log_level_t      log_min_level    = LOG_INFO;
 static int              log_retention    = 0;
 static int              log_running      = 0;
 
+/* Output formatting flags — cached once at log_init.
+ * Color is emitted only when the chosen stream is a TTY AND NO_COLOR is unset.
+ * Sniffing once avoids per-call getenv/isatty overhead. */
+static int              stdout_is_tty    = 0;
+static int              stderr_is_tty    = 0;
+static int              no_color_env     = 0;
+
+/* Systemd-native output mode. See log_set_systemd_mode() for the full
+ * format. Cleared on log_init; AppGuard sets it after sniffing
+ * JOURNAL_STREAM. Tests may flip it directly. */
+static int              log_systemd_mode = 0;
+
 /* Writer thread */
 static pthread_t        log_thread;
 static pthread_mutex_t  log_mutex     = PTHREAD_MUTEX_INITIALIZER;
@@ -94,22 +106,47 @@ static const char *level_color(log_level_t level)
     return "";
 }
 
+/* RFC 5424 syslog priority for systemd's <N> prefix. journald parses
+ * and strips this; lets `journalctl -p err` filter precisely instead
+ * of relying on stream-default priority. */
+static int level_priority(log_level_t level)
+{
+    switch (level) {
+    case LOG_DEBUG:   return 7;
+    case LOG_INFO:    return 6;
+    case LOG_WARNING: return 4;
+    case LOG_ERROR:   return 3;
+    }
+    return 6;
+}
+
 /* --- Console output --- */
 
 static void print_to_console(const char *timestamp, log_level_t level,
                              const char *func, const char *message)
 {
+    if (log_systemd_mode) {
+        /* All to stdout, <N> priority prefix, no timestamp, no color. */
+        fprintf(stdout, "<%d>[%s] %s\n", level_priority(level), func, message);
+        return;
+    }
+
     FILE *out = (level >= LOG_ERROR) ? stderr : stdout;
-    const char *color = level_color(level);
-    int has_color = color[0] != '\0';
+    int is_tty = (out == stderr) ? stderr_is_tty : stdout_is_tty;
+    int use_color = is_tty && !no_color_env;
 
-    fprintf(out, COLOR_BLUE "%s" COLOR_RESET " " COLOR_BOLD "[%s]" COLOR_RESET " ",
-            timestamp, func);
-
-    if (has_color)
-        fprintf(out, "%s%s" COLOR_RESET "\n", color, message);
-    else
-        fprintf(out, "%s\n", message);
+    if (use_color) {
+        const char *color = level_color(level);
+        int has_msg_color = color[0] != '\0';
+        fprintf(out, COLOR_BLUE "%s" COLOR_RESET " " COLOR_BOLD "[%s]" COLOR_RESET " ",
+                timestamp, func);
+        if (has_msg_color)
+            fprintf(out, "%s%s" COLOR_RESET "\n", color, message);
+        else
+            fprintf(out, "%s\n", message);
+    } else {
+        fprintf(out, "%s [%s] %s\n", timestamp, func, message);
+    }
 }
 
 /* --- Stream fan-out --- */
@@ -258,6 +295,23 @@ int log_init(cutils_db_t *db, log_level_t level, int retention_days)
     log_stop = 0;
     log_running = 1;
 
+    /* Force line-buffered stdout. glibc switches to fully-buffered (4KB block)
+     * when stdout isn't a TTY, which under Docker/pipes causes INFO/DEBUG lines
+     * to sit in the buffer until it fills while stderr (always unbuffered)
+     * flushes immediately — interleaving errors ahead of context. No-op on a
+     * TTY (already line-buffered). */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    /* Cache TTY state and NO_COLOR for the console writer. Sniffing once
+     * here means a stream redirected after init still uses the init-time
+     * decision — a deliberate trade for not paying isatty/getenv per log. */
+    stdout_is_tty = isatty(STDOUT_FILENO);
+    stderr_is_tty = isatty(STDERR_FILENO);
+    {
+        const char *nc = getenv("NO_COLOR");
+        no_color_env = (nc != NULL && nc[0] != '\0');
+    }
+
     memset(log_streams, 0, sizeof(log_streams));
 
     if (db) {
@@ -304,6 +358,16 @@ void log_set_level(log_level_t level)
 log_level_t log_get_level(void)
 {
     return log_min_level;
+}
+
+void log_set_systemd_mode(int enabled)
+{
+    log_systemd_mode = enabled ? 1 : 0;
+}
+
+int log_get_systemd_mode(void)
+{
+    return log_systemd_mode;
 }
 
 int log_stream_register(log_stream_fn fn, void *userdata)
