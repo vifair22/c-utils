@@ -328,6 +328,19 @@ int log_init(cutils_db_t *db, log_level_t level, int retention_days)
     log_stop = 0;
     atomic_store(&log_running, 1);
 
+    /* Reset state that survives across init/shutdown cycles so a
+     * fresh init starts from a known baseline. log_systemd_mode in
+     * particular: the comment on its declaration says "cleared on
+     * log_init"; it now actually is. AppGuard sets it after init
+     * if log_systemd_autodetect was requested.
+     *
+     * Queue heads default to NULL after a clean shutdown — but a
+     * test that re-inits without shutdown (or a future caller path)
+     * would otherwise inherit dangling pointers. Defensively zero. */
+    atomic_store(&log_systemd_mode, 0);
+    log_queue_head = NULL;
+    log_queue_tail = NULL;
+
     /* Force line-buffered stdout. glibc switches to fully-buffered (4KB block)
      * when stdout isn't a TTY, which under Docker/pipes causes INFO/DEBUG lines
      * to sit in the buffer until it fills while stderr (always unbuffered)
