@@ -1,5 +1,9 @@
 # c-utils
 
+[![pipeline](https://git.airies.net/vifair22/c-utils/badges/master/pipeline.svg)](https://git.airies.net/vifair22/c-utils/-/commits/master)
+[![coverage](https://git.airies.net/vifair22/c-utils/badges/master/coverage.svg)](https://git.airies.net/vifair22/c-utils/-/commits/master)
+[![release](https://git.airies.net/vifair22/c-utils/-/badges/release.svg)](https://git.airies.net/vifair22/c-utils/-/releases)
+
 Shared C application framework. Static library providing config management, SQLite database access, structured logging, Pushover notifications, error loop detection, and lifecycle orchestration. Built for Linux, C11, with minimal dependencies.
 
 ## Subsystems
