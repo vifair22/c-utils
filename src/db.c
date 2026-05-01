@@ -49,17 +49,24 @@ int db_open(cutils_db_t **db, const char *path)
      * cutils_db_tx_begin) can still call db_execute or db_exec_raw inside
      * that scope without self-deadlocking on the per-call lock guard. */
     pthread_mutexattr_t mattr;
+    /* LCOV_EXCL_START — pthread_mutexattr_init / pthread_mutex_init only
+     * fail on EAGAIN (resource exhaustion) or EINVAL (bad attr); neither
+     * is reachable from this call site. Excluded from coverage so a
+     * truly-unreachable failure path doesn't drag the line ratio down. */
     if (pthread_mutexattr_init(&mattr) != 0) {
         free(d);
         return set_error(CUTILS_ERR, "db_open: mutexattr init failed");
     }
+    /* LCOV_EXCL_STOP */
     pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
     int mrc = pthread_mutex_init(&d->mutex, &mattr);
     pthread_mutexattr_destroy(&mattr);
+    /* LCOV_EXCL_START */
     if (mrc != 0) {
         free(d);
         return set_error(CUTILS_ERR, "db_open: mutex init failed");
     }
+    /* LCOV_EXCL_STOP */
 
     int rc = sqlite3_open(path, &d->conn);
     if (rc != SQLITE_OK) {

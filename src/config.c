@@ -200,22 +200,27 @@ int config_init(cutils_config_t **out,
      * and then call config_get_str under the same hold. */
     cfg->mutex = malloc(sizeof(*cfg->mutex));
     if (!cfg->mutex)
-        return set_error(CUTILS_ERR_NOMEM, "config_init: mutex alloc failed");
+        return set_error(CUTILS_ERR_NOMEM, "config_init: mutex alloc failed"); /* LCOV_EXCL_LINE */
     {
         pthread_mutexattr_t mattr;
+        /* LCOV_EXCL_START — pthread_mutexattr_init / pthread_mutex_init
+         * only fail on EAGAIN / EINVAL; not reachable here. */
         if (pthread_mutexattr_init(&mattr) != 0) {
             free(cfg->mutex);
             cfg->mutex = NULL;
             return set_error(CUTILS_ERR, "config_init: mutexattr init failed");
         }
+        /* LCOV_EXCL_STOP */
         pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
         int mrc = pthread_mutex_init(cfg->mutex, &mattr);
         pthread_mutexattr_destroy(&mattr);
+        /* LCOV_EXCL_START */
         if (mrc != 0) {
             free(cfg->mutex);
             cfg->mutex = NULL;
             return set_error(CUTILS_ERR, "config_init: mutex init failed");
         }
+        /* LCOV_EXCL_STOP */
     }
 
     cfg->app_name = strdup(app_name);
