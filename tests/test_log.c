@@ -337,6 +337,9 @@ static void test_no_color_env_suppresses_escapes(void **state)
 static void emit_all_four_levels(void)
 {
     assert_int_equal(log_init(NULL, LOG_DEBUG, 0), CUTILS_OK);
+    /* log_init resets systemd mode (see test_reinit_resets_systemd_mode),
+     * so the set must happen after init for the writer to see it. */
+    log_set_systemd_mode(1);
     log_write(LOG_DEBUG,   "fn", "d-msg");
     log_write(LOG_INFO,    "fn", "i-msg");
     log_write(LOG_WARNING, "fn", "w-msg");
@@ -353,8 +356,8 @@ static void test_systemd_mode_format(void **state)
      *   - all four levels, including ERROR, appear in stdout (proving the
      *     stream split was dropped — captured fd is stdout only) */
     (void)state;
-    log_set_systemd_mode(1);
-
+    /* Mode is set inside emit_all_four_levels after log_init, since
+     * log_init resets the flag. */
     char buf[4096];
     capture_console("/tmp/cutils_test_log_systemd.txt", buf, sizeof(buf),
                     emit_all_four_levels);
@@ -415,6 +418,82 @@ static void test_log_retention(void **state)
     db_close(db);
 }
 
+/* --- Stream callback re-entry: must not deadlock on the registry lock --- */
+
+static int reentry_cb_calls = 0;
+
+static void reentry_inner_cb(const char *timestamp, const char *level,
+                              const char *func, const char *message,
+                              void *userdata)
+{
+    (void)timestamp; (void)level; (void)func; (void)message; (void)userdata;
+    reentry_cb_calls++;
+}
+
+static void reentry_outer_cb(const char *timestamp, const char *level,
+                              const char *func, const char *message,
+                              void *userdata)
+{
+    (void)timestamp; (void)level; (void)func; (void)message; (void)userdata;
+    reentry_cb_calls++;
+    /* Re-enter log_* from inside a stream callback. Pre-fix, fire_streams
+     * held stream_mutex across the callback, so this log_warn would
+     * try to lock the same non-recursive mutex and deadlock. With the
+     * snapshot-then-fire-unlocked design, this completes normally. */
+    static int reentered = 0;
+    if (!reentered) {
+        reentered = 1;
+        log_warn("re-entry from stream callback");
+        reentered = 0;
+    }
+}
+
+static void test_stream_callback_reentry_no_deadlock(void **state)
+{
+    (void)state;
+    reentry_cb_calls = 0;
+
+    assert_int_equal(log_init(NULL, LOG_INFO, 0), CUTILS_OK);
+
+    int h_outer = log_stream_register(reentry_outer_cb, NULL);
+    int h_inner = log_stream_register(reentry_inner_cb, NULL);
+    assert_true(h_outer >= 0 && h_inner >= 0);
+
+    /* If the lock-during-callback bug were still present this hangs
+     * forever and CI eventually times out the runner. */
+    log_info("trigger fan-out");
+
+    /* Outer fires twice (once for "trigger fan-out", once for the
+     * nested "re-entry..."), inner fires twice on each fan-out, plus
+     * any extra. Just assert it ran more than once. */
+    assert_true(reentry_cb_calls >= 2);
+
+    log_stream_unregister(h_outer);
+    log_stream_unregister(h_inner);
+    log_shutdown();
+}
+
+/* --- init/shutdown/init cycle must reset module state --- */
+
+static void test_reinit_resets_systemd_mode(void **state)
+{
+    (void)state;
+
+    /* First cycle: enable systemd mode. */
+    assert_int_equal(log_init(NULL, LOG_INFO, 0), CUTILS_OK);
+    log_set_systemd_mode(1);
+    assert_int_equal(log_get_systemd_mode(), 1);
+    log_shutdown();
+
+    /* Pre-fix: log_systemd_mode survived the cycle and the second init
+     * inherited the prior 1. The comment on the declaration claimed
+     * the field was cleared on init, but the code didn't actually do
+     * it. Now it does. */
+    assert_int_equal(log_init(NULL, LOG_INFO, 0), CUTILS_OK);
+    assert_int_equal(log_get_systemd_mode(), 0);
+    log_shutdown();
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -434,6 +513,8 @@ int main(void)
         cmocka_unit_test_teardown(test_systemd_mode_format, teardown),
         cmocka_unit_test_teardown(test_systemd_mode_setter, teardown),
         cmocka_unit_test_teardown(test_log_retention, teardown),
+        cmocka_unit_test_teardown(test_stream_callback_reentry_no_deadlock, teardown),
+        cmocka_unit_test_teardown(test_reinit_resets_systemd_mode, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

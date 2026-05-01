@@ -3,6 +3,7 @@
 #include <setjmp.h>
 #include <cmocka.h>
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -825,6 +826,82 @@ static void test_init_env_config_path(void **state)
     config_free(cfg_arg);
 }
 
+/* --- Concurrency regression: shared cfg across threads --- */
+
+typedef struct {
+    cutils_config_t *cfg;
+    int              iterations;
+} concurrent_cfg_arg_t;
+
+static void *concurrent_db_reader(void *p)
+{
+    concurrent_cfg_arg_t *a = p;
+    for (int i = 0; i < a->iterations; i++) {
+        const char *v = config_get_str(a->cfg, "feature.flag");
+        /* Value may be the seeded default "off" or whatever the writer
+         * just set — both are non-NULL and short. The point is we're
+         * mutating the cache list and reading it concurrently; without
+         * the mutex this UAFs or returns torn list pointers. */
+        assert_non_null(v);
+        (void)v;
+    }
+    return NULL;
+}
+
+static void *concurrent_db_writer(void *p)
+{
+    concurrent_cfg_arg_t *a = p;
+    for (int i = 0; i < a->iterations; i++) {
+        const char *new_val = (i & 1) ? "on" : "off";
+        assert_int_equal(config_set_db(a->cfg, "feature.flag", new_val),
+                         CUTILS_OK);
+    }
+    return NULL;
+}
+
+static void test_concurrent_cfg_db_readers_writers(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG, "db:\n  path: " TEST_DB "\n");
+
+    cutils_config_t *cfg = NULL;
+    assert_int_equal(config_init(&cfg, "testapp", TEST_CFG,
+                                 CFG_FIRST_RUN_CONTINUE, NULL, NULL),
+                     CUTILS_OK);
+
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db,
+        "CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT, type TEXT, "
+        "default_value TEXT, description TEXT)"), CUTILS_OK);
+
+    const config_key_t db_keys[] = {
+        { "feature.flag", CFG_STRING, "off", "Toggle", CFG_STORE_DB, 0 },
+        { NULL, 0, NULL, NULL, 0, 0 }
+    };
+    assert_int_equal(config_attach_db(cfg, db, db_keys), CUTILS_OK);
+
+    enum { NREADERS = 4, NWRITERS = 2, ITERATIONS = 200 };
+    pthread_t readers[NREADERS], writers[NWRITERS];
+    concurrent_cfg_arg_t arg = { .cfg = cfg, .iterations = ITERATIONS };
+
+    for (int i = 0; i < NREADERS; i++)
+        pthread_create(&readers[i], NULL, concurrent_db_reader, &arg);
+    for (int i = 0; i < NWRITERS; i++)
+        pthread_create(&writers[i], NULL, concurrent_db_writer, &arg);
+
+    for (int i = 0; i < NREADERS; i++) pthread_join(readers[i], NULL);
+    for (int i = 0; i < NWRITERS; i++) pthread_join(writers[i], NULL);
+
+    /* Final value is one of the writer's values — both are valid. */
+    const char *final = config_get_str(cfg, "feature.flag");
+    assert_non_null(final);
+    assert_true(strcmp(final, "on") == 0 || strcmp(final, "off") == 0);
+
+    db_close(db);
+    config_free(cfg);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -857,6 +934,7 @@ int main(void)
         cmocka_unit_test_teardown(test_db_key_types, teardown),
         cmocka_unit_test_teardown(test_get_db_str_stable_across_reads, teardown),
         cmocka_unit_test_teardown(test_init_env_config_path, teardown_envpath),
+        cmocka_unit_test_teardown(test_concurrent_cfg_db_readers_writers, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

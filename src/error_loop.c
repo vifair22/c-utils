@@ -3,6 +3,7 @@
 #include "cutils/mem.h"
 
 #include <ctype.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,14 +11,15 @@
 #include <time.h>
 
 struct error_loop {
-    int            threshold;
-    int            cooldown_sec;
-    error_loop_fn  on_loop;
-    void          *userdata;
-    char          *last_identity;
-    char          *last_raw;
-    int            count;
-    time_t         suppressed_until;
+    int             threshold;
+    int             cooldown_sec;
+    error_loop_fn   on_loop;
+    void           *userdata;
+    char           *last_identity;
+    char           *last_raw;
+    int             count;
+    time_t          suppressed_until;
+    pthread_mutex_t mutex;       /* protects last_*, count, suppressed_until */
 };
 
 /* --- Normalization ---
@@ -125,6 +127,14 @@ error_loop_t *error_loop_create(int threshold, int cooldown_sec,
     error_loop_t *det = calloc(1, sizeof(*det));
     if (!det) return NULL;
 
+    /* LCOV_EXCL_START — pthread_mutex_init only fails on EAGAIN / EINVAL;
+     * not reachable at this call site (default attrs, ample resources). */
+    if (pthread_mutex_init(&det->mutex, NULL) != 0) {
+        free(det);
+        return NULL;
+    }
+    /* LCOV_EXCL_STOP */
+
     det->threshold = threshold > 0 ? threshold : 5;
     det->cooldown_sec = cooldown_sec;
     det->on_loop = on_loop ? on_loop : default_callback;
@@ -140,6 +150,7 @@ void error_loop_free(error_loop_t *det)
     if (!det) return;
     free(det->last_identity);
     free(det->last_raw);
+    pthread_mutex_destroy(&det->mutex);
     free(det);
 }
 
@@ -150,6 +161,15 @@ void error_loop_free_p(error_loop_t **det)
         *det = NULL;
     }
 }
+
+/* Action decided under the lock; the actual log/callback fires after we
+ * release the mutex so a callback that re-enters error_loop_* doesn't
+ * self-deadlock on the non-recursive mutex. */
+typedef enum {
+    ACT_NONE,
+    ACT_LOG_NORMAL,
+    ACT_FIRE_THRESHOLD,
+} report_action_t;
 
 void error_loop_report(error_loop_t *det, const char *fmt, ...)
 {
@@ -162,38 +182,54 @@ void error_loop_report(error_loop_t *det, const char *fmt, ...)
     CUTILS_AUTOFREE char *identity = make_identity(raw);
     if (!identity) return;
 
-    /* Same error as last time? */
-    if (det->last_identity && strcmp(identity, det->last_identity) == 0) {
-        det->count++;
-        free(det->last_raw);
-        det->last_raw = strdup(raw);
-    } else {
-        free(det->last_identity);
-        free(det->last_raw);
-        det->last_identity   = CUTILS_MOVE(identity);  /* transfer — cleanup no-op */
-        det->last_raw        = strdup(raw);
-        det->count           = 1;
-        det->suppressed_until = 0;
+    report_action_t action = ACT_NONE;
+    int snapshot_count     = 0;
+
+    {
+        CUTILS_LOCK_GUARD(&det->mutex);
+
+        /* Same error as last time? */
+        if (det->last_identity && strcmp(identity, det->last_identity) == 0) {
+            det->count++;
+            free(det->last_raw);
+            det->last_raw = strdup(raw);
+        } else {
+            free(det->last_identity);
+            free(det->last_raw);
+            det->last_identity   = CUTILS_MOVE(identity);  /* transfer — cleanup no-op */
+            det->last_raw        = strdup(raw);
+            det->count           = 1;
+            det->suppressed_until = 0;
+        }
+
+        /* Decide the action while we still hold consistent state. */
+        time_t now = time(NULL);
+        if (now >= det->suppressed_until) {
+            if (det->count < det->threshold) {
+                action = ACT_LOG_NORMAL;
+            } else if (det->count == det->threshold) {
+                action = ACT_FIRE_THRESHOLD;
+                if (det->cooldown_sec > 0)
+                    det->suppressed_until = now + det->cooldown_sec;
+            }
+            snapshot_count = det->count;
+        }
+        /* count > threshold and not in cooldown: re-fire at threshold intervals */
     }
 
-    /* In cooldown? */
-    time_t now = time(NULL);
-    if (now < det->suppressed_until)
-        return;
-
-    if (det->count < det->threshold) {
+    /* on_loop and userdata are immutable after error_loop_create, so reading
+     * them outside the lock is safe. The raw stack buffer is also local. */
+    if (action == ACT_LOG_NORMAL) {
         log_error("main loop: %s", raw);
-    } else if (det->count == det->threshold) {
-        log_error("main loop: repeating error (%dx): %s", det->count, raw);
-        det->on_loop(det->last_raw, det->count, det->userdata);
-        if (det->cooldown_sec > 0)
-            det->suppressed_until = now + det->cooldown_sec;
+    } else if (action == ACT_FIRE_THRESHOLD) {
+        log_error("main loop: repeating error (%dx): %s", snapshot_count, raw);
+        det->on_loop(raw, snapshot_count, det->userdata);
     }
-    /* count > threshold and not in cooldown: re-fire at threshold intervals */
 }
 
 void error_loop_success(error_loop_t *det)
 {
+    CUTILS_LOCK_GUARD(&det->mutex);
     free(det->last_identity);
     free(det->last_raw);
     det->last_identity = NULL;
