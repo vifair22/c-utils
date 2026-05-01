@@ -84,7 +84,21 @@ void config_free(cutils_config_t *cfg);
 
 /* Get a string value. Returns the value or default.
  * Checks env var override first, then file value, then compiled-in default.
- * Returns NULL only if the key doesn't exist. */
+ * Returns NULL only if the key doesn't exist.
+ *
+ * Thread-safety: the read API is safe to call concurrently from any
+ * thread. Internally it locks the config handle, so torn reads of the
+ * keys array, the YAML doc, and the DB cache are not possible. The
+ * returned `const char *` may point into the YAML doc or the DB
+ * cache; another thread calling config_set / config_set_db on the
+ * same key invalidates the previous return — copy the value before
+ * yielding the lock to user code if you need it to outlive a write.
+ *
+ * Env var precedence path: getenv() is called on every read. POSIX
+ * makes the getenv return pointer invalid on a concurrent setenv from
+ * any thread, so apps that read config concurrently MUST NOT call
+ * setenv / putenv after appguard_init returns. (Standard 12-factor
+ * usage — set env once at startup, never mutate — is fine.) */
 const char *config_get_str(const cutils_config_t *cfg, const char *key);
 
 /* Get an integer value. Returns default_val if key doesn't exist or isn't parseable. */
