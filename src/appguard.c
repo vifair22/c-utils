@@ -96,7 +96,13 @@ static void *signal_watcher(void *arg)
     if (guard->log_started)  log_shutdown();
     if (guard->db)           db_close(guard->db);
 
-    _exit(0);
+    /* exit(0) rather than _exit(0): we want any atexit handlers the
+     * consuming app registered to fire (resource cleanup, telemetry
+     * flush) on signal-driven shutdown — that's the same disposition
+     * the app gets on a normal main() return. As a side benefit, the
+     * libgcov atexit handler runs too, so coverage data is flushed
+     * from the watcher's path under fork-based tests. */
+    exit(0);
 }
 
 static int install_signal_watcher(appguard_t *guard)

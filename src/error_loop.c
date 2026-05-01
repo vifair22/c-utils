@@ -127,10 +127,13 @@ error_loop_t *error_loop_create(int threshold, int cooldown_sec,
     error_loop_t *det = calloc(1, sizeof(*det));
     if (!det) return NULL;
 
+    /* LCOV_EXCL_START — pthread_mutex_init only fails on EAGAIN / EINVAL;
+     * not reachable at this call site (default attrs, ample resources). */
     if (pthread_mutex_init(&det->mutex, NULL) != 0) {
         free(det);
         return NULL;
     }
+    /* LCOV_EXCL_STOP */
 
     det->threshold = threshold > 0 ? threshold : 5;
     det->cooldown_sec = cooldown_sec;
