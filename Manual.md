@@ -899,11 +899,25 @@ The Pushover API has a 1024-character message limit. Messages exceeding this lim
 
 ### Retry behavior
 
-The worker attempts delivery up to 3 times with exponential backoff (1s, 2s, 4s base delays). After 3 failures, the message is marked as permanently failed (`failed = 1` in the `push` table) and not retried.
+Transient send failures (network errors, 5xx responses) trigger backoff retry on the schedule **30s, 1m, 2m, 5m, 15m, 1h** (final entry capped — repeated failures keep retrying at 1h). Each row's attempt count and next-retry deadline are persisted in the `push` table (`attempts`, `next_retry_at`), so backoff state survives process restarts. The worker uses `pthread_cond_timedwait` to self-wake at the earliest pending deadline; this means retries continue across the full lifetime of every queued message regardless of caller traffic.
+
+Permanent failures (4xx responses — bad token, malformed request) mark the message `failed = 1` immediately and stop retrying.
+
+The give-up clock is the per-message TTL (default 24h, overridable via `push_opts_t.ttl`). When `now > timestamp + ttl`, the worker marks the row `failed = 1` without a send attempt — stale alerts are worse than not delivering them. For an outage that exceeds the TTL, the message is dropped at the worker's next drain pass.
+
+### Disabled contract
+
+`push_send` and `push_send_opts` are silent no-ops (return `CUTILS_OK`, no DB row inserted) when any of these are true:
+
+- AppGuard was configured with `enable_pushover = 0`.
+- `enable_pushover = 1` but `pushover.token` or `pushover.user` is empty.
+- `push_shutdown` has already run.
+
+App code can call `push_send()` unconditionally; the enable decision lives in AppGuard config, not at every call site.
 
 ### Worker lifecycle
 
-The worker thread polls for unsent messages. It uses a condition variable signaled by `push_send()` so it wakes immediately on new messages rather than polling on an interval. `push_shutdown()` signals the worker to drain pending messages and exit.
+The worker thread blocks on a condition variable. `push_send` signals it on enqueue. When rows are in retry-backoff, the worker waits on `pthread_cond_timedwait` until the earliest deadline. `push_shutdown()` signals the worker to drain currently-due messages and exit; rows still in backoff are not force-attempted on shutdown — they get picked up on the next process start (the durable-queue contract).
 
 ---
 
@@ -1229,18 +1243,22 @@ Stores queued Pushover notifications.
 
 ```sql
 CREATE TABLE push (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
-    token     TEXT NOT NULL,
-    user      TEXT NOT NULL,
-    ttl       TEXT NOT NULL,
-    message   TEXT NOT NULL,
-    title     TEXT NOT NULL,
-    failed    INTEGER NOT NULL DEFAULT 0
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp     TEXT NOT NULL,
+    token         TEXT NOT NULL,
+    user          TEXT NOT NULL,
+    ttl           TEXT NOT NULL,
+    message       TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    failed        INTEGER NOT NULL DEFAULT 0,
+    html          INTEGER NOT NULL DEFAULT 0,
+    priority      INTEGER NOT NULL DEFAULT 0,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER NOT NULL DEFAULT 0
 );
 ```
 
-The `failed` column marks permanently failed messages (3 delivery attempts exhausted). The worker queries for rows where `failed = 0` when looking for messages to deliver.
+`failed = 1` marks rows the worker has given up on — either a 4xx permanent failure or a TTL-expired message. `attempts` counts prior delivery attempts (driving the backoff schedule); `next_retry_at` is the unix epoch second at which the row becomes eligible for another attempt. The worker queries `WHERE failed = 0 AND next_retry_at <= now()` in rowid order; rows still in backoff are skipped automatically.
 
 ### system_migrations
 

@@ -154,8 +154,10 @@ test-asan: clean-test $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "=== $$t (asan) ==="; ./$$t || exit 1; done
 
 # Coverage. Cobertura XML feeds GitLab's MR diff-view per-file annotations;
-# --fail-under-line 80 enforces the project-wide coverage floor (current
-# baseline ~93%, leaves comfortable headroom).
+# --fail-under-line 90 is the absolute floor (current baseline ~93%, headroom
+# kept loose to absorb gcov run-to-run variance and flaky branch hits).
+# GitLab's Coverage-Check approval rule is the relative ratchet that catches
+# regressions across pipelines.
 coverage: CFLAGS = $(COV_CFLAGS)
 coverage: BUILD_TYPE = coverage
 coverage: TEST_LIBS += --coverage
@@ -165,7 +167,7 @@ coverage: clean-test $(TEST_BINS)
 	@gcovr --root . --object-directory $(TEST_DIR) --filter 'src/' \
 	    --print-summary \
 	    --cobertura $(TEST_DIR)/coverage/cobertura.xml \
-	    --fail-under-line 80
+	    --fail-under-line 90
 	@gcovr --root . --object-directory $(TEST_DIR) --filter 'src/' --branches --print-summary 2>/dev/null || true
 
 # Static analysis

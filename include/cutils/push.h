@@ -7,8 +7,15 @@
  *
  * DB-persisted notification queue with background worker thread.
  * Messages survive crashes — the worker picks up unsent messages on restart.
- * Retry with exponential backoff (3 attempts).
- * Messages > 1024 chars are split on newline boundaries. */
+ * Retry with backoff schedule 30s, 1m, 2m, 5m, 15m, 1h (then 1h capped),
+ * giving up only when the per-message TTL elapses (default 24h).
+ * Messages > 1024 chars are split on newline boundaries.
+ *
+ * Disabled contract: when AppGuard is configured with enable_pushover=0
+ * (or creds aren't configured, or push_shutdown has run), push_send and
+ * push_send_opts return CUTILS_OK and silently drop the message. App
+ * code calls push_send unconditionally; the disable decision lives in
+ * AppGuard config, not in every call site. */
 
 /* Forward declarations */
 typedef struct cutils_db cutils_db_t;
