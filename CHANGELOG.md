@@ -5,6 +5,83 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.0.2] - 2026-05-08
+
+Push subsystem durability and disable contract. Two related fixes.
+Public function signatures unchanged; one behavioral shift documented
+under **Changed**.
+
+### Fixed
+
+- **Push** — the inline retry in `send_one` (1s, 2s, 4s) capped a
+  transient outage at a 7-second total budget. Anything longer
+  than that — a router restart, an ISP blip, a brief cloud
+  incident — silently swallowed the message because the worker
+  would `break` after retries exhausted, then park on `cond_wait`
+  with no further retry path until a fresh `push_send` happened
+  to wake it. Retry now lives in the worker, persisted via two
+  new columns (`attempts`, `next_retry_at`) added by migration
+  `005_push_retry`. Backoff schedule: 30s, 1m, 2m, 5m, 15m, 1h
+  (final entry capped). The worker uses `pthread_cond_timedwait`
+  to self-wake at the earliest `next_retry_at`, so retries
+  continue across the full lifetime of every queued message
+  without depending on caller traffic. Per-message TTL (default
+  24h, overridable via `push_opts_t.ttl`) is the give-up clock —
+  rows whose `timestamp + ttl` has elapsed are marked `failed=1`
+  without a send attempt.
+- **Push** — `push_init` left `push_db` set on the
+  creds-missing branch, so `push_send` happily inserted rows
+  into a queue that nothing drained: a slow leak proportional
+  to send rate. `push_db`/`push_cfg` are now nulled on that
+  path, matching the `enable_pushover=0` shape and triggering
+  the disabled contract below.
+- **Push** — `sleep(N)` inside the inline retry blocked
+  `push_shutdown` for up to 4 seconds. The new
+  `cond_timedwait` design makes shutdown responsive even when
+  the next retry deadline is hours away — the shutdown signal
+  wakes the worker immediately.
+- **Push** — a single transient-failing row could park its
+  queued siblings behind it. The worker `break`d the inner
+  drain loop on every transient failure, so subsequent rows
+  waited for the next external wake-up. The drain now advances
+  past a row whose `next_retry_at` has been pushed forward and
+  processes anything else that's currently due.
+
+### Changed
+
+- **Push (disabled contract)** — `push_send` and
+  `push_send_opts` return `CUTILS_OK` and silently drop the
+  message when the subsystem is disabled (any of: AppGuard
+  configured with `enable_pushover=0`; Pushover credentials
+  not configured; `push_shutdown` already ran). Previously
+  `push_send_opts` returned `CUTILS_ERR_INVALID` for the
+  not-initialized and post-shutdown cases, forcing every app
+  call site to gate on whether push was active. Apps now
+  sprinkle `push_send(...)` calls without conditionals and the
+  enable decision lives in one place — the AppGuard config.
+  Note: this is a behavior change for callers that explicitly
+  checked the old error return; the function signatures are
+  unchanged.
+
+### Tests
+
+- TTL expiry: rows past `timestamp + ttl` get marked `failed=1`
+  on the worker's drain pass, no network call.
+- Shutdown responsiveness: with a row deferred 24h into the
+  future, `push_shutdown` returns in under 2s (in practice,
+  sub-millisecond — the cond signal wakes the timedwait).
+- Disabled-contract no-ops: pre-init, missing creds, and
+  post-shutdown all return `CUTILS_OK` and leave the push
+  table empty.
+- Pre-1.0.2 tests that asserted error returns from the
+  disabled paths (`test_push_send_not_initialized`,
+  `test_push_send_no_creds`, `test_push_send_after_shutdown_rejected`)
+  were updated/renamed to assert the new no-op contract.
+- `test_concurrent_push_send_multi_part_atomic` reworked to
+  use a creds fixture; the pre-fix test relied on no-creds
+  leaving `push_db` set so the worker never started, which
+  the disabled-contract change closed off.
+
 ## [1.0.1] - 2026-04-30
 
 Thread-safety pass. The 1.0.0 README advertises "safe to call from any
