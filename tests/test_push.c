@@ -106,35 +106,44 @@ static void test_push_init_no_creds(void **state)
     free_fixture(&fix);
 }
 
-static void test_push_send_not_initialized(void **state)
+static void test_push_send_no_op_when_uninitialized(void **state)
 {
     (void)state;
-    /* push_send_opts with NULL db should fail */
+    /* Disabled contract: when push_init was never called (e.g.
+     * AppGuard's enable_pushover=0), push_send_opts must return
+     * CUTILS_OK silently. App code calls push_send unconditionally
+     * without gating on a per-call enabled check. */
     push_opts_t opts = {
         .title = "test",
         .message = "test msg",
     };
-    assert_int_equal(push_send_opts(&opts), CUTILS_ERR_INVALID);
+    assert_int_equal(push_send_opts(&opts), CUTILS_OK);
 }
 
-static void test_push_send_no_creds(void **state)
+static void test_push_send_no_op_when_creds_missing(void **state)
 {
     (void)state;
     push_fixture_t fix = make_fixture(0);
 
+    /* push_init with no creds clears push_db so push_send_opts
+     * silently no-ops. Pre-1.0.2 left push_db set, which meant
+     * sends inserted rows that nothing drained — a slow queue
+     * leak. We verify both: rc is CUTILS_OK and the push table
+     * stays empty. */
     assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
 
-    /* Even with explicit opts, if no creds it should fail */
     push_opts_t opts = {
         .title = "test",
         .message = "msg",
     };
-    /* push is not running (no creds), so send_opts will hit the "not initialized" path
-     * since push_db is NULL after init without creds */
-    /* Actually push_db is still set, but push_running is 0 - send_opts checks push_db */
-    /* The send should fail because credentials aren't available */
-    int rc = push_send_opts(&opts);
-    assert_int_not_equal(rc, CUTILS_OK);
+    assert_int_equal(push_send_opts(&opts), CUTILS_OK);
+    assert_int_equal(push_send("title", "body"), CUTILS_OK);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(fix.db, "SELECT COUNT(*) FROM push",
+                                NULL, &r), CUTILS_OK);
+    assert_string_equal(r->rows[0][0], "0");
+    db_result_free(r);
 
     push_shutdown();
     free_fixture(&fix);
@@ -391,9 +400,9 @@ static void test_push_shutdown_without_init(void **state)
     push_shutdown();
 }
 
-/* --- Post-shutdown call must be rejected, not silently enqueued --- */
+/* --- Post-shutdown call must silently drop, not enqueue --- */
 
-static void test_push_send_after_shutdown_rejected(void **state)
+static void test_push_send_after_shutdown_no_op(void **state)
 {
     (void)state;
     push_fixture_t fix = make_fixture(1);
@@ -401,16 +410,17 @@ static void test_push_send_after_shutdown_rejected(void **state)
     assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
     push_shutdown();
 
-    /* Post-shutdown push_db is now NULL — sends must fail with
-     * CUTILS_ERR_INVALID instead of inserting into the queue with
-     * no live worker to drain. */
+    /* Post-shutdown push_db is NULL — disabled contract says
+     * push_send returns CUTILS_OK silently. The row must NOT be
+     * inserted (no live worker to drain it) but the caller doesn't
+     * need to know push has been torn down. */
     push_opts_t opts = {
         .title = "post-shutdown",
         .message = "should not enqueue",
     };
-    assert_int_equal(push_send_opts(&opts), CUTILS_ERR_INVALID);
+    assert_int_equal(push_send_opts(&opts), CUTILS_OK);
+    assert_int_equal(push_send("late", "drop"), CUTILS_OK);
 
-    /* Verify no row was inserted. */
     db_result_t *r = NULL;
     assert_int_equal(db_execute(fix.db, "SELECT COUNT(*) FROM push",
                                 NULL, &r), CUTILS_OK);
@@ -437,14 +447,16 @@ static void *chunk_sender(void *p)
 static void test_concurrent_push_send_multi_part_atomic(void **state)
 {
     (void)state;
-    /* No-creds fixture: push_init succeeds, but push_running stays 0
-     * so the worker thread never starts. We get push_db set without
-     * the worker draining rows behind us. */
-    push_fixture_t fix = make_fixture(0);
+    /* Creds fixture: bogus token/user so the worker's send attempts
+     * get 4xx (SEND_PERMANENT_FAIL) and rows are marked failed=1
+     * instead of deleted. We can then walk the queue post-drain and
+     * verify rowid ordering. Pre-1.0.2 this test ran with a no-creds
+     * fixture (push_db left set, worker never started) — that's no
+     * longer possible because no-creds now nulls push_db and
+     * push_send becomes a silent no-op. */
+    push_fixture_t fix = make_fixture(1);
     assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
 
-    /* Build two distinguishable >1024-char messages that split into 3+ chunks.
-     * 2500 'A's / 'B's with newlines as split points. */
     char msg_a[2500];
     char msg_b[2500];
     memset(msg_a, 'A', sizeof(msg_a) - 1);
@@ -473,9 +485,10 @@ static void test_concurrent_push_send_multi_part_atomic(void **state)
     pthread_join(tA, NULL);
     pthread_join(tB, NULL);
 
-    /* Walk the queue in rowid order. The first message we see (A or B)
-     * must have ALL its chunks before any chunk of the other — proving
-     * the per-send tx serialized the inserts. */
+    /* Drain via shutdown: the worker tries each row, gets 4xx from
+     * the bogus creds, marks failed=1. Rows persist in rowid order. */
+    push_shutdown();
+
     db_result_t *r = NULL;
     assert_int_equal(db_execute(fix.db,
         "SELECT title FROM push ORDER BY rowid", NULL, &r), CUTILS_OK);
@@ -489,18 +502,13 @@ static void test_concurrent_push_send_multi_part_atomic(void **state)
         if (c != first) {
             switched = 1;
         } else if (switched) {
-            /* Came back to the first sender's chunks after switching to
-             * the other — that's interleaving. Pre-fix this would
-             * trigger; post-fix it must not. */
             db_result_free(r);
-            push_shutdown();
             free_fixture(&fix);
             fail_msg("multi-part chunks interleaved across concurrent senders");
         }
     }
 
     db_result_free(r);
-    push_shutdown();
     free_fixture(&fix);
 }
 
@@ -562,13 +570,127 @@ static void test_push_init_drains_preexisting_rows(void **state)
     free_fixture(&fix);
 }
 
+/* --- TTL give-up: rows past timestamp+ttl get marked failed=1
+ *     without ever calling send_one. Tests the new
+ *     "stop retrying once the message has gone stale" behavior. --- */
+
+static _Atomic int ttl_expired_signal = 0;
+
+static void ttl_expired_log_cb(const char *ts, const char *level,
+                               const char *func, const char *msg, void *userdata)
+{
+    (void)ts; (void)level; (void)userdata;
+    if (func && strcmp(func, "push_worker_thread") == 0 &&
+        msg && strstr(msg, "push expired before delivery"))
+        atomic_store(&ttl_expired_signal, 1);
+}
+
+static void test_ttl_expired_row_marked_failed(void **state)
+{
+    (void)state;
+    push_fixture_t fix = make_fixture(1);
+    atomic_store(&ttl_expired_signal, 0);
+
+    /* Wildly-expired row: timestamp=1 (1970), ttl=1. Worker must
+     * mark it failed=1 from the TTL check, no network call. */
+    const char *params[] = {
+        "1", "tok", "usr", "1",
+        "stale body", "stale title",
+        "0", "0", "0", "0", "0", NULL
+    };
+    assert_int_equal(db_execute_non_query(fix.db,
+        "INSERT INTO push (timestamp, token, user, ttl, message, title, "
+        "failed, html, priority, attempts, next_retry_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params, NULL), CUTILS_OK);
+
+    int h = log_stream_register(ttl_expired_log_cb, NULL);
+    assert_true(h >= 0);
+
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+
+    int got = 0;
+    for (int i = 0; i < 50; i++) {
+        if (atomic_load(&ttl_expired_signal)) { got = 1; break; }
+        struct timespec ts = { 0, 100 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    assert_true(got);
+
+    /* Confirm the row is marked failed=1 in the DB. */
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(fix.db,
+        "SELECT failed FROM push WHERE title = 'stale title'",
+        NULL, &r), CUTILS_OK);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "1");
+    db_result_free(r);
+
+    log_stream_unregister(h);
+    push_shutdown();
+    free_fixture(&fix);
+}
+
+/* --- Shutdown stays responsive even when the worker is parked in
+ *     pthread_cond_timedwait for a far-future retry. The pre-1.0.2
+ *     send_one used sleep(4) which could block shutdown for seconds;
+ *     the new design uses cond_timedwait so push_shutdown's signal
+ *     wakes the worker immediately regardless of deadline. --- */
+
+static void test_shutdown_responsive_with_future_retry(void **state)
+{
+    (void)state;
+    push_fixture_t fix = make_fixture(1);
+
+    /* Row deferred 1 day into the future. Worker drains nothing on
+     * startup, then enters cond_timedwait with a 24h deadline. */
+    long long now = (long long)time(NULL);
+    char ts_str[32], retry_str[32];
+    snprintf(ts_str,    sizeof(ts_str),    "%lld", now);
+    snprintf(retry_str, sizeof(retry_str), "%lld", now + 86400);
+    const char *params[] = {
+        ts_str, "tok", "usr", "86400",
+        "deferred", "deferred title",
+        "0", "0", "0", "0", retry_str, NULL
+    };
+    assert_int_equal(db_execute_non_query(fix.db,
+        "INSERT INTO push (timestamp, token, user, ttl, message, title, "
+        "failed, html, priority, attempts, next_retry_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params, NULL), CUTILS_OK);
+
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+
+    /* Brief pause so the worker has time to enter cond_timedwait. */
+    struct timespec brief = { 0, 200 * 1000 * 1000 };
+    nanosleep(&brief, NULL);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    push_shutdown();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    long long elapsed_ms =
+        (long long)(t1.tv_sec - t0.tv_sec) * 1000 +
+        (long long)(t1.tv_nsec - t0.tv_nsec) / 1000000;
+
+    /* 2s ceiling is loose enough for slow CI but tight enough to
+     * catch a sleep(N) regression. Real shutdown is sub-millisecond
+     * here — the cond_signal wakes the worker, it sees push_stop=1
+     * and returns. */
+    assert_true(elapsed_ms < 2000);
+
+    free_fixture(&fix);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
-        cmocka_unit_test_teardown(test_push_send_not_initialized, teardown),
+        cmocka_unit_test_teardown(test_push_send_no_op_when_uninitialized, teardown),
         cmocka_unit_test_teardown(test_push_shutdown_without_init, teardown),
         cmocka_unit_test_teardown(test_push_init_no_creds, teardown),
-        cmocka_unit_test_teardown(test_push_send_no_creds, teardown),
+        cmocka_unit_test_teardown(test_push_send_no_op_when_creds_missing, teardown),
         cmocka_unit_test_teardown(test_push_send_enqueue, teardown),
         cmocka_unit_test_teardown(test_push_send_opts_override, teardown),
         cmocka_unit_test_teardown(test_push_send_long_message_split, teardown),
@@ -578,9 +700,11 @@ int main(void)
         cmocka_unit_test_teardown(test_push_send_html_and_priority, teardown),
         cmocka_unit_test_teardown(test_push_send_defaults_zero, teardown),
         cmocka_unit_test_teardown(test_push_send_negative_priority, teardown),
-        cmocka_unit_test_teardown(test_push_send_after_shutdown_rejected, teardown),
+        cmocka_unit_test_teardown(test_push_send_after_shutdown_no_op, teardown),
         cmocka_unit_test_teardown(test_concurrent_push_send_multi_part_atomic, teardown),
         cmocka_unit_test_teardown(test_push_init_drains_preexisting_rows, teardown),
+        cmocka_unit_test_teardown(test_ttl_expired_row_marked_failed, teardown),
+        cmocka_unit_test_teardown(test_shutdown_responsive_with_future_retry, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -72,6 +72,11 @@ static const db_migration_t lib_migrations[] = {
         "ALTER TABLE push ADD COLUMN html INTEGER NOT NULL DEFAULT 0;"
         "ALTER TABLE push ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;"
     },
+    {
+        "005_push_retry",
+        "ALTER TABLE push ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;"
+        "ALTER TABLE push ADD COLUMN next_retry_at INTEGER NOT NULL DEFAULT 0;"
+    },
     { NULL, NULL }
 };
 
