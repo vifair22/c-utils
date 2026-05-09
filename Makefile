@@ -158,6 +158,19 @@ test-asan: clean-test $(TEST_BINS)
 # kept loose to absorb gcov run-to-run variance and flaky branch hits).
 # GitLab's Coverage-Check approval rule is the relative ratchet that catches
 # regressions across pipelines.
+#
+# --gcov-ignore-parse-errors=negative_hits.warn_once_per_file works around
+# gcc bug 68080 (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=68080): gcc
+# non-deterministically emits "branch 0 taken -1 (fallthrough)" lines that
+# gcovr treats as fatal by default. Master pipeline 1404 hit this and
+# blocked release:auto-tag for v1.0.2; downgrading the parse error to a
+# one-shot warning keeps the gate honest without papering over real
+# coverage drops.
+#
+# --gcov-ignore-errors=no_working_dir_found is the companion: when the
+# parse error above fires, gcovr also can't infer the working directory
+# for that translation unit and bails. We tolerate that too rather than
+# fail the build on a transient gcov tool quirk.
 coverage: CFLAGS = $(COV_CFLAGS)
 coverage: BUILD_TYPE = coverage
 coverage: TEST_LIBS += --coverage
@@ -167,6 +180,8 @@ coverage: clean-test $(TEST_BINS)
 	@gcovr --root . --object-directory $(TEST_DIR) --filter 'src/' \
 	    --print-summary \
 	    --cobertura $(TEST_DIR)/coverage/cobertura.xml \
+	    --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+	    --gcov-ignore-errors=no_working_dir_found \
 	    --fail-under-line 90
 	@gcovr --root . --object-directory $(TEST_DIR) --filter 'src/' --branches --print-summary 2>/dev/null || true
 
