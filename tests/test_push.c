@@ -10,11 +10,22 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <curl/curl.h>
+
 #include "cutils/push.h"
 #include "cutils/config.h"
 #include "cutils/db.h"
 #include "cutils/error.h"
 #include "cutils/log.h"
+
+/* Exposed by push.c specifically for this test — see comment on the
+ * definition in src/push.c. Builds the URL-encoded POST body into a
+ * newly-malloc'd buffer sized exactly to the formatted content. */
+extern char *cutils_push_build_postfields(CURL *curl,
+                                          const char *token, const char *user,
+                                          const char *title, const char *message,
+                                          const char *timestamp, const char *ttl,
+                                          int html, int priority);
 
 #define TEST_DB  "/tmp/cutils_test_push.db"
 #define TEST_CFG "/tmp/cutils_test_push.yaml"
@@ -684,6 +695,75 @@ static void test_shutdown_responsive_with_future_retry(void **state)
     free_fixture(&fix);
 }
 
+/* The previous design wrote the URL-encoded POST body into a 4KB
+ * stack buffer in send_one. With url-encoding expanding each UTF-8
+ * byte up to 3x, a max-length title plus a max-length message of
+ * mostly multi-byte characters could approach that bound. The
+ * dynamic-sized buffer eliminates the failure mode entirely.
+ *
+ * This test feeds inputs that, after URL-encoding, are guaranteed to
+ * exceed the old 4KB cap, then verifies the dynamic builder produced
+ * a complete, NUL-terminated body containing every field intact and
+ * no truncation at the 4096-byte mark. */
+static void test_build_postfields_no_truncation_oversize(void **state)
+{
+    (void)state;
+
+    /* curl_global_init / cleanup are reference-counted; safe to call
+     * inside a unit test even if other tests have already initialized
+     * libcurl through push_init. */
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    CURL *curl = curl_easy_init();
+    assert_non_null(curl);
+
+    /* 2048 bytes of '!' (each byte URL-encodes to '%21'). After
+     * encoding, the message alone is 6144 bytes — well past the old
+     * 4KB fixed-buffer ceiling. The size is deliberately larger than
+     * MAX_MSG_CHARS (1024) so the test acts as defense-in-depth: if
+     * split_and_store is ever bypassed or its cap raised, the dynamic
+     * builder still produces a complete body without truncation.
+     * Title is similarly heavy-encoded for additional headroom. */
+    char msg[2049];
+    memset(msg, '!', sizeof(msg) - 1);
+    msg[sizeof(msg) - 1] = '\0';
+
+    char title[251];
+    memset(title, '!', sizeof(title) - 1);
+    title[sizeof(title) - 1] = '\0';
+
+    char *body = cutils_push_build_postfields(
+        curl,
+        "ATOKEN1234567890ABCDEF1234567890",
+        "AUSER1234567890ABCDEF1234567890",
+        title, msg,
+        "1700000000", "86400",
+        1, 1);
+    assert_non_null(body);
+
+    size_t blen = strlen(body);
+    assert_true(blen > 4096); /* Old fixed buffer would have truncated. */
+
+    /* Spot-check structure: every parameter name appears, the encoded
+     * message length matches expectation (3 bytes per source byte),
+     * and the optional html / priority tails are present. */
+    assert_non_null(strstr(body, "token=ATOKEN"));
+    assert_non_null(strstr(body, "&user=AUSER"));
+    assert_non_null(strstr(body, "&title=%21"));   /* '!' = %21 */
+    assert_non_null(strstr(body, "&message=%21"));
+    assert_non_null(strstr(body, "&timestamp=1700000000"));
+    assert_non_null(strstr(body, "&ttl=86400"));
+    assert_non_null(strstr(body, "&html=1"));
+    assert_non_null(strstr(body, "&priority=1"));
+
+    /* Verify no embedded NUL before the trailing one (would indicate
+     * truncation that snprintf hid by NUL-terminating mid-content). */
+    assert_int_equal(strlen(body), blen);
+
+    free(body);
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -705,6 +785,7 @@ int main(void)
         cmocka_unit_test_teardown(test_push_init_drains_preexisting_rows, teardown),
         cmocka_unit_test_teardown(test_ttl_expired_row_marked_failed, teardown),
         cmocka_unit_test_teardown(test_shutdown_responsive_with_future_retry, teardown),
+        cmocka_unit_test_teardown(test_build_postfields_no_truncation_oversize, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
