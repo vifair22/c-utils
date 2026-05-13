@@ -56,6 +56,16 @@ struct cutils_config {
 
     /* Merged key registry (internal + app) */
     config_key_t   *keys;
+    /* Parallel to `keys`: captured env-var value at the time the key was
+     * registered, or NULL if the env var was unset. Snapshotting at
+     * registration eliminates per-read getenv() (one syscall removed
+     * from the read path) and closes the POSIX hazard where a
+     * concurrent setenv on any thread invalidates the previous getenv
+     * return pointer. The documented contract is "no setenv after
+     * appguard_init returns"; with this snapshot we no longer rely on
+     * that assumption holding — env changes simply aren't observed,
+     * which matches the documented behavior. */
+    char          **env_values;
     int             nkeys;
     int             keys_capacity;
 
@@ -127,6 +137,28 @@ static char *make_env_name(const char *prefix, const char *dotkey)
     return name;
 }
 
+/* Snapshot the env-var value for keys[idx] into env_values[idx].
+ * Returns CUTILS_OK on success (including "no env var set" — stored as NULL)
+ * and CUTILS_ERR_NOMEM if a strdup or the env-name buffer alloc fails. */
+static int capture_env_for_key(cutils_config_t *cfg, int idx)
+{
+    cfg->env_values[idx] = NULL;
+    if (!cfg->env_prefix) return CUTILS_OK;
+
+    CUTILS_AUTOFREE char *envname = make_env_name(cfg->env_prefix,
+                                                  cfg->keys[idx].key);
+    if (!envname)
+        return set_error(CUTILS_ERR_NOMEM, "config env name alloc");
+
+    const char *v = getenv(envname);
+    if (!v) return CUTILS_OK;
+
+    cfg->env_values[idx] = strdup(v);
+    if (!cfg->env_values[idx])
+        return set_error(CUTILS_ERR_NOMEM, "config env value alloc");
+    return CUTILS_OK;
+}
+
 static int add_key(cutils_config_t *cfg, const config_key_t *key)
 {
     /* Check for collision */
@@ -142,10 +174,19 @@ static int add_key(cutils_config_t *cfg, const config_key_t *key)
                                     (size_t)newcap * sizeof(config_key_t));
         if (!tmp) return set_error(CUTILS_ERR_NOMEM, "config key alloc");
         cfg->keys = tmp;
+
+        char **etmp = realloc(cfg->env_values,
+                              (size_t)newcap * sizeof(char *));
+        if (!etmp) return set_error(CUTILS_ERR_NOMEM, "config env_values alloc");
+        cfg->env_values = etmp;
+
         cfg->keys_capacity = newcap;
     }
 
-    cfg->keys[cfg->nkeys++] = *key;
+    cfg->keys[cfg->nkeys] = *key;
+    int rc = capture_env_for_key(cfg, cfg->nkeys);
+    if (rc != CUTILS_OK) return rc;
+    cfg->nkeys++;
     return CUTILS_OK;
 }
 
@@ -350,6 +391,11 @@ void config_free(cutils_config_t *cfg)
     free(cfg->env_prefix);
     free(cfg->config_path);
     free(cfg->keys);
+    if (cfg->env_values) {
+        for (int i = 0; i < cfg->nkeys; i++)
+            free(cfg->env_values[i]);
+        free(cfg->env_values);
+    }
     free(cfg->sections);
     yaml_free(cfg->doc);
 
@@ -495,21 +541,30 @@ const char *config_get_str(const cutils_config_t *cfg, const char *key)
 {
     /* Cast away const on the mutex pointer. Locking is non-mutating from
      * the caller's perspective (a "logically const" config). The lock
-     * protects the YAML doc walk, the keys-array walk in
-     * config_get_key_def, and the DB cache mutation inside
-     * config_get_from_db. cfg->mutex is recursive so config_get_int /
-     * config_get_bool can hold it across this call. */
+     * protects the YAML doc walk, the keys-array walk, and the DB
+     * cache mutation inside config_get_from_db. cfg->mutex is recursive
+     * so config_get_int / config_get_bool can hold it across this
+     * call. */
     CUTILS_LOCK_GUARD(cfg->mutex);
 
-    /* 1. Check env var override */
-    CUTILS_AUTOFREE char *envname = make_env_name(cfg->env_prefix, key);
-    if (envname) {
-        const char *envval = getenv(envname);
-        if (envval) return envval;
+    /* Find the key's index — used for both the env-cache lookup and as
+     * the key definition. Linear scan is fine at typical key counts
+     * (tens of entries); if this ever becomes hot, a sorted index is
+     * the obvious next step. */
+    int idx = -1;
+    for (int i = 0; i < cfg->nkeys; i++) {
+        if (strcmp(cfg->keys[i].key, key) == 0) { idx = i; break; }
     }
 
-    /* Determine store for this key */
-    const config_key_t *def = config_get_key_def(cfg, key);
+    /* 1. Env var override (captured at registration; see
+     * capture_env_for_key). Environment changes after appguard_init are
+     * intentionally not observed — this matches the documented
+     * "12-factor: set env once at startup" usage and removes a per-read
+     * getenv() syscall plus its POSIX setenv hazard. */
+    if (idx >= 0 && cfg->env_values[idx])
+        return cfg->env_values[idx];
+
+    const config_key_t *def = idx >= 0 ? &cfg->keys[idx] : NULL;
 
     /* 2. Check the appropriate store */
     if (def && def->store == CFG_STORE_DB) {

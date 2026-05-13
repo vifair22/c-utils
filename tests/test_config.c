@@ -274,6 +274,23 @@ static void test_get_str_default(void **state)
     config_free(cfg);
 }
 
+/* Teardown that also clears env vars used by env-aware tests. Without
+ * this, a failed assertion leaks the env var into subsequent tests
+ * whose config_init then captures it — cascading failures that
+ * obscure the real one. */
+static int teardown_env(void **state)
+{
+    (void)state;
+    unsetenv("TESTAPP_DB_PATH");
+    unsetenv("MY_COOL_APP_DB_PATH");
+    unsetenv("TESTAPP_CONFIG_PATH");
+    unlink(TEST_CFG);
+    unlink(TEST_DB);
+    unlink(TEST_DB "-wal");
+    unlink(TEST_DB "-shm");
+    return 0;
+}
+
 static void test_get_env_override(void **state)
 {
     (void)state;
@@ -281,16 +298,48 @@ static void test_get_env_override(void **state)
         "db:\n"
         "  path: file_value.db\n");
 
+    /* Set env BEFORE config_init — values are snapshotted at
+     * registration time, not on every read. */
+    setenv("TESTAPP_DB_PATH", "env_value.db", 1);
+
     cutils_config_t *cfg = NULL;
     assert_int_equal(config_init(&cfg, "testapp", TEST_CFG,
                                  CFG_FIRST_RUN_CONTINUE, NULL, NULL), CUTILS_OK);
 
-    /* Set env var: TESTAPP_DB_PATH */
-    setenv("TESTAPP_DB_PATH", "env_value.db", 1);
+    /* Env-captured value wins over file value. */
     assert_string_equal(config_get_str(cfg, "db.path"), "env_value.db");
-    unsetenv("TESTAPP_DB_PATH");
 
-    /* Without env, should use file value */
+    /* Changing the env after init has no effect — the snapshot is
+     * frozen for the config's lifetime. */
+    setenv("TESTAPP_DB_PATH", "different_value.db", 1);
+    assert_string_equal(config_get_str(cfg, "db.path"), "env_value.db");
+
+    /* Unsetting after init likewise has no effect. */
+    unsetenv("TESTAPP_DB_PATH");
+    assert_string_equal(config_get_str(cfg, "db.path"), "env_value.db");
+
+    config_free(cfg);
+}
+
+/* Verifies the captured-at-init contract from the opposite direction:
+ * a config initialized with no env set never picks up a later setenv,
+ * even though the env var name matches and was set well before any
+ * read. This is the property that closes the POSIX setenv-vs-getenv
+ * race documented in config.h. */
+static void test_env_not_observed_after_init(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: file_value.db\n");
+
+    /* No env at init time. */
+    cutils_config_t *cfg = NULL;
+    assert_int_equal(config_init(&cfg, "testapp", TEST_CFG,
+                                 CFG_FIRST_RUN_CONTINUE, NULL, NULL), CUTILS_OK);
+
+    /* Now set the env — must not be observed. */
+    setenv("TESTAPP_DB_PATH", "late_value.db", 1);
     assert_string_equal(config_get_str(cfg, "db.path"), "file_value.db");
 
     config_free(cfg);
@@ -647,17 +696,19 @@ static void test_env_prefix_special_chars(void **state)
     (void)state;
     write_file(TEST_CFG, "db:\n  path: test.db\n");
 
+    /* Env var should be MY_COOL_APP_DB_PATH — set before init so the
+     * captured-at-registration snapshot picks it up. */
+    setenv("MY_COOL_APP_DB_PATH", "env.db", 1);
+
     cutils_config_t *cfg = NULL;
     /* App name with hyphens and dots */
     assert_int_equal(config_init(&cfg, "my-cool.app", TEST_CFG,
                                  CFG_FIRST_RUN_CONTINUE, NULL, NULL), CUTILS_OK);
 
-    /* Env var should be MY_COOL_APP_DB_PATH */
-    setenv("MY_COOL_APP_DB_PATH", "env.db", 1);
     assert_string_equal(config_get_str(cfg, "db.path"), "env.db");
-    unsetenv("MY_COOL_APP_DB_PATH");
 
     config_free(cfg);
+    unsetenv("MY_COOL_APP_DB_PATH");
 }
 
 /* --- Duplicate section handling --- */
@@ -914,7 +965,8 @@ int main(void)
         cmocka_unit_test_teardown(test_get_int, teardown),
         cmocka_unit_test_teardown(test_get_bool, teardown),
         cmocka_unit_test_teardown(test_get_str_default, teardown),
-        cmocka_unit_test_teardown(test_get_env_override, teardown),
+        cmocka_unit_test_teardown(test_get_env_override, teardown_env),
+        cmocka_unit_test_teardown(test_env_not_observed_after_init, teardown_env),
         cmocka_unit_test_teardown(test_set_file_key, teardown),
         cmocka_unit_test_teardown(test_set_internal_key_fails, teardown),
         cmocka_unit_test_teardown(test_set_unknown_key_fails, teardown),
@@ -929,7 +981,7 @@ int main(void)
         cmocka_unit_test_teardown(test_get_int_unknown_key, teardown),
         cmocka_unit_test_teardown(test_error_errno_long_message, teardown),
         cmocka_unit_test_teardown(test_free_null, teardown),
-        cmocka_unit_test_teardown(test_env_prefix_special_chars, teardown),
+        cmocka_unit_test_teardown(test_env_prefix_special_chars, teardown_env),
         cmocka_unit_test_teardown(test_duplicate_section, teardown),
         cmocka_unit_test_teardown(test_db_key_types, teardown),
         cmocka_unit_test_teardown(test_get_db_str_stable_across_reads, teardown),
