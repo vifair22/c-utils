@@ -15,7 +15,17 @@
  * Read precedence: ENV_VAR > store value > compiled-in default.
  *
  * The YAML format is controlled by c-utils: simple section/key/value,
- * no flow syntax, no anchors. Comments are preserved on mutation. */
+ * no flow syntax, no anchors. Comments are preserved on mutation.
+ *
+ * YAML line-length limit: individual lines in the YAML file MUST be
+ * ≤1024 bytes including the trailing newline. The parser reads lines
+ * into fixed-size stack buffers; longer lines truncate silently and
+ * may produce a partial parse. This is sufficient for any realistic
+ * key/value pair (a 1024-byte value would be longer than most URLs
+ * or shell-style command strings), but is documented so callers
+ * working with abnormally large values know to set them via the DB
+ * store rather than the YAML store. Section names and key names are
+ * additionally bounded to 128 bytes each. */
 
 /* Value types */
 typedef enum {
