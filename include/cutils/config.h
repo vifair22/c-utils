@@ -89,16 +89,20 @@ void config_free(cutils_config_t *cfg);
  * Thread-safety: the read API is safe to call concurrently from any
  * thread. Internally it locks the config handle, so torn reads of the
  * keys array, the YAML doc, and the DB cache are not possible. The
- * returned `const char *` may point into the YAML doc or the DB
- * cache; another thread calling config_set / config_set_db on the
- * same key invalidates the previous return — copy the value before
- * yielding the lock to user code if you need it to outlive a write.
+ * returned `const char *` may point into the YAML doc, the DB cache,
+ * or the env-var snapshot; another thread calling config_set /
+ * config_set_db on the same key invalidates the previous return —
+ * copy the value before yielding the lock to user code if you need it
+ * to outlive a write.
  *
- * Env var precedence path: getenv() is called on every read. POSIX
- * makes the getenv return pointer invalid on a concurrent setenv from
- * any thread, so apps that read config concurrently MUST NOT call
- * setenv / putenv after appguard_init returns. (Standard 12-factor
- * usage — set env once at startup, never mutate — is fine.) */
+ * Env var precedence: env-var values are snapshotted once when each
+ * key is registered (during config_init for file keys, during
+ * config_attach_db for DB keys). Changes to the environment after
+ * registration are NOT observed by subsequent reads — set env vars
+ * before appguard_init / config_init runs. This matches standard
+ * 12-factor usage (set once at startup, never mutate) and eliminates
+ * the per-read getenv() syscall plus its POSIX setenv-races-getenv
+ * hazard. */
 const char *config_get_str(const cutils_config_t *cfg, const char *key);
 
 /* Get an integer value. Returns default_val if key doesn't exist or isn't parseable. */
