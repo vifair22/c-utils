@@ -69,3 +69,38 @@ void bench_db_execute_1000_rows(bench_ctx_t *ctx)
     unlink(BENCH_DB_PATH "-wal");
     unlink(BENCH_DB_PATH "-shm");
 }
+
+/* Same fixture, same row count, same column shape — but consumed via
+ * the streaming iterator. Head-to-head comparison against
+ * bench_db_execute_1000_rows isolates the per-cell strdup cost in the
+ * materializing path: iteration hands out sqlite's internal column
+ * pointers directly, no strdup, no heap row array. Expectation is a
+ * substantial speedup and O(1) heap regardless of row count. */
+void bench_db_iter_1000_rows(bench_ctx_t *ctx)
+{
+    cutils_db_t *db = NULL;
+    setup_db(&db);
+
+    BENCH_LOOP(ctx) {
+        cutils_db_iter_t *it = NULL;
+        int rc = db_iter_begin(db, "SELECT a, b, c FROM t", NULL, &it);
+        if (rc != 0 || !it) {
+            fputs("bench_db: iter_begin failed\n", stderr); exit(1);
+        }
+        const char **row;
+        size_t seen = 0;
+        while (db_iter_next(it, &row)) {
+            BENCH_USE(row[0]);
+            BENCH_USE(row[1]);
+            BENCH_USE(row[2]);
+            seen++;
+        }
+        BENCH_USE(seen);
+        db_iter_end(it);
+    }
+
+    db_close(db);
+    unlink(BENCH_DB_PATH);
+    unlink(BENCH_DB_PATH "-wal");
+    unlink(BENCH_DB_PATH "-shm");
+}

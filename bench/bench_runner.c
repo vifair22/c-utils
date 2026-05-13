@@ -35,6 +35,7 @@ struct bench_entry {
 static const struct bench_entry bench_table[] = {
     { "config_get_str",          bench_config_get_str        },
     { "db_execute_1000_rows",    bench_db_execute_1000_rows  },
+    { "db_iter_1000_rows",       bench_db_iter_1000_rows     },
     { "log_write_db_off",        bench_log_write_db_off      },
     { "log_write_db_on",         bench_log_write_db_on       },
     { "json_parse_walk",         bench_json_parse_walk       },
