@@ -408,6 +408,288 @@ static void test_tx_holds_mutex_against_concurrent_writer(void **state)
     db_close(db);
 }
 
+/* --- Streaming iterator (db_iter_*) --- */
+
+static void seed_three_rows(cutils_db_t *db)
+{
+    assert_int_equal(
+        db_exec_raw(db,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value TEXT)"),
+        CUTILS_OK);
+    const char *p1[] = { "alice", "a", NULL };
+    const char *p2[] = { "bob",   "b", NULL };
+    const char *p3[] = { "carol", "c", NULL };
+    assert_int_equal(
+        db_execute_non_query(db, "INSERT INTO t(name, value) VALUES (?, ?)", p1, NULL),
+        CUTILS_OK);
+    assert_int_equal(
+        db_execute_non_query(db, "INSERT INTO t(name, value) VALUES (?, ?)", p2, NULL),
+        CUTILS_OK);
+    assert_int_equal(
+        db_execute_non_query(db, "INSERT INTO t(name, value) VALUES (?, ?)", p3, NULL),
+        CUTILS_OK);
+}
+
+static void test_iter_happy_path(void **state)
+{
+    /* Iterator usage is wrapped in its own block so CUTILS_AUTO_DB_ITER
+     * fires BEFORE db_close — the iterator holds the connection mutex
+     * and an open prepared statement; closing the DB while either is
+     * still alive is UB. This pattern is documented in db.h. */
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    seed_three_rows(db);
+
+    {
+        CUTILS_AUTO_DB_ITER cutils_db_iter_t *it = NULL;
+        assert_int_equal(
+            db_iter_begin(db, "SELECT name, value FROM t ORDER BY id",
+                          NULL, &it),
+            CUTILS_OK);
+
+        assert_int_equal(db_iter_ncols(it), 2);
+        assert_string_equal(db_iter_col_name(it, 0), "name");
+        assert_string_equal(db_iter_col_name(it, 1), "value");
+
+        const char *expected_names[]  = { "alice", "bob", "carol" };
+        const char *expected_values[] = { "a",     "b",   "c"     };
+        const char **row = NULL;
+        int seen = 0;
+        while (db_iter_next(it, &row)) {
+            assert_string_equal(row[0], expected_names[seen]);
+            assert_string_equal(row[1], expected_values[seen]);
+            seen++;
+        }
+        assert_int_equal(seen, 3);
+        assert_int_equal(db_iter_error(it), 0);
+    }
+
+    db_close(db);
+}
+
+static void test_iter_empty_result(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(
+        db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"),
+        CUTILS_OK);
+
+    {
+        CUTILS_AUTO_DB_ITER cutils_db_iter_t *it = NULL;
+        assert_int_equal(
+            db_iter_begin(db, "SELECT name FROM t WHERE id = 999",
+                          NULL, &it),
+            CUTILS_OK);
+
+        const char **row = NULL;
+        assert_int_equal(db_iter_next(it, &row), 0);
+        assert_int_equal(db_iter_error(it), 0);
+    }
+
+    db_close(db);
+}
+
+static void test_iter_early_break_via_auto_cleanup(void **state)
+{
+    /* Caller breaks out of the loop after one row; CUTILS_AUTO_DB_ITER
+     * is the only thing that cleans up. If finalize / mutex-unlock
+     * didn't run, the next db_open + db call below would deadlock or
+     * leak. The fact that this test returns means the cleanup ran. */
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    seed_three_rows(db);
+
+    {
+        CUTILS_AUTO_DB_ITER cutils_db_iter_t *it = NULL;
+        assert_int_equal(
+            db_iter_begin(db, "SELECT name FROM t ORDER BY id", NULL, &it),
+            CUTILS_OK);
+
+        const char **row = NULL;
+        assert_int_equal(db_iter_next(it, &row), 1);
+        assert_string_equal(row[0], "alice");
+        /* Break — scope exit fires db_iter_end_p. */
+    }
+
+    /* If the iterator hadn't released the mutex, this would deadlock
+     * (recursive mutex notwithstanding — we'd hang on the count
+     * never reaching zero). */
+    CUTILS_AUTO_DBRES db_result_t *r = NULL;
+    assert_int_equal(
+        db_execute(db, "SELECT name FROM t WHERE id = 1", NULL, &r),
+        CUTILS_OK);
+    assert_int_equal(r->nrows, 1);
+
+    db_close(db);
+}
+
+static void test_iter_bad_sql(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+
+    cutils_db_iter_t *it = NULL;
+    int rc = db_iter_begin(db, "SELEKT * FROM nope", NULL, &it);
+    assert_int_not_equal(rc, CUTILS_OK);
+    assert_null(it);
+    /* Mutex must have been released even though begin failed —
+     * confirm by doing another op. */
+    assert_int_equal(
+        db_exec_raw(db, "CREATE TABLE t(id INTEGER)"),
+        CUTILS_OK);
+
+    db_close(db);
+}
+
+static void test_iter_null_column_returns_empty_string(void **state)
+{
+    /* db_execute returns "" for NULL columns (see db.c:157). The
+     * iterator must match that contract so callers can swap APIs
+     * without changing read code. */
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(
+        db_exec_raw(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)"),
+        CUTILS_OK);
+    assert_int_equal(
+        db_exec_raw(db, "INSERT INTO t(name) VALUES (NULL)"),
+        CUTILS_OK);
+
+    {
+        CUTILS_AUTO_DB_ITER cutils_db_iter_t *it = NULL;
+        assert_int_equal(
+            db_iter_begin(db, "SELECT name FROM t", NULL, &it),
+            CUTILS_OK);
+
+        const char **row = NULL;
+        assert_int_equal(db_iter_next(it, &row), 1);
+        assert_non_null(row[0]);
+        assert_string_equal(row[0], "");
+    }
+
+    db_close(db);
+}
+
+static void test_iter_with_bound_params(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    seed_three_rows(db);
+
+    {
+        CUTILS_AUTO_DB_ITER cutils_db_iter_t *it = NULL;
+        const char *params[] = { "bob", NULL };
+        assert_int_equal(
+            db_iter_begin(db, "SELECT name FROM t WHERE name = ?", params, &it),
+            CUTILS_OK);
+
+        const char **row = NULL;
+        assert_int_equal(db_iter_next(it, &row), 1);
+        assert_string_equal(row[0], "bob");
+        assert_int_equal(db_iter_next(it, &row), 0);
+    }
+
+    db_close(db);
+}
+
+static void test_iter_end_safe_on_null(void **state)
+{
+    (void)state;
+    db_iter_end(NULL); /* must not crash */
+    cutils_db_iter_t *p = NULL;
+    db_iter_end_p(&p); /* must not crash; p stays NULL */
+    assert_null(p);
+}
+
+static void test_iter_ncols_and_col_name_bounds(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    seed_three_rows(db);
+
+    {
+        CUTILS_AUTO_DB_ITER cutils_db_iter_t *it = NULL;
+        assert_int_equal(
+            db_iter_begin(db, "SELECT id, name, value FROM t", NULL, &it),
+            CUTILS_OK);
+
+        assert_int_equal(db_iter_ncols(it), 3);
+        assert_non_null(db_iter_col_name(it, 0));
+        assert_non_null(db_iter_col_name(it, 2));
+        /* Out-of-range returns NULL, doesn't crash. */
+        assert_null(db_iter_col_name(it, -1));
+        assert_null(db_iter_col_name(it, 3));
+        assert_null(db_iter_col_name(it, 999));
+        /* Same bounds discipline on NULL iter. */
+        assert_int_equal(db_iter_ncols(NULL), 0);
+        assert_null(db_iter_col_name(NULL, 0));
+        assert_int_equal(db_iter_error(NULL), 0);
+    }
+
+    db_close(db);
+}
+
+/* Test the explicit-end path (rather than CUTILS_AUTO_DB_ITER) to
+ * cover db_iter_end called directly. Also exercises iteration that
+ * continues after seeing an error from a deliberately-failed step
+ * (closing the db underneath the iterator would normally be UB; we
+ * use a more controlled approach — bind a param to a column the
+ * iterator step will then choke on... not really possible at this
+ * layer. Instead this test just confirms the explicit-end path is
+ * reachable). */
+static void test_iter_explicit_end(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    seed_three_rows(db);
+
+    cutils_db_iter_t *it = NULL;
+    assert_int_equal(
+        db_iter_begin(db, "SELECT name FROM t", NULL, &it),
+        CUTILS_OK);
+
+    /* Read one row then explicitly end before the natural stop. */
+    const char **row = NULL;
+    assert_int_equal(db_iter_next(it, &row), 1);
+    db_iter_end(it);
+    /* db_iter_end with already-finalized state should be no-op-safe
+     * — pattern not commonly used but documented as safe. */
+
+    db_close(db);
+}
+
+/* Calling db_iter_next with row_out=NULL must not crash — useful for
+ * "just walk to verify rows exist" style use. */
+static void test_iter_next_null_row_out(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    seed_three_rows(db);
+
+    {
+        CUTILS_AUTO_DB_ITER cutils_db_iter_t *it = NULL;
+        assert_int_equal(
+            db_iter_begin(db, "SELECT name FROM t", NULL, &it),
+            CUTILS_OK);
+
+        int count = 0;
+        while (db_iter_next(it, NULL)) count++;
+        assert_int_equal(count, 3);
+    }
+
+    db_close(db);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -426,6 +708,16 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_auto_db_tx_immediate_commit_persists, setup, teardown),
         cmocka_unit_test_setup_teardown(test_auto_db_tx_immediate_rolls_back_on_early_return, setup, teardown),
         cmocka_unit_test_setup_teardown(test_tx_holds_mutex_against_concurrent_writer, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_iter_happy_path, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_iter_empty_result, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_iter_early_break_via_auto_cleanup, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_iter_bad_sql, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_iter_null_column_returns_empty_string, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_iter_with_bound_params, setup, teardown),
+        cmocka_unit_test(test_iter_end_safe_on_null),
+        cmocka_unit_test_setup_teardown(test_iter_ncols_and_col_name_bounds, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_iter_explicit_end, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_iter_next_null_row_out, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

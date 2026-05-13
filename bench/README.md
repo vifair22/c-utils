@@ -37,6 +37,7 @@ Each run produces:
 |---|---|---|---|
 | `config_get_str` | `config_get_str` worst-case | 300-key registry, look up the last key | Linear scan over the key array |
 | `db_execute_1000_rows` | `db_execute` materialization | 1000 pre-loaded rows, 3 string columns each | sqlite step loop + 3000 per-cell `strdup`s + result-struct build |
+| `db_iter_1000_rows` | `db_iter_*` streaming | Same fixture as `db_execute_1000_rows` | Iterator hands out sqlite's internal column pointers — no per-cell strdup, no row array; head-to-head against the materializing path |
 | `log_write_db_off` | `log_write` filter short-circuit | `log_init(db=NULL, level=LOG_ERROR)`, then call `log_info` | The atomic-load + level-compare early return — the dominant cost of below-threshold log calls in a daemon |
 | `log_write_db_on` | `log_write` full producer path | `log_init(db=open, level=LOG_INFO)`, then call `log_info` | `vsnprintf` + console format + async enqueue (DB writer drains concurrently, not measured here) |
 | `json_parse_walk` | `json_req_parse` + getters | ~250-byte JSON, then read 6 fields by dot-path | cJSON parse + the request handle's dot-path traversal |
@@ -62,12 +63,22 @@ same ballpark or better.
 
 | Benchmark | Median (ns) | Min (ns) | Max (ns) |
 |---|---:|---:|---:|
-| `config_get_str` | 1814 | 1809 | 1820 |
-| `db_execute_1000_rows` | 192080 | 189425 | 196937 |
+| `config_get_str` | 1889 | 1866 | 1959 |
+| `db_execute_1000_rows` | 192659 | 189916 | 193937 |
+| `db_iter_1000_rows` | 138187 | 138130 | 140923 |
 | `log_write_db_off` | 2.3 | 2.3 | 2.3 |
-| `log_write_db_on` | 9730 | 9591 | 9843 |
-| `json_parse_walk` | 740 | 734 | 749 |
-| `push_build_postfields` | 1156 | 1099 | 1139 |
+| `log_write_db_on` | 9733 | 9677 | 9833 |
+| `json_parse_walk` | 759 | 757 | 775 |
+| `push_build_postfields` | 1115 | 1114 | 1139 |
+
+The `db_iter_*` row is the most informative head-to-head: same fixture
+and column shape as `db_execute_1000_rows`, but consumed via the
+streaming iterator. The iterator runs **~28% faster** for this size
+(138 µs vs 192 µs) AND uses O(1) heap regardless of row count, where
+`db_execute` is O(n) — every cell is `strdup`'d into an owned result
+struct. The new API is the right choice for SELECTs over unknown or
+large row counts; `db_execute` remains the right call for known-small
+result sets you want to pass around as an indexable array.
 
 Quick reading: `log_write_db_off` at 2.3 ns is the atomic-load
 short-circuit doing its job — that's effectively a no-op call and

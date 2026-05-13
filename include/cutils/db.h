@@ -130,6 +130,103 @@ void cutils_db_tx_end_p(cutils_db_tx_t *tx);
 
 #define CUTILS_AUTO_DB_TX __attribute__((cleanup(cutils_db_tx_end_p)))
 
+/* --- Streaming query iterator ---
+ *
+ * Same param-binding contract as db_execute, but delivers rows
+ * one-at-a-time without materializing the full result set. Use this
+ * for SELECTs with unknown or large row counts; use db_execute when
+ * the result is known small and you want an indexable array you can
+ * pass around.
+ *
+ *   CUTILS_AUTO_DB_ITER cutils_db_iter_t *it = NULL;
+ *   const char *params[] = { "active", NULL };
+ *   if (db_iter_begin(db, "SELECT id, name FROM users WHERE status = ?",
+ *                     params, &it) != CUTILS_OK)
+ *       return -1;
+ *
+ *   const char **row;
+ *   while (db_iter_next(it, &row)) {
+ *       / * row[0] = "id" column, row[1] = "name" column.
+ *        * Strings are valid until the next db_iter_next call. * /
+ *       handle(row[0], row[1]);
+ *   }
+ *   if (db_iter_error(it))
+ *       return -1;  / * sqlite error, message in cutils_get_error() * /
+ *
+ * Memory: O(1) heap regardless of row count. db_execute is O(n) —
+ * every row's cells are strdup'd. The iterator hands out pointers
+ * into sqlite's internal column buffers, which sqlite recycles on
+ * each step.
+ *
+ * Locking: the iterator holds the connection mutex for its entire
+ * lifetime. No other db_* call on the same connection can proceed
+ * while an iterator is open. Keep iterator scopes short — never
+ * span network I/O, condition waits, or other potentially-blocking
+ * work inside the loop body.
+ *
+ * Lifetime-ordering rule: the iterator must end BEFORE db_close on
+ * the same connection. Either let CUTILS_AUTO_DB_ITER fire in a
+ * nested block:
+ *
+ *     {
+ *         CUTILS_AUTO_DB_ITER cutils_db_iter_t *it = NULL;
+ *         db_iter_begin(db, ...);
+ *         // use
+ *     }  // iter end fires here
+ *     db_close(db);
+ *
+ * Or call db_iter_end(it) explicitly before db_close. Closing the
+ * db while an iterator is open is UB — the iterator still holds
+ * the mutex and a prepared statement against the now-freed
+ * connection. */
+
+typedef struct cutils_db_iter cutils_db_iter_t;
+
+/* Begin iteration. params is a NULL-terminated array of bind values
+ * (same shape as db_execute), or NULL for no params. On success
+ * *iter receives a heap-allocated iterator that must be released
+ * with db_iter_end (or via CUTILS_AUTO_DB_ITER). On error *iter is
+ * NULL and the message is in cutils_get_error(). */
+CUTILS_MUST_USE
+int  db_iter_begin(cutils_db_t *db, const char *sql,
+                   const char **params, cutils_db_iter_t **iter);
+
+/* Step to the next row. Returns 1 (true) if *row_out now points at
+ * a fresh row, 0 at natural end-of-rows OR on sqlite step error
+ * (callers who care can disambiguate via db_iter_error). NULL
+ * columns are returned as the empty string "" to match
+ * db_execute's contract. The row_out array is the same pointer for
+ * every call within one iterator; only the contents change. */
+int  db_iter_next (cutils_db_iter_t *iter, const char ***row_out);
+
+/* Number of columns in the result set. Constant across iteration. */
+int  db_iter_ncols(const cutils_db_iter_t *iter);
+
+/* Column name at idx, or NULL if idx is out of range. Pointer valid
+ * for the iterator's lifetime. */
+const char *db_iter_col_name(const cutils_db_iter_t *iter, int idx);
+
+/* Nonzero if db_iter_next previously returned 0 due to a sqlite
+ * step error rather than natural end-of-rows. The error message
+ * was stashed in the thread-local error buffer at the time. */
+int  db_iter_error(const cutils_db_iter_t *iter);
+
+/* Finalize the statement, release the connection mutex, free the
+ * iterator. Safe to call with NULL. */
+void db_iter_end(cutils_db_iter_t *iter);
+
+/* Pointer-cleanup helper. Use via CUTILS_AUTO_DB_ITER. */
+void db_iter_end_p(cutils_db_iter_t **iter);
+
+/* Scoped cleanup attribute. Place on the local variable holding the
+ * iterator pointer; db_iter_end runs on any scope exit:
+ *
+ *   CUTILS_AUTO_DB_ITER cutils_db_iter_t *it = NULL;
+ *   if (db_iter_begin(...) != CUTILS_OK) return -1;
+ *   / * iterator released automatically on any return below * /
+ */
+#define CUTILS_AUTO_DB_ITER __attribute__((cleanup(db_iter_end_p)))
+
 /* Savepoint management (used by migration runner) */
 CUTILS_MUST_USE int db_savepoint         (cutils_db_t *db, const char *name);
 CUTILS_MUST_USE int db_savepoint_release (cutils_db_t *db, const char *name);

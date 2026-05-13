@@ -41,6 +41,7 @@ size_t bench_iters(bench_ctx_t *ctx);
 /* Benchmark prototypes. */
 void bench_config_get_str       (bench_ctx_t *ctx);
 void bench_db_execute_1000_rows (bench_ctx_t *ctx);
+void bench_db_iter_1000_rows    (bench_ctx_t *ctx);
 void bench_log_write_db_off     (bench_ctx_t *ctx);
 void bench_log_write_db_on      (bench_ctx_t *ctx);
 void bench_json_parse_walk      (bench_ctx_t *ctx);
