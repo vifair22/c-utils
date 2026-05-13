@@ -29,6 +29,20 @@ all additions are appended.
   lifetime-ordering rule (iterator must end before `db_close` on
   the same connection — let `CUTILS_AUTO_DB_ITER` fire in a nested
   block, or call `db_iter_end` explicitly).
+- **`db_open_with_mode`** — additive sibling to `db_open` that takes
+  a `mode_t` and unconditionally `chmod`s the database file to the
+  requested mode. Idempotent: the file has the requested mode after
+  the call returns, regardless of whether it was created during the
+  open or already existed. Intended for daemons whose DB holds
+  sensitive data (credentials, audit logs) and that don't want to
+  rely on the calling process's umask. WAL/SHM sidecar files are
+  not chmod'd by this call — set `umask(0077)` before opening if
+  strict perms on those matter.
+- **Config file permission warning** — `config_init` now stats the
+  parsed config file and emits a stderr warning if it's group- or
+  world-readable. c-utils config files commonly hold credentials,
+  so a permissive mode is worth flagging at startup. The warning
+  is non-fatal — the consuming app decides whether to act on it.
 - **Microbenchmark harness** — new `bench/` directory and
   `make bench` target. Auto-calibrating, release-built, dedicated
   build tree, CSV output at `build-bench/results.csv` for before/
@@ -99,7 +113,8 @@ optimized-with-numbers or documented as already-optimal-per-bench).
 - New types and functions added to `<cutils/db.h>`:
   `cutils_db_iter_t`, `db_iter_begin`, `db_iter_next`,
   `db_iter_ncols`, `db_iter_col_name`, `db_iter_error`,
-  `db_iter_end`, `db_iter_end_p`, `CUTILS_AUTO_DB_ITER`.
+  `db_iter_end`, `db_iter_end_p`, `CUTILS_AUTO_DB_ITER`,
+  `db_open_with_mode`.
 - `db_result_t` layout unchanged.
 
 ## [1.0.3] - 2026-05-13

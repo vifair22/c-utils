@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -667,6 +668,55 @@ static void test_iter_explicit_end(void **state)
     db_close(db);
 }
 
+/* db_open_with_mode chmods the file unconditionally, so after the
+ * call the file has exactly the requested mode regardless of whether
+ * it was just created (subject to umask) or already existed. The two
+ * tests below cover both shapes. */
+
+static mode_t file_mode(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return st.st_mode & 0777;
+}
+
+static void test_db_open_with_mode_new_file(void **state)
+{
+    (void)state;
+    /* Make sure no leftover file exists from a prior run. */
+    unlink(TEST_DB);
+
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open_with_mode(&db, TEST_DB, 0600), CUTILS_OK);
+    assert_non_null(db);
+    /* The DB file should now exist with mode 0600 regardless of the
+     * test runner's umask. */
+    assert_int_equal((int)file_mode(TEST_DB), 0600);
+
+    db_close(db);
+}
+
+static void test_db_open_with_mode_existing_file(void **state)
+{
+    /* Pre-create the file with permissive mode, then open with
+     * restrictive mode. The post-open file mode should reflect the
+     * caller's request, not the pre-existing perms. */
+    (void)state;
+    unlink(TEST_DB);
+
+    cutils_db_t *db1 = NULL;
+    assert_int_equal(db_open(&db1, TEST_DB), CUTILS_OK);
+    db_close(db1);
+    /* Force loose perms to simulate an old too-permissive DB file. */
+    assert_int_equal(chmod(TEST_DB, 0644), 0);
+    assert_int_equal((int)file_mode(TEST_DB), 0644);
+
+    cutils_db_t *db2 = NULL;
+    assert_int_equal(db_open_with_mode(&db2, TEST_DB, 0600), CUTILS_OK);
+    assert_int_equal((int)file_mode(TEST_DB), 0600);
+    db_close(db2);
+}
+
 /* Calling db_iter_next with row_out=NULL must not crash — useful for
  * "just walk to verify rows exist" style use. */
 static void test_iter_next_null_row_out(void **state)
@@ -718,6 +768,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_iter_ncols_and_col_name_bounds, setup, teardown),
         cmocka_unit_test_setup_teardown(test_iter_explicit_end, setup, teardown),
         cmocka_unit_test_setup_teardown(test_iter_next_null_row_out, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_db_open_with_mode_new_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_db_open_with_mode_existing_file, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
