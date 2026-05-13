@@ -29,9 +29,6 @@ all additions are appended.
   lifetime-ordering rule (iterator must end before `db_close` on
   the same connection — let `CUTILS_AUTO_DB_ITER` fire in a nested
   block, or call `db_iter_end` explicitly).
-- **`db_result_t::strpool`** — a new field appended at the end of
-  `db_result_t`. Reserved for future use; the 1.1.0 implementation
-  leaves it NULL.
 - **Microbenchmark harness** — new `bench/` directory and
   `make bench` target. Auto-calibrating, release-built, dedicated
   build tree, CSV output at `build-bench/results.csv` for before/
@@ -103,9 +100,7 @@ optimized-with-numbers or documented as already-optimal-per-bench).
   `cutils_db_iter_t`, `db_iter_begin`, `db_iter_next`,
   `db_iter_ncols`, `db_iter_col_name`, `db_iter_error`,
   `db_iter_end`, `db_iter_end_p`, `CUTILS_AUTO_DB_ITER`.
-- `db_result_t` gains a `strpool` field appended at the end.
-  Existing accesses to `rows`, `nrows`, `ncols`, `col_names` are
-  layout-stable.
+- `db_result_t` layout unchanged.
 
 ## [1.0.3] - 2026-05-13
 
