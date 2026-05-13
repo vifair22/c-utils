@@ -198,9 +198,17 @@ include/
 src/                    implementation
 lib/cJSON/              vendored JSON library
 tests/                  cmocka unit tests
+bench/                  microbenchmark harness (1.1.0+)
+examples/
+  minimal/              buildable end-to-end consumer (1.1.0+)
 tools/
   embed_sql.sh          SQL-to-C migration embedder
 ```
+
+A complete, runnable example consumer lives at `examples/minimal/`.
+After building c-utils, `cd examples/minimal && make && ./minimal`
+to see config generation, migrations, the streaming iterator, and
+graceful shutdown end-to-end.
 
 ## License
 
