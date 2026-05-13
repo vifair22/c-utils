@@ -3,3 +3,5 @@ build-test/
 build-bench/
 .cache
 todo.md
+compile_commands.json
+libc-utils.pc
