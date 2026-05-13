@@ -68,34 +68,57 @@ static int needs_quoting(const char *value)
     return 0;
 }
 
-static void doc_add_entry(yaml_doc_t *doc, const char *section,
-                          const char *key, const char *value)
+/* Returns 0 on success, -1 on NOMEM (either the realloc or any of the
+ * three strdups). The previous design silently swallowed alloc
+ * failures, leaving the doc with a missing entry that surfaced later
+ * as a confusing "key not found" instead of the real OOM. NOMEM
+ * branches are LCOV_EXCL'd — alloc failure on a few-hundred-byte
+ * realloc / small strdup is not exercisable from test code without
+ * fault injection. */
+static int doc_add_entry(yaml_doc_t *doc, const char *section,
+                         const char *key, const char *value)
 {
     if (doc->nentries >= doc->capacity) {
         int newcap = doc->capacity ? doc->capacity * 2 : 16;
         yaml_entry_t *tmp = realloc(doc->entries,
                                     (size_t)newcap * sizeof(yaml_entry_t));
-        if (!tmp) return;
+        if (!tmp) return -1;  /* LCOV_EXCL_LINE */
         doc->entries = tmp;
         doc->capacity = newcap;
     }
 
+    char *s = strdup(section);
+    char *k = strdup(key);
+    char *v = strdup(value);
+    /* LCOV_EXCL_START */
+    if (!s || !k || !v) {
+        free(s); free(k); free(v);
+        return -1;
+    }
+    /* LCOV_EXCL_STOP */
+
     yaml_entry_t *e = &doc->entries[doc->nentries++];
-    e->section = strdup(section);
-    e->key = strdup(key);
-    e->value = strdup(value);
+    e->section = s;
+    e->key = k;
+    e->value = v;
+    return 0;
 }
 
-static void doc_add_line(yaml_doc_t *doc, const char *line)
+/* Returns 0 on success, -1 on NOMEM. Same propagation rationale as
+ * doc_add_entry above; same LCOV_EXCL for the alloc-failure branches. */
+static int doc_add_line(yaml_doc_t *doc, const char *line)
 {
     if (doc->nlines >= doc->lines_capacity) {
         int newcap = doc->lines_capacity ? doc->lines_capacity * 2 : 64;
         char **tmp = realloc(doc->lines, (size_t)newcap * sizeof(char *));
-        if (!tmp) return;
+        if (!tmp) return -1;  /* LCOV_EXCL_LINE */
         doc->lines = tmp;
         doc->lines_capacity = newcap;
     }
-    doc->lines[doc->nlines++] = strdup(line);
+    char *l = strdup(line);
+    if (!l) return -1;  /* LCOV_EXCL_LINE */
+    doc->lines[doc->nlines++] = l;
+    return 0;
 }
 
 /* --- Entry lookup ---
@@ -169,7 +192,13 @@ yaml_doc_t *yaml_parse_file(const char *path)
         strncpy(raw, line, sizeof(raw) - 1);
         raw[sizeof(raw) - 1] = '\0';
         strip_trailing_whitespace(raw);
-        doc_add_line(doc, raw);
+        /* LCOV_EXCL_START — NOMEM propagation; not exercisable from
+         * test code without fault injection. */
+        if (doc_add_line(doc, raw) != 0) {
+            yaml_free(doc);
+            return NULL;
+        }
+        /* LCOV_EXCL_STOP */
 
         /* Skip blank lines and comments */
         const char *trimmed = skip_whitespace(line);
@@ -212,7 +241,12 @@ yaml_doc_t *yaml_parse_file(const char *path)
                 strip_trailing_whitespace(key);
                 strip_comment_and_unquote(val);
                 strip_trailing_whitespace(val);
-                doc_add_entry(doc, current_section, key, val);
+                /* LCOV_EXCL_START — NOMEM propagation. */
+                if (doc_add_entry(doc, current_section, key, val) != 0) {
+                    yaml_free(doc);
+                    return NULL;
+                }
+                /* LCOV_EXCL_STOP */
             }
         }
     }
