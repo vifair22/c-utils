@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* --- Helpers --- */
 
@@ -442,5 +443,12 @@ int yaml_generate_template(const char *path,
         }
     }
 
+    /* Default-safe permissions: generated templates often hold blank
+     * credential slots (pushover.token, etc.) that the user will fill
+     * in. Make the file 0600 from the start so it doesn't sit at the
+     * umask default (often 0644 = world-readable) between template
+     * generation and the user's first chmod. Caller may chmod after
+     * the fact if a more relaxed mode is intended. */
+    chmod(path, 0600);
     return 0;
 }

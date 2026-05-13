@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #include "cutils/mem.h"
 
@@ -25,11 +26,36 @@ typedef struct {
     char  **col_names; /* col_names[col_idx] */
 } db_result_t;
 
-/* Open a database connection. Creates the file if it doesn't exist.
+/* Open a database connection. Creates the file if it doesn't exist
+ * (subject to the calling process's umask).
  * Enables WAL mode and sets a 5-second busy timeout.
  * Returns CUTILS_OK on success, error code on failure. */
 CUTILS_MUST_USE
 int db_open(cutils_db_t **db, const char *path);
+
+/* Open a database connection and chmod the file to the given mode.
+ * Equivalent to db_open followed by an unconditional chmod — the mode
+ * is enforced whether the file was just created or already existed,
+ * so callers get an idempotent "the DB file has these permissions
+ * after this call returns" guarantee.
+ *
+ * Intended for daemons whose DB holds sensitive data (credentials,
+ * audit logs, etc.) and that don't want to rely on the calling
+ * process's umask. Typical use:
+ *
+ *     db_open_with_mode(&db, "/var/lib/myapp.db", 0600);
+ *
+ * Note on WAL/SHM: sqlite creates path-wal and path-shm files lazily
+ * on the first write transaction; their mode is determined by the
+ * umask at that moment, NOT by this call. If you need strict
+ * permissions on every artifact, set umask(0077) before this call so
+ * subsequent WAL/SHM creates inherit the same restriction.
+ *
+ * Returns CUTILS_OK on success, CUTILS_ERR_IO on chmod failure (with
+ * the connection torn down and *db set to NULL), or whatever db_open
+ * returns on open failure. */
+CUTILS_MUST_USE
+int db_open_with_mode(cutils_db_t **db, const char *path, mode_t mode);
 
 /* Close and free the database handle. Safe to call with NULL. */
 void db_close(cutils_db_t *db);
