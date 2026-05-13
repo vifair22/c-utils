@@ -200,6 +200,67 @@ typedef enum {
     SEND_TRANSIENT_FAIL,
 } send_result_t;
 
+/* Prototype declared ahead of the definition to satisfy
+ * -Wmissing-prototypes (the function is intentionally non-static so
+ * the cmocka test can call it directly; see comment on the
+ * definition). The matching declaration in tests/test_push.c uses
+ * extern with the same signature. */
+char *cutils_push_build_postfields(CURL *curl,
+                                   const char *token, const char *user,
+                                   const char *title, const char *message,
+                                   const char *timestamp, const char *ttl,
+                                   int html, int priority);
+
+/* Build the URL-encoded Pushover POST body. Returns a newly-allocated
+ * buffer sized exactly to fit the formatted content plus the
+ * terminating NUL, or NULL on allocation failure. Caller frees.
+ *
+ * The previous design wrote into a fixed 4KB stack buffer. With both
+ * `title` and `message` capped (250 and 1024 chars respectively) the
+ * worst-case unencoded total fit, but URL-encoding can expand each
+ * UTF-8 byte up to 3x — a max-length message of mostly multi-byte
+ * characters could land near 3KB encoded, and combined with a
+ * heavy-encoded title plus the parameter overhead the fixed buffer
+ * was uncomfortably close to truncation. Sizing to actual content
+ * removes the failure mode entirely.
+ *
+ * Non-static so the unit test can verify the no-truncation property
+ * directly — the function has no other callers outside this file. */
+char *cutils_push_build_postfields(CURL *curl,
+                                   const char *token, const char *user,
+                                   const char *title, const char *message,
+                                   const char *timestamp, const char *ttl,
+                                   int html, int priority)
+{
+    CUTILS_AUTO_CURLSTR char *enc_title = curl_easy_escape(curl, title, 0);
+    CUTILS_AUTO_CURLSTR char *enc_msg   = curl_easy_escape(curl, message, 0);
+    const char *etitle = enc_title ? enc_title : "";
+    const char *emsg   = enc_msg   ? enc_msg   : "";
+
+    const char *html_part = html ? "&html=1" : "";
+    char prio_part[24];
+    if (priority != 0)
+        snprintf(prio_part, sizeof(prio_part), "&priority=%d", priority);
+    else
+        prio_part[0] = '\0';
+
+    static const char fmt[] =
+        "token=%s&user=%s&title=%s&message=%s&timestamp=%s&ttl=%s%s%s";
+
+    int need = snprintf(NULL, 0, fmt,
+                        token, user, etitle, emsg, timestamp, ttl,
+                        html_part, prio_part);
+    if (need < 0) return NULL;
+
+    char *buf = malloc((size_t)need + 1);
+    if (!buf) return NULL;
+
+    snprintf(buf, (size_t)need + 1, fmt,
+             token, user, etitle, emsg, timestamp, ttl,
+             html_part, prio_part);
+    return buf;
+}
+
 static send_result_t send_one(const char *token, const char *user,
                               const char *title, const char *message,
                               const char *timestamp, const char *ttl,
@@ -212,27 +273,14 @@ static send_result_t send_one(const char *token, const char *user,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discard_cb);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
 
-    char postfields[4096];
-    CUTILS_AUTO_CURLSTR char *enc_title = curl_easy_escape(curl, title, 0);
-    CUTILS_AUTO_CURLSTR char *enc_msg   = curl_easy_escape(curl, message, 0);
+    CUTILS_AUTOFREE char *postfields = cutils_push_build_postfields(
+        curl, token, user, title, message, timestamp, ttl, html, priority);
+    if (!postfields)
+        return SEND_TRANSIENT_FAIL; /* OOM — retryable. */
 
-    int written = snprintf(postfields, sizeof(postfields),
-             "token=%s&user=%s&title=%s&message=%s&timestamp=%s&ttl=%s",
-             token, user,
-             enc_title ? enc_title : "",
-             enc_msg ? enc_msg : "",
-             timestamp, ttl);
-
-    if (html)
-        written += snprintf(postfields + written,
-                            sizeof(postfields) - (size_t)written,
-                            "&html=1");
-    if (priority != 0)
-        written += snprintf(postfields + written,
-                            sizeof(postfields) - (size_t)written,
-                            "&priority=%d", priority);
-    (void)written;
-
+    /* libcurl borrows the buffer for the duration of curl_easy_perform
+     * (CURLOPT_POSTFIELDS does not copy). The AUTOFREE on postfields
+     * fires at function return, well after perform completes. */
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postfields);
 
     CURLcode res = curl_easy_perform(curl);
