@@ -264,6 +264,22 @@ analyze: check
 	    -Iinclude -Ilib/cJSON $(SRCS)
 	@echo "cppcheck: OK"
 
+# --- pkg-config template ---
+# Substitutes @VERSION@ and @PREFIX@ in libc-utils.pc.in to produce
+# libc-utils.pc, suitable for dropping into $(PREFIX)/lib/pkgconfig/.
+# PREFIX defaults to /usr/local; override on the command line:
+#     make pc PREFIX=/opt/local
+
+PREFIX ?= /usr/local
+
+libc-utils.pc: libc-utils.pc.in release_version
+	@sed -e 's|@VERSION@|$(RELEASE_VERSION)|g' \
+	     -e 's|@PREFIX@|$(PREFIX)|g' \
+	     libc-utils.pc.in > $@
+	@echo "generated $@ (Version=$(RELEASE_VERSION), prefix=$(PREFIX))"
+
+pc: libc-utils.pc
+
 # Linting
 lint:
 	@echo "=== clang-tidy ==="
@@ -278,5 +294,6 @@ clean-test:
 	rm -rf $(TEST_DIR)
 
 clean: clean-lib clean-test clean-bench
+	rm -f libc-utils.pc
 
-.PHONY: check test test-junit test-asan coverage debug asan analyze lint bench clean clean-lib clean-test clean-bench
+.PHONY: check test test-junit test-asan coverage debug asan analyze lint bench pc clean clean-lib clean-test clean-bench
