@@ -66,6 +66,21 @@ static void appguard_signal_set(sigset_t *out)
     sigaddset(out, SIGUSR1);
 }
 
+/* Tear down the three background subsystems (push, log, db) in
+ * reverse-of-init order, gated on the per-subsystem started flags.
+ * Shared between the signal watcher and appguard_shutdown so the two
+ * paths can't drift on which subsystems to touch or in what order.
+ *
+ * Does NOT touch guard->config or free(guard) — those operations
+ * differ between callers (the signal watcher exits the process and
+ * lets the kernel reclaim; appguard_shutdown frees explicitly). */
+static void shutdown_subsystems(appguard_t *guard)
+{
+    if (guard->push_started) push_shutdown();
+    if (guard->log_started)  log_shutdown();
+    if (guard->db)           db_close(guard->db);
+}
+
 static void *signal_watcher(void *arg)
 {
     appguard_t *guard = arg;
@@ -92,9 +107,7 @@ static void *signal_watcher(void *arg)
     const char *name = (sig == SIGINT) ? "SIGINT" : "SIGTERM";
     fprintf(stderr, "\nReceived %s, shutting down...\n", name);
 
-    if (guard->push_started) push_shutdown();
-    if (guard->log_started)  log_shutdown();
-    if (guard->db)           db_close(guard->db);
+    shutdown_subsystems(guard);
 
     /* exit(0) rather than _exit(0): we want any atexit handlers the
      * consuming app registered to fire (resource cleanup, telemetry
@@ -280,15 +293,7 @@ void appguard_shutdown(appguard_t *guard)
 
     log_info("c-utils shutting down");
 
-    /* Reverse order */
-    if (guard->push_started)
-        push_shutdown();
-
-    if (guard->log_started)
-        log_shutdown();
-
-    if (guard->db)
-        db_close(guard->db);
+    shutdown_subsystems(guard);
 
     if (guard->config)
         config_free(guard->config);

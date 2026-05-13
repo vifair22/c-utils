@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -46,6 +47,9 @@ static void write_file(const char *path, const char *content)
     assert_non_null(f);
     fputs(content, f);
     fclose(f);
+    /* chmod 0600 so config_init's permissive-mode warning (1.1.0)
+     * doesn't fire on every test that writes a config file. */
+    chmod(path, 0600);
 }
 
 /* Helper: set up a DB + config with pushover keys */

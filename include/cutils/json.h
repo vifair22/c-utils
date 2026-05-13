@@ -13,6 +13,41 @@
  * Callers never see the underlying JSON library (currently cJSON).
  * Do not include cJSON headers from application code.
  *
+ * Quick reference:
+ *
+ *   // Parse a request body and read fields by dot-path:
+ *   CUTILS_AUTO_JSON_REQ cutils_json_req_t *req = NULL;
+ *   json_req_parse(buf, len, &req);
+ *   CUTILS_AUTOFREE char *name = NULL;
+ *   json_req_get_str(req, "user.name", &name);
+ *   uint32_t port; json_req_get_u32(req, "metadata.port", &port, 0, 65535);
+ *
+ *   // Iterate an array of objects:
+ *   CUTILS_AUTO_JSON_ITER cutils_json_iter_t it;
+ *   json_iter_begin(req, "items", &it);
+ *   while (json_iter_next(&it)) {
+ *       CUTILS_AUTOFREE char *n = NULL;
+ *       json_iter_get_str(&it, "name", &n);
+ *   }
+ *
+ *   // Build a response (object root):
+ *   CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
+ *   json_resp_new(&resp);
+ *   json_resp_add_str(resp, "status", "ok");
+ *   json_resp_add_u32(resp, "stats.count", 42);
+ *   CUTILS_AUTOFREE char *body = NULL; size_t blen;
+ *   json_resp_finalize(resp, &body, &blen);
+ *
+ *   // Build a response with an array of objects:
+ *   CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
+ *   json_resp_new(&resp);
+ *   for (size_t i = 0; i < n; i++) {
+ *       CUTILS_AUTO_JSON_ELEM cutils_json_elem_t elem;
+ *       json_resp_array_append_begin(resp, "users", &elem);
+ *       json_elem_add_str(&elem, "name", users[i].name);
+ *       json_elem_commit(&elem);   // discard on early return
+ *   }
+ *
  * Core invariant: no function in this header returns a pointer into
  * internal storage. Strings are always owned copies (free with free()).
  * Nested access is by dot-notation path. Array iteration uses a

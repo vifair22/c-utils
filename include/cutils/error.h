@@ -47,7 +47,16 @@ typedef enum {
  * Returns "" if no error has been set. */
 const char *cutils_get_error(void);
 
-/* Clear the thread-local error state. */
+/* Clear the thread-local error state.
+ *
+ * Most callers never need this — c-utils functions write the error
+ * buffer on failure and leave it untouched on success, and consumers
+ * read it via cutils_get_error() only after seeing a non-OK return
+ * code. Call cutils_clear_error explicitly when you want to reset
+ * the buffer before doing work whose outcome you'll inspect by some
+ * other means (e.g. probing for an optional config file with
+ * fopen + stat, where the file's absence isn't a c-utils error but
+ * an earlier call may have left a stale message in the buffer). */
 void cutils_clear_error(void);
 
 /* Return a short name for an error code ("OK", "ERR_IO", etc.) */

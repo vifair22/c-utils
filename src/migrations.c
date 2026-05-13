@@ -20,12 +20,16 @@ static void closedir_p(DIR **d)
 
 /* --- SHA256 checksum helper --- */
 
+/* Caller guarantees out is at least (SHA256_DIGEST_LENGTH * 2 + 1)
+ * bytes (65 for SHA256). snprintf with the exact remaining space is a
+ * style match for the rest of the codebase — every other src/ file
+ * uses snprintf rather than sprintf. */
 static void sha256_hex(const char *data, size_t len, char *out)
 {
     unsigned char hash[SHA256_DIGEST_LENGTH];
     SHA256((const unsigned char *)data, len, hash);
     for (int i = 0; i < SHA256_DIGEST_LENGTH; i++)
-        sprintf(out + i * 2, "%02x", hash[i]);
+        snprintf(out + i * 2, 3, "%02x", hash[i]);
     out[SHA256_DIGEST_LENGTH * 2] = '\0';
 }
 
@@ -288,11 +292,27 @@ int db_run_app_migrations(cutils_db_t *db, const char *migrations_dir)
             goto cleanup;          /* tx auto-rolls-back */
         }
 
-        fseek(f, 0, SEEK_END);
+        /* LCOV_EXCL_START — fseek / ftell only fail on stream-type
+         * mismatches (pipes, char devices, etc.) and EBADF; for a
+         * just-opened regular .sql file, these are unreachable in
+         * any practical test. */
+        if (fseek(f, 0, SEEK_END) != 0) {
+            rc = set_error_errno(CUTILS_ERR_IO, "fseek %s", path);
+            goto cleanup;
+        }
         long fsize = ftell(f);
-        fseek(f, 0, SEEK_SET);
+        if (fseek(f, 0, SEEK_SET) != 0) {
+            rc = set_error_errno(CUTILS_ERR_IO, "fseek %s", path);
+            goto cleanup;
+        }
 
-        if (fsize <= 0) continue;
+        if (fsize < 0) {
+            /* ftell error — surface it instead of silently skipping. */
+            rc = set_error_errno(CUTILS_ERR_IO, "ftell %s", path);
+            goto cleanup;
+        }
+        /* LCOV_EXCL_STOP */
+        if (fsize == 0) continue;  /* empty .sql file, skip silently */
 
         CUTILS_AUTOFREE char *sql = malloc((size_t)fsize + 1);
         if (!sql) {

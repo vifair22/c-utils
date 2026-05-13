@@ -1,0 +1,15 @@
+# c-utils clang-tidy configuration
+#
+# We use the default check set MINUS the C11 Annex K family
+# (clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+# and its variants). Annex K's *_s functions (strcpy_s, snprintf_s,
+# memcpy_s, etc.) are optional under C11 and not present in glibc.
+# Without that, every snprintf, memcpy, memmove, and strerror call in
+# the codebase produces a noise warning that c-utils consciously
+# ignores — there's no portable migration target.
+#
+# Other check families are kept on by default. To investigate noise
+# locally: clang-tidy --config-file=.clang-tidy src/somefile.c -- ...
+
+Checks: '-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,-clang-analyzer-security.insecureAPI.strcpy,-clang-analyzer-security.insecureAPI.strncpy'
+WarningsAsErrors: ''

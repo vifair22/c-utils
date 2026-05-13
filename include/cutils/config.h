@@ -14,8 +14,43 @@
  * Keys use dot-notation ("ups.device"). Each key lives in exactly one store.
  * Read precedence: ENV_VAR > store value > compiled-in default.
  *
+ * Quick reference:
+ *
+ *   // Set the env override BEFORE calling appguard_init / config_init.
+ *   // Late setenv after init is NOT observed (env values are
+ *   // snapshotted at registration time, see the env-var paragraph
+ *   // below for the why).
+ *
+ *   // Define the keys the app cares about (static array, NULL-sentinel):
+ *   static const config_key_t app_keys[] = {
+ *       { "sensor.host", CFG_STRING, "127.0.0.1", "Sensor host",
+ *         CFG_STORE_FILE, 1 },
+ *       { "sensor.port", CFG_INT, "8080", "Sensor port",
+ *         CFG_STORE_FILE, 0 },
+ *       { NULL, 0, NULL, NULL, 0, 0 }
+ *   };
+ *
+ *   // Reads — same API for file-backed and DB-backed keys.
+ *   // appguard_config(guard) gives the cutils_config_t * handle.
+ *   const char *host = config_get_str(cfg, "sensor.host");
+ *   int port = config_get_int(cfg, "sensor.port", 8080);
+ *
+ *   // Mutations:
+ *   config_set(cfg, "sensor.host", "10.0.0.1");      // file key
+ *   config_set_db(cfg, "session.token", new_token);  // DB key
+ *
  * The YAML format is controlled by c-utils: simple section/key/value,
- * no flow syntax, no anchors. Comments are preserved on mutation. */
+ * no flow syntax, no anchors. Comments are preserved on mutation.
+ *
+ * YAML line-length limit: individual lines in the YAML file MUST be
+ * ≤1024 bytes including the trailing newline. The parser reads lines
+ * into fixed-size stack buffers; longer lines truncate silently and
+ * may produce a partial parse. This is sufficient for any realistic
+ * key/value pair (a 1024-byte value would be longer than most URLs
+ * or shell-style command strings), but is documented so callers
+ * working with abnormally large values know to set them via the DB
+ * store rather than the YAML store. Section names and key names are
+ * additionally bounded to 128 bytes each. */
 
 /* Value types */
 typedef enum {

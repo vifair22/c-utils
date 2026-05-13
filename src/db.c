@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 struct cutils_db {
     sqlite3        *conn;
@@ -87,6 +88,30 @@ int db_open(cutils_db_t **db, const char *path)
     sqlite3_busy_timeout(d->conn, 5000);
 
     *db = d;
+    return CUTILS_OK;
+}
+
+int db_open_with_mode(cutils_db_t **db, const char *path, mode_t mode)
+{
+    int rc = db_open(db, path);
+    if (rc != CUTILS_OK) return rc;
+
+    /* Unconditional chmod: makes the API idempotent — the caller is
+     * guaranteed `the file has mode X` regardless of whether it was
+     * just-created (subject to umask) or already existed. The
+     * WAL/SHM sidecars are NOT touched here; if strict perms are
+     * needed on those too, the caller should set umask(0077) before
+     * this call so sqlite's lazy WAL/SHM creates inherit. */
+    if (chmod(path, mode) != 0) {
+        /* LCOV_EXCL_START — chmod on a just-opened file we own
+         * shouldn't fail; exercising this needs an EROFS mount or
+         * similar deliberate harness. */
+        int err = set_error_errno(CUTILS_ERR_IO, "chmod %s", path);
+        db_close(*db);
+        *db = NULL;
+        return err;
+        /* LCOV_EXCL_STOP */
+    }
     return CUTILS_OK;
 }
 
@@ -387,4 +412,157 @@ void cutils_db_tx_end_p(cutils_db_tx_t *tx)
     }
     tx->active    = 0;
     tx->finalized = 1;
+}
+
+/* --- Streaming query iterator ---
+ *
+ * The iterator holds the connection mutex across its lifetime so the
+ * prepared statement and sqlite's internal column buffers remain
+ * stable between successive db_iter_next calls. The recursive mutex
+ * (see db_open) means an iterator can be opened from inside a tx
+ * scope — both hold the mutex, both release on close.
+ *
+ * Row pointers handed out via db_iter_next point into sqlite's
+ * column-text storage, which sqlite recycles on the next step. The
+ * row_buf array itself is allocated once at db_iter_begin and reused
+ * across every next() call — caller-visible pointers are stable, the
+ * strings they reference are not. */
+
+struct cutils_db_iter {
+    cutils_db_t   *db;
+    sqlite3_stmt  *stmt;
+    int            ncols;
+    const char   **row_buf;     /* ncols slots, refilled per step */
+    char         **col_names;   /* ncols strdup'd names */
+    int            holds_mutex; /* did we acquire db->mutex? */
+    int            errored;     /* step returned non-DONE/ROW */
+};
+
+int db_iter_begin(cutils_db_t *db, const char *sql,
+                  const char **params, cutils_db_iter_t **out)
+{
+    *out = NULL;
+
+    /* LCOV_EXCL_START — calloc(<48 bytes>, 1) failure is unreachable in
+     * any practical test environment. Excluded so a fundamentally
+     * untestable path doesn't drag the line ratio down. */
+    cutils_db_iter_t *it = calloc(1, sizeof(*it));
+    if (!it)
+        return set_error(CUTILS_ERR_NOMEM, "db_iter_begin: alloc failed");
+    /* LCOV_EXCL_STOP */
+    it->db = db;
+
+    pthread_mutex_lock(&db->mutex);
+    it->holds_mutex = 1;
+
+    int rc = sqlite3_prepare_v2(db->conn, sql, -1, &it->stmt, NULL);
+    if (rc != SQLITE_OK) {
+        rc = set_error(CUTILS_ERR_DB, "prepare: %s",
+                       sqlite3_errmsg(db->conn));
+        goto fail;
+    }
+
+    rc = bind_params(it->stmt, params);
+    if (rc != CUTILS_OK)
+        goto fail;
+
+    it->ncols = sqlite3_column_count(it->stmt);
+    if (it->ncols > 0) {
+        it->row_buf   = calloc((size_t)it->ncols, sizeof(*it->row_buf));
+        it->col_names = calloc((size_t)it->ncols, sizeof(*it->col_names));
+        /* LCOV_EXCL_START — alloc failure on a few hundred bytes is
+         * not exercisable from test code without fault injection. The
+         * fail-path is reached via the same goto and db_iter_end
+         * tolerates partial state (NULL slots, no-stmt, etc.). */
+        if (!it->row_buf || !it->col_names) {
+            rc = set_error(CUTILS_ERR_NOMEM,
+                           "db_iter_begin: row/colname alloc");
+            goto fail;
+        }
+        /* LCOV_EXCL_STOP */
+        for (int c = 0; c < it->ncols; c++) {
+            it->col_names[c] = strdup(sqlite3_column_name(it->stmt, c));
+            /* LCOV_EXCL_START — same rationale: small strdup failure
+             * not reachable in tests. db_iter_end frees the partial
+             * col_names array (NULL slots are no-op'd by free). */
+            if (!it->col_names[c]) {
+                rc = set_error(CUTILS_ERR_NOMEM,
+                               "db_iter_begin: col name alloc");
+                goto fail;
+            }
+            /* LCOV_EXCL_STOP */
+        }
+    }
+
+    *out = it;
+    return CUTILS_OK;
+
+fail:
+    /* db_iter_end handles every shape of partial state: stmt may be
+     * NULL (prepare failed), col_names may be partially populated
+     * (strdup-loop bail), and holds_mutex tracks whether to unlock. */
+    db_iter_end(it);
+    return rc;
+}
+
+int db_iter_next(cutils_db_iter_t *it, const char ***row_out)
+{
+    if (!it || it->errored) return 0;
+
+    int rc = sqlite3_step(it->stmt);
+    if (rc == SQLITE_DONE) return 0;
+    if (rc != SQLITE_ROW) {
+        CUTILS_UNUSED(set_error(CUTILS_ERR_DB, "step: %s",
+                                sqlite3_errmsg(it->db->conn)));
+        it->errored = 1;
+        return 0;
+    }
+
+    for (int c = 0; c < it->ncols; c++) {
+        const char *v = (const char *)sqlite3_column_text(it->stmt, c);
+        /* NULL columns → "" to match db_execute's contract. The empty
+         * string literal lives in static storage; safe to return as a
+         * const char *. */
+        it->row_buf[c] = v ? v : "";
+    }
+
+    if (row_out) *row_out = it->row_buf;
+    return 1;
+}
+
+int db_iter_ncols(const cutils_db_iter_t *it)
+{
+    return it ? it->ncols : 0;
+}
+
+const char *db_iter_col_name(const cutils_db_iter_t *it, int idx)
+{
+    if (!it || idx < 0 || idx >= it->ncols) return NULL;
+    return it->col_names[idx];
+}
+
+int db_iter_error(const cutils_db_iter_t *it)
+{
+    return it ? it->errored : 0;
+}
+
+void db_iter_end(cutils_db_iter_t *it)
+{
+    if (!it) return;
+    if (it->stmt) sqlite3_finalize(it->stmt);
+    if (it->col_names) {
+        for (int c = 0; c < it->ncols; c++) free(it->col_names[c]);
+        free(it->col_names);
+    }
+    free(it->row_buf);
+    if (it->holds_mutex) pthread_mutex_unlock(&it->db->mutex);
+    free(it);
+}
+
+void db_iter_end_p(cutils_db_iter_t **it)
+{
+    if (it && *it) {
+        db_iter_end(*it);
+        *it = NULL;
+    }
 }

@@ -294,6 +294,43 @@ static void test_compiled_migrations_null_is_noop(void **state)
     db_close(db);
 }
 
+/* Empty .sql files in the migrations directory are skipped silently
+ * rather than failing the run. Useful for the case where a developer
+ * `touch`'d a new migration file before writing its SQL — the test
+ * here also exercises the fsize == 0 branch added in 1.1.0 to make
+ * that skip explicit. */
+static void test_empty_sql_file_is_skipped(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+
+    write_migration("001_real.sql",
+        "CREATE TABLE real_table (id INTEGER PRIMARY KEY);");
+    write_migration("002_empty.sql", "");
+
+    assert_int_equal(db_run_app_migrations(db, TEST_MIG_DIR), CUTILS_OK);
+
+    /* Real table exists. */
+    db_result_t *result = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='real_table'",
+        NULL, &result), CUTILS_OK);
+    assert_int_equal(result->nrows, 1);
+    db_result_free(result);
+
+    /* Empty migration is not recorded as applied (no checksum row). */
+    result = NULL;
+    const char *p[] = { "002_empty.sql", NULL };
+    assert_int_equal(db_execute(db,
+        "SELECT filename FROM system_migrations WHERE filename = ?",
+        p, &result), CUTILS_OK);
+    assert_int_equal(result->nrows, 0);
+    db_result_free(result);
+
+    db_close(db);
+}
+
 static void test_compiled_and_file_migrations_coexist(void **state)
 {
     (void)state;
@@ -340,6 +377,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_compiled_migrations_checksum_mismatch, setup, teardown),
         cmocka_unit_test_setup_teardown(test_compiled_migrations_null_is_noop, setup, teardown),
         cmocka_unit_test_setup_teardown(test_compiled_and_file_migrations_coexist, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_empty_sql_file_is_skipped, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
