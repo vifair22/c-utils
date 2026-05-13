@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 struct cutils_db {
     sqlite3        *conn;
@@ -87,6 +88,30 @@ int db_open(cutils_db_t **db, const char *path)
     sqlite3_busy_timeout(d->conn, 5000);
 
     *db = d;
+    return CUTILS_OK;
+}
+
+int db_open_with_mode(cutils_db_t **db, const char *path, mode_t mode)
+{
+    int rc = db_open(db, path);
+    if (rc != CUTILS_OK) return rc;
+
+    /* Unconditional chmod: makes the API idempotent — the caller is
+     * guaranteed `the file has mode X` regardless of whether it was
+     * just-created (subject to umask) or already existed. The
+     * WAL/SHM sidecars are NOT touched here; if strict perms are
+     * needed on those too, the caller should set umask(0077) before
+     * this call so sqlite's lazy WAL/SHM creates inherit. */
+    if (chmod(path, mode) != 0) {
+        /* LCOV_EXCL_START — chmod on a just-opened file we own
+         * shouldn't fail; exercising this needs an EROFS mount or
+         * similar deliberate harness. */
+        int err = set_error_errno(CUTILS_ERR_IO, "chmod %s", path);
+        db_close(*db);
+        *db = NULL;
+        return err;
+        /* LCOV_EXCL_STOP */
+    }
     return CUTILS_OK;
 }
 
