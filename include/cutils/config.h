@@ -9,7 +9,7 @@
  *
  * Two-store config system:
  *   1. YAML file — bootstrap + persistent settings
- *   2. SQLite DB — runtime-mutable app settings (see task #6)
+ *   2. SQLite DB — runtime-mutable app settings
  *
  * Keys use dot-notation ("ups.device"). Each key lives in exactly one store.
  * Read precedence: ENV_VAR > store value > compiled-in default.
