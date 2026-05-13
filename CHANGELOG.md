@@ -5,6 +5,62 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.0.3] - 2026-05-13
+
+Round of post-1.0.2 polish. Three internal fixes, no public API or ABI
+changes — public-header function signatures are unchanged, and the
+only behavioral shift is documented under **Changed**.
+
+### Fixed
+
+- **CI** — `gcovr` was rejecting the test pipeline on GCC's BUG 68080
+  ("negative branch counts in exception-handler regions"), which surfaces
+  intermittently on Debian-trixie builds. `gcovr` now tolerates the
+  negative-count rows via `--exclude-throw-branches`; coverage numbers
+  are unchanged, the gate just stops false-positiving on toolchain bugs.
+- **Push** — `send_one` formatted the URL-encoded Pushover POST body
+  into a fixed 4KB stack buffer. With `MAX_MSG_CHARS = 1024` and
+  `MAX_TITLE_CHARS = 250` the worst-case unencoded total fit, but
+  URL-encoding expands each UTF-8 byte up to 3x — a max-length message
+  of mostly multi-byte characters could approach the bound, and a
+  future bump to either cap would silently truncate. The body is now
+  built in `cutils_push_build_postfields` via two-pass `snprintf` into
+  a buffer sized exactly to the formatted content. NOMEM yields
+  `SEND_TRANSIENT_FAIL` so the row retries normally.
+
+### Changed
+
+- **Config** — env-var overrides are now captured **at registration
+  time** (during `config_init` for file keys, during
+  `config_attach_db` for DB keys) rather than re-read via `getenv` on
+  every `config_get_str` call. This removes the per-read syscall plus
+  the per-read `make_env_name` allocation, and closes the POSIX hazard
+  where a concurrent `setenv` on any thread invalidates a prior
+  `getenv` return pointer. The existing "no `setenv` after
+  `appguard_init` returns" guidance in the config header is now
+  enforced by behavior rather than externalized as a caller invariant:
+  late `setenv` is silently ignored, matching the documented contract.
+  Apps that already follow 12-factor practice (set env once at
+  startup) are unaffected.
+
+### Documentation
+
+- Removed an orphaned "see task #6" reference from the config-subsystem
+  docstring in `include/cutils/config.h`.
+
+### Dead-code sweep
+
+Ran `cppcheck --enable=unusedFunction`, link-time `--gc-sections`
+inspection of every exported text symbol (210 total across the
+library), and manual reference counts on every public macro, error
+code, and private file-scope helper. Result: no removable internal
+code. The strict-warning compiler regime (`-Wunused-function`,
+`-Wunused-variable`, `-Wunused-parameter`, `-Wunused-result`) plus
+broad test coverage have already kept the codebase clean. Public-API
+constants that are not consumed internally (`CUTILS_NONNULL`,
+several `PUSH_PRIORITY_*` levels) are intentionally retained — they
+are documented public surface that consumers may use.
+
 ## [1.0.2] - 2026-05-08
 
 Push subsystem durability and disable contract. Two related fixes.
