@@ -64,6 +64,8 @@ make test-asan    # run tests under AddressSanitizer
 
 make analyze      # stack-usage check + gcc -fanalyzer + cppcheck
 make lint         # clang-tidy
+
+make bench        # microbenchmarks (release-built); see bench/README.md
 make clean
 ```
 
