@@ -23,83 +23,106 @@ struct error_loop {
 };
 
 /* --- Normalization ---
- * Strip variable parts so the same logical error matches across iterations.
- * Replaces: UUIDs, ISO timestamps, hex addresses, long hex sequences. */
+ *
+ * Strip variable parts of error messages so the same logical error
+ * matches across iterations. Each pattern is a small "try this
+ * shape at position p" function that returns the in-place
+ * replacement's length (so the dispatcher can advance past it), or
+ * 0 if the pattern doesn't match. The dispatcher in
+ * normalize_inplace tries each in declared order and either consumes
+ * the replacement length or advances one byte.
+ *
+ * Adding a new pattern is a self-contained edit: write one
+ * try_replace_X that probes at p, and append it to the dispatch
+ * order in normalize_inplace. No edits to a shared megafunction. */
+
+/* Replace the run starting at p with `repl` (length rlen), shifting
+ * the tail down. Returns rlen so callers can do p += try_replace_...
+ * cleanly. The tail's strlen(q) accounts for the new NUL position. */
+static size_t replace_run(char *p, const char *q, const char *repl, size_t rlen)
+{
+    memmove(p + rlen, q, strlen(q) + 1);
+    memcpy(p, repl, rlen);
+    return rlen;
+}
+
+/* UUID: 8-4-4-4-12 hex with hyphens. */
+static size_t try_replace_uuid(char *p)
+{
+    if (!isxdigit((unsigned char)p[0]) || strlen(p) < 36)
+        return 0;
+    static const int groups[] = { 8, 4, 4, 4, 12 };
+    const char *q = p;
+    for (int g = 0; g < 5; g++) {
+        for (int c = 0; c < groups[g]; c++) {
+            if (!isxdigit((unsigned char)*q)) return 0;
+            q++;
+        }
+        if (g < 4) {
+            if (*q != '-') return 0;
+            q++;
+        }
+    }
+    /* Trailing char must not extend the run alphanumerically — that
+     * would mean the UUID is a substring of a longer token. */
+    if (isalnum((unsigned char)*q))
+        return 0;
+    return replace_run(p, q, "<uuid>", 6);
+}
+
+/* "0x" prefix followed by at least 4 hex digits. */
+static size_t try_replace_hex_addr(char *p)
+{
+    if (p[0] != '0' || p[1] != 'x' || !isxdigit((unsigned char)p[2]))
+        return 0;
+    const char *q = p + 2;
+    while (isxdigit((unsigned char)*q)) q++;
+    if ((size_t)(q - p) < 4)
+        return 0;
+    return replace_run(p, q, "<addr>", 6);
+}
+
+/* ISO 8601 timestamp: YYYY-MM-DD[T ]HH:MM:SS, with optional
+ * fractional seconds. */
+static size_t try_replace_timestamp(char *p)
+{
+    if (!isdigit((unsigned char)p[0]) || strlen(p) < 19)
+        return 0;
+    if (p[4] != '-' || p[7] != '-' ||
+        (p[10] != 'T' && p[10] != ' ') ||
+        p[13] != ':' || p[16] != ':')
+        return 0;
+    const char *q = p + 19;
+    if (*q == '.') { q++; while (isdigit((unsigned char)*q)) q++; }
+    return replace_run(p, q, "<timestamp>", 11);
+}
+
+/* 8+ contiguous hex characters NOT followed by an alpha (which would
+ * make this part of a longer identifier). */
+static size_t try_replace_long_hex(char *p)
+{
+    if (!isxdigit((unsigned char)p[0]))
+        return 0;
+    const char *q = p;
+    while (isxdigit((unsigned char)*q)) q++;
+    if ((size_t)(q - p) < 8 || isalpha((unsigned char)*q))
+        return 0;
+    return replace_run(p, q, "<hex>", 5);
+}
 
 static void normalize_inplace(char *buf)
 {
+    /* Try patterns in declared order at each position. UUID first
+     * because its trailing-group hex run would otherwise be eaten by
+     * the long-hex pattern; hex-addr before long-hex for the same
+     * reason w.r.t the "0x" prefix. */
     char *p = buf;
-
     while (*p) {
-        /* UUID: 8-4-4-4-12 hex pattern */
-        if (isxdigit((unsigned char)p[0]) && strlen(p) >= 36) {
-            int is_uuid = 1;
-            const int uuid_groups[] = { 8, 4, 4, 4, 12 };
-            const char *q = p;
-            for (int g = 0; g < 5; g++) {
-                for (int c = 0; c < uuid_groups[g]; c++) {
-                    if (!isxdigit((unsigned char)*q)) { is_uuid = 0; break; }
-                    q++;
-                }
-                if (!is_uuid) break;
-                if (g < 4) {
-                    if (*q != '-') { is_uuid = 0; break; }
-                    q++;
-                }
-            }
-            if (is_uuid && !isalnum((unsigned char)*q)) {
-                size_t rlen = 6; /* <uuid> */
-                memmove(p + rlen, q, strlen(q) + 1);
-                memcpy(p, "<uuid>", rlen);
-                p += rlen;
-                continue;
-            }
-        }
-
-        /* 0x hex address */
-        if (p[0] == '0' && p[1] == 'x' && isxdigit((unsigned char)p[2])) {
-            const char *q = p + 2;
-            while (isxdigit((unsigned char)*q)) q++;
-            size_t hlen = (size_t)(q - p);
-            if (hlen >= 4) {
-                size_t rlen = 6; /* <addr> */
-                memmove(p + rlen, q, strlen(q) + 1);
-                memcpy(p, "<addr>", rlen);
-                p += rlen;
-                continue;
-            }
-        }
-
-        /* ISO timestamp: YYYY-MM-DD[T ]HH:MM:SS */
-        if (isdigit((unsigned char)p[0]) && strlen(p) >= 19 &&
-            p[4] == '-' && p[7] == '-' &&
-            (p[10] == 'T' || p[10] == ' ') &&
-            p[13] == ':' && p[16] == ':') {
-            const char *q = p + 19;
-            /* Skip optional fractional seconds */
-            if (*q == '.') { q++; while (isdigit((unsigned char)*q)) q++; }
-            size_t rlen = 11; /* <timestamp> */
-            memmove(p + rlen, q, strlen(q) + 1);
-            memcpy(p, "<timestamp>", rlen);
-            p += rlen;
-            continue;
-        }
-
-        /* Long hex sequences (8+ chars) */
-        if (isxdigit((unsigned char)p[0])) {
-            const char *q = p;
-            while (isxdigit((unsigned char)*q)) q++;
-            size_t hlen = (size_t)(q - p);
-            if (hlen >= 8 && !isalpha((unsigned char)*q)) {
-                size_t rlen = 5; /* <hex> */
-                memmove(p + rlen, q, strlen(q) + 1);
-                memcpy(p, "<hex>", rlen);
-                p += rlen;
-                continue;
-            }
-        }
-
-        p++;
+        size_t adv = try_replace_uuid(p);
+        if (!adv) adv = try_replace_hex_addr(p);
+        if (!adv) adv = try_replace_timestamp(p);
+        if (!adv) adv = try_replace_long_hex(p);
+        p += adv ? adv : 1;
     }
 }
 
