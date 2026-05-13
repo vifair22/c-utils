@@ -14,7 +14,23 @@
  *
  * Async SQLite persistence via background writer thread.
  * Multiple stream callback registrations for live log fan-out.
- * Configurable retention with automatic cleanup. */
+ * Configurable retention with automatic cleanup.
+ *
+ * Quick reference:
+ *
+ *   // After appguard_init() returns, just use the macros:
+ *   log_debug("started worker %d", id);
+ *   log_info("processed %zu records", n);
+ *   log_warn("retry %d/%d on %s", attempt, max, host);
+ *   log_error("failed: %s", cutils_get_error());
+ *
+ *   // Adjust level at runtime (default LOG_INFO):
+ *   log_set_level(LOG_DEBUG);
+ *
+ *   // Live fan-out to a WebSocket / metrics endpoint / etc:
+ *   int h = log_stream_register(my_callback, my_ctx);
+ *   ...
+ *   log_stream_unregister(h);   // keep my_ctx alive briefly after — see below */
 
 /* Log levels */
 typedef enum {

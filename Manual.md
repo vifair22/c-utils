@@ -324,6 +324,73 @@ for (int c = 0; c < result->ncols; c++)
 
 An empty result set (`nrows == 0`) is still a valid, non-NULL pointer that must be freed.
 
+### Streaming queries (1.1.0+)
+
+`db_execute` materializes the full result set on the heap: every cell is `strdup`'d into the `db_result_t`. For SELECTs over known-small row counts that's the most ergonomic option (you get a random-access array you can pass around). For unknown or large row counts, prefer the streaming iterator — it delivers rows one at a time and uses O(1) heap regardless of row count.
+
+```c
+CUTILS_AUTO_DB_ITER cutils_db_iter_t *it = NULL;
+
+const char *params[] = { "active", NULL };
+if (db_iter_begin(db,
+        "SELECT id, name FROM users WHERE status = ?",
+        params, &it) != CUTILS_OK)
+    return -1;
+
+const char **row;
+while (db_iter_next(it, &row)) {
+    /* row[0] = "id" column, row[1] = "name" column.
+     * Strings are valid only until the next db_iter_next call —
+     * sqlite recycles its column buffers on each step.
+     * strdup() the value if you need it to outlive the next row. */
+    handle(row[0], row[1]);
+}
+if (db_iter_error(it))
+    return -1;  /* sqlite step error; message in cutils_get_error() */
+```
+
+The iterator API is symmetric with `cutils_json_iter_t`: stack-allocated handle, `_begin` / `_next` / `_end`, with `CUTILS_AUTO_DB_ITER` for scope-exit cleanup.
+
+**Locking and lifetime ordering**
+
+The iterator holds the connection mutex from `db_iter_begin` to `db_iter_end`. No other `db_*` call on the same connection can proceed while it's open — keep iterator scopes short and don't span blocking work (network I/O, condition waits, etc.) inside the loop body.
+
+The iterator MUST end before `db_close` on the same connection. Either let `CUTILS_AUTO_DB_ITER` fire in a nested block:
+
+```c
+{
+    CUTILS_AUTO_DB_ITER cutils_db_iter_t *it = NULL;
+    db_iter_begin(db, ...);
+    /* use */
+}                /* iter end fires here */
+db_close(db);
+```
+
+Or call `db_iter_end(it)` explicitly before `db_close`. Closing the database while an iterator is open is undefined behavior — the iterator still holds the mutex and a prepared statement against the now-freed connection.
+
+**`db_execute` vs `db_iter_*` at a glance**
+
+| | `db_execute` | `db_iter_*` |
+|---|---|---|
+| Heap usage | O(n) — every cell strdup'd | O(1) — sqlite buffers reused |
+| Result shape | Indexable `db_result_t` array | Step-by-step, current row only |
+| Best for | Known-small queries you'll keep around | Large or unbounded queries; streaming pipelines |
+| Speed (1000×3 rows) | ~199 µs | ~138 µs (~31% faster) |
+
+### Restricting file permissions (1.1.0+)
+
+For databases that hold sensitive data — credentials, audit logs, anything you wouldn't want in a backup of the user's home directory — use `db_open_with_mode` instead of `db_open`:
+
+```c
+cutils_db_t *db = NULL;
+if (db_open_with_mode(&db, "/var/lib/myapp.db", 0600) != CUTILS_OK)
+    return -1;
+```
+
+This is idempotent: after the call returns the file has the requested mode, whether it was just created or already existed with a different mode. Existing-file mode is enforced even if the caller's umask would have left it more permissive.
+
+WAL/SHM sidecars caveat: sqlite creates `path-wal` and `path-shm` lazily on the first write transaction; their mode is determined by the umask at that moment. If you need strict perms on the sidecars too, set `umask(0077)` before opening so subsequent WAL/SHM creates inherit the restriction.
+
 ### Transactions
 
 ```c
@@ -555,7 +622,9 @@ Any config key can be overridden by an environment variable. The variable name i
 3. Append the key with dots replaced by `_` and uppercased: `SENSOR_HOST`
 4. Result: `MY_MONITOR_SENSOR_HOST`
 
-Environment overrides are checked first on every `config_get_*` call. They do not persist — they exist only in the process environment.
+Environment overrides are **captured at registration time** — once when each key is first registered (during `config_init` for file keys, during `config_attach_db` for DB keys). Changes to the environment after that point are not observed by subsequent `config_get_*` reads. This matches the standard 12-factor "set env once at startup" model and avoids both the per-read `getenv` syscall and the POSIX hazard where a concurrent `setenv` on any thread invalidates a prior `getenv` return pointer.
+
+The practical implication: set environment overrides before calling `appguard_init` / `config_init`. Late `setenv` from inside the application is silently ignored.
 
 ### Read API
 
@@ -1164,41 +1233,60 @@ These return the handles managed by AppGuard. The application uses them for conf
 
 ## 10. Threading Model
 
-c-utils manages its own threads internally. The consuming application does not need to create threads for c-utils to function, and should not need to be aware of internal threading beyond the safety guarantees documented here.
+c-utils manages three internal background threads. The consuming application does not create threads for c-utils to function, and does not need to be aware of internal threading beyond the safety guarantees documented here. This section is the canonical reference for which threads exist, what they do, and what they synchronize on.
 
 ### Threads
 
-| Thread | Purpose | Started by | Stopped by |
-|--------|---------|------------|------------|
-| Log writer | Drains log queue to SQLite | `log_init()` | `log_shutdown()` |
-| Push worker | Delivers queued notifications via HTTP | `push_init()` | `push_shutdown()` |
+| Thread | Purpose | Started by | Stopped by | Sync peers |
+|---|---|---|---|---|
+| **Log writer** | Drains the log entry queue to SQLite. Periodically (once per day) deletes log rows older than `log_retention_days`. | `log_init()` (when called with a non-NULL `db`) | `log_shutdown()` | `log_mutex` + `log_cond` for queue; goes through `db_execute_non_query()` (so the DB mutex too) for inserts. |
+| **Push worker** | Polls the `push` table for ready-to-send notifications, delivers them via libcurl, applies backoff on transient failures, marks `failed=1` on permanent failures. | `push_init()` (when creds are configured AND `appguard_config_t.enable_pushover` is set) | `push_shutdown()` | `push_mutex` + `push_cond` to throttle; reads/writes the `push` table via `db_execute*` (DB mutex). |
+| **Signal watcher** | Receives SIGINT / SIGTERM / SIGUSR1 via `sigwait` — the dedicated synchronous handler that replaces the pre-1.0.1 async signal handler. On SIGINT/SIGTERM it tears down subsystems and `exit(0)`s. On SIGUSR1 (sent by `appguard_shutdown`) it exits the watcher cleanly. | `appguard_init()` (always — last init step) | `appguard_shutdown()` sends SIGUSR1 then joins. | None during steady state; on signal-driven shutdown it takes the same locks as `appguard_shutdown`. |
 
-Both threads are started during `appguard_init()` and stopped during `appguard_shutdown()`.
+All three threads are started by `appguard_init()` in the order above and stopped by `appguard_shutdown()` in reverse. Each *_init() / *_shutdown() pair is also exposed individually, so applications not using AppGuard can manage them directly.
 
-### Synchronization
+### Synchronization primitives
 
-**Database access:** All `db_*` functions acquire a `pthread_mutex_t` before touching the SQLite connection. Any thread can call any `db_*` function at any time.
+| Lock / cond | What it protects | Who locks |
+|---|---|---|
+| `db->mutex` (recursive) | The single SQLite connection. Every `db_*` call serializes through this. Recursive so an in-progress `cutils_db_tx_t` scope can re-enter `db_execute*` from the same thread without self-deadlocking. | All `db_*` callers; the log writer and push worker (indirectly via `db_execute_non_query`). |
+| `cfg->mutex` (recursive, heap-allocated) | The config handle: keys array, env-value snapshots, YAML doc, DB-cache slot list. Recursive so `config_get_int` / `config_get_bool` can hold it across an internal `config_get_str` call. | All `config_*` callers. |
+| `log_mutex` + `log_cond` | The log writer's producer-consumer queue. | `log_write` (producer); `log_writer_thread` (consumer). |
+| `stream_mutex` | The log stream-callback registry. | `log_stream_register` / `_unregister` / `fire_streams` — held only across array reads, callbacks fire unlocked. |
+| `push_mutex` + `push_cond` | The push worker's wake-up. The push table itself is protected by the DB mutex. | `push_send` (signaler); `push_worker_thread` (waiter). |
+| `error_loop_t::mutex` | Per-detector state (`last_identity`, `last_raw`, `count`, `suppressed_until`). Callbacks fire outside the lock. | `error_loop_report` / `error_loop_success`. |
 
-**Log queue:** The log entry queue is protected by a mutex with a condition variable. `log_write()` enqueues an entry and signals the writer thread. The writer thread wakes, flushes all pending entries to the database, then sleeps.
+### Atomic gates
 
-**Push queue:** The push worker uses a mutex and condition variable. `push_send()` writes to the database and signals the worker. The worker wakes, queries for unsent messages, delivers them, and sleeps.
+A handful of cross-thread flags use `_Atomic` rather than a mutex because the read path needs to be lock-free and the only operation is `compare-and-skip`:
 
-**Error buffer:** The error message buffer is `_Thread_local` — each thread has its own. No synchronization needed.
+| Variable | Read by | Written by |
+|---|---|---|
+| `log_min_level` | Every `log_write` (filter short-circuit) | `log_set_level` |
+| `log_running`, `log_db` | `log_write`, the writer's gate check | `log_init`, `log_shutdown` |
+| `log_systemd_mode` | `print_to_console`, `log_get_systemd_mode` | `log_set_systemd_mode` |
+| `push_db`, `push_cfg`, `push_running` | `push_send` (disabled-contract gate) | `push_init`, `push_shutdown` |
 
-**Config reads:** `config_get_str()` for file-backed keys is read-only after init (no mutex). For DB-backed keys, it goes through `db_execute()` which is mutex-protected.
+### Lifetime ordering
 
-### Thread safety summary
+- **AppGuard owns the threads.** Apps that use `appguard_init` / `appguard_shutdown` get correct startup and shutdown ordering for free.
+- **Direct callers must order init+shutdown carefully.** `db_open` first, then `log_init(db, ...)` and `push_init(db, cfg)`. At shutdown: stop the workers (`push_shutdown`, `log_shutdown`) before `db_close`. The DB is the bottom of the stack.
+- **Iterator scopes must end before `db_close`.** A `cutils_db_iter_t` holds the connection mutex from `db_iter_begin` to `db_iter_end`. See the Streaming queries section under Database.
+- **Stream-callback userdata must outlive in-flight `log_*` calls.** `log_stream_unregister` can return while a concurrent `fire_streams` snapshot still holds a pointer to the just-unregistered slot. Apps that unregister at runtime must keep `userdata` alive until any in-flight `log_*` calls on other threads have returned.
+- **Signal-driven shutdown is one-way.** When the watcher takes the SIGINT/SIGTERM path, it drains the worker queues, runs `atexit` handlers, and `exit(0)`s — the consuming app's `main()` does not return. Resources that need explicit cleanup (e.g. unlinking a pidfile) should be registered via `atexit`.
+
+### Thread-safety quick reference
 
 | Operation | Thread-safe? | Notes |
-|-----------|-------------|-------|
-| `db_*` functions | Yes | Mutex-serialized |
-| `log_*` macros | Yes | Lock-free enqueue with mutex+condvar |
-| `push_send()` | Yes | Mutex-protected |
-| `config_get_*` | Yes | File keys are read-only; DB keys go through `db_execute` |
-| `config_set()` | No | File mutation is not serialized. Call from one thread only. |
-| `config_set_db()` | Yes | Goes through `db_execute_non_query` |
-| `error_loop_*` | No | Each instance should be used from one thread only. |
-| `cutils_get_error()` | Yes | Thread-local, no cross-thread access |
+|---|---|---|
+| `db_*` functions | Yes | Recursive mutex on the connection. |
+| `db_iter_*` | Yes, but **single-iterator-per-thread** | Iterator holds the connection mutex for its full lifetime. Don't try to open two iterators in parallel on the same connection. |
+| `log_*` macros | Yes | Atomic gates + mutex-protected queue. |
+| `push_send`, `push_send_opts` | Yes | DB-backed enqueue + cond-var wake-up. |
+| `config_get_*` | Yes | Recursive mutex on the config handle. |
+| `config_set`, `config_set_db` | Yes | Same recursive mutex. |
+| `error_loop_*` | Yes — per detector | Each detector has its own mutex; one detector instance is safe to share across threads. |
+| `cutils_get_error` / `cutils_set_error_*` | Yes | Thread-local buffer, no cross-thread access. |
 
 ---
 
@@ -1297,6 +1385,7 @@ Declare a variable with one of these attributes and the matching cleanup runs au
 | `CUTILS_LOCK_GUARD(m)` | `pthread_mutex_unlock()` | Scoped mutex lock |
 | `CUTILS_AUTO_DBRES` | `db_result_free()` | `db_result_t *` from `db_execute` |
 | `CUTILS_AUTO_DB_TX` | `db_rollback()` unless committed | Scoped DB transaction |
+| `CUTILS_AUTO_DB_ITER` | `db_iter_end()` | `cutils_db_iter_t *` from `db_iter_begin` (1.1.0+) |
 | `CUTILS_AUTO_JSON_REQ` | `json_req_free()` | `cutils_json_req_t *` |
 | `CUTILS_AUTO_JSON_RESP` | `json_resp_free()` | `cutils_json_resp_t *` |
 | `CUTILS_AUTO_JSON_ITER` | `json_iter_end()` | Stack-allocated `cutils_json_iter_t` |
@@ -1451,7 +1540,9 @@ The pattern for subsystem-local cleanup helpers (DIR, CURL, sqlite3_stmt, etc.) 
 | `make test-asan` | Build and run all tests under AddressSanitizer. |
 | `make check` | Syntax-only compilation check (no object files). |
 | `make analyze` | Static analysis: stack-usage check (64KB limit), `gcc -fanalyzer`, `cppcheck`. |
-| `make lint` | `clang-tidy` analysis with output filtered to warnings and errors. |
+| `make lint` | `clang-tidy` analysis. See `.clang-tidy` for disabled checks (1.1.0+ suppresses Annex K `insecureAPI` noise). |
+| `make bench` | Run the microbenchmark suite (release flags). Output: a per-bench table to stdout plus `build-bench/results.csv` for before/after diffing. See `bench/README.md` for methodology and baseline numbers. (1.1.0+) |
+| `make pc PREFIX=/usr/local` | Generate `libc-utils.pc` from `libc-utils.pc.in` so downstream consumers can discover include/lib paths via `pkg-config --cflags --libs c-utils`. (1.1.0+) |
 | `make clean` | Remove all build artifacts. |
 
 ### Compiler flags
@@ -1504,3 +1595,21 @@ LIBS     = -L$(CUTILS_DIR) -lc-utils -lsqlite3 -lcurl -lcrypto -lpthread
 ```
 
 Build c-utils before building the consuming application. The static library (`libc-utils.a`) and headers are the only interface — there is no install step.
+
+For consumers who'd rather discover paths via pkg-config than hard-code relative directories, generate the `.pc` file with `make pc PREFIX=...`, drop it into the consumer's pkg-config search path, and use `pkg-config --cflags --libs c-utils`.
+
+### Benchmarks (1.1.0+)
+
+The `bench/` directory contains a small auto-calibrating microbench harness for the library's documented hot paths. Run with:
+
+```sh
+make bench                  # full suite
+./build-bench/bin/bench db  # filter by substring
+```
+
+Each run produces:
+
+- A human-readable table on stdout (one row per benchmark).
+- A CSV at `build-bench/results.csv` for `diff`-able before/after comparisons.
+
+See `bench/README.md` for methodology, the per-benchmark setup, baseline numbers, and the recipe for adding new benchmarks.

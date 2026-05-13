@@ -13,7 +13,37 @@
  * All access serialized through the mutex — safe to call from any thread.
  *
  * Query results are returned as a simple row/column structure that the
- * caller frees with db_result_free(). */
+ * caller frees with db_result_free().
+ *
+ * Quick reference:
+ *
+ *   // Open / close
+ *   cutils_db_t *db = NULL;
+ *   db_open(&db, "/path/to/file.db");
+ *   db_open_with_mode(&db, "/path/to/file.db", 0600);  // restrict perms
+ *   db_close(db);
+ *
+ *   // SELECT (materialized, known-small result)
+ *   CUTILS_AUTO_DBRES db_result_t *r = NULL;
+ *   db_execute(db, "SELECT a, b FROM t WHERE c = ?", (const char*[]){ v, NULL }, &r);
+ *   for (int i = 0; i < r->nrows; i++) use(r->rows[i][0]);
+ *
+ *   // SELECT (streaming, unbounded result)
+ *   CUTILS_AUTO_DB_ITER cutils_db_iter_t *it = NULL;
+ *   db_iter_begin(db, "SELECT a, b FROM t", NULL, &it);
+ *   const char **row;
+ *   while (db_iter_next(it, &row)) use(row[0]);
+ *
+ *   // INSERT / UPDATE / DELETE
+ *   db_execute_non_query(db, "INSERT INTO t VALUES (?, ?)",
+ *                        (const char*[]){ v1, v2, NULL }, NULL);
+ *
+ *   // Transaction (auto-rollback on early return)
+ *   CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+ *   cutils_db_tx_begin(db, &tx);
+ *   ... // work
+ *   return db_tx_commit(&tx);
+ */
 
 /* Opaque database handle */
 typedef struct cutils_db cutils_db_t;
