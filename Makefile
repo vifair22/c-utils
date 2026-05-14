@@ -3,6 +3,7 @@ CC          = gcc
 AR          = ar
 BUILD_DIR   = build
 TEST_DIR    = build-test
+BENCH_DIR   = build-bench
 STACK_LIMIT = 65536
 
 # Version embedding. release_version is the source of truth for the semver;
@@ -185,6 +186,51 @@ coverage: clean-test $(TEST_BINS)
 	    --fail-under-line 90
 	@gcovr --root . --object-directory $(TEST_DIR) --filter 'src/' --branches --print-summary 2>/dev/null || true
 
+# --- Benchmarks ---
+# Bench harness lives in bench/. Each bench_*.c contributes a measurement
+# function declared in bench/bench.h; bench_runner.c lists them in
+# bench_table[] and drives auto-calibration + measurement. Output is a
+# human-readable table on stdout plus build-bench/results.csv for
+# before/after diffing across optimization MRs.
+#
+# The bench binary links against a release-flag-built copy of libc-utils
+# in BENCH_DIR, separate from build/ and build-test/ so debug/coverage
+# instrumentation never contaminates the numbers.
+
+BENCH_SRCS     = $(wildcard bench/bench_*.c)
+BENCH_OBJS     = $(patsubst bench/%.c,$(BENCH_DIR)/obj/%.o,$(BENCH_SRCS))
+BENCH_LIB_OBJS = $(patsubst src/%.c,$(BENCH_DIR)/lib/%.o,$(SRCS))
+BENCH_VENDOR_OBJS = $(patsubst lib/cJSON/%.c,$(BENCH_DIR)/vendor/%.o,$(VENDOR))
+BENCH_LIB      = $(BENCH_DIR)/$(LIB)
+BENCH_LIBS     = -L$(BENCH_DIR) -lc-utils -lsqlite3 -lcurl -lcrypto -lpthread
+BENCH_BIN      = $(BENCH_DIR)/bin/bench
+
+$(BENCH_DIR):
+	@mkdir -p $(BENCH_DIR)/obj $(BENCH_DIR)/lib $(BENCH_DIR)/vendor $(BENCH_DIR)/bin
+
+$(BENCH_DIR)/obj/%.o: bench/%.c | $(BENCH_DIR)
+	$(CC) $(CFLAGS) -Iinclude -Ibench -c $< -o $@
+
+$(BENCH_DIR)/lib/%.o: src/%.c | $(BENCH_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BENCH_DIR)/vendor/%.o: lib/cJSON/%.c | $(BENCH_DIR)
+	$(CC) $(CFLAGS) $(VENDOR_RELAX) $(VENDOR_CJSON_ALLOW) -c $< -o $@
+
+$(BENCH_LIB): $(BENCH_LIB_OBJS) $(BENCH_VENDOR_OBJS) | $(BENCH_DIR)
+	$(AR) rcs $@ $^
+
+$(BENCH_BIN): $(BENCH_OBJS) $(BENCH_LIB) | $(BENCH_DIR)
+	$(CC) $(CFLAGS) -Iinclude -Ibench $(BENCH_OBJS) -o $@ $(BENCH_LIBS)
+
+bench: CFLAGS = $(RELEASE_CFLAGS)
+bench: BUILD_TYPE = release
+bench: clean-bench $(BENCH_BIN)
+	@./$(BENCH_BIN)
+
+clean-bench:
+	rm -rf $(BENCH_DIR)
+
 # Static analysis
 ANALYZE_CFLAGS = -std=c11 -D_POSIX_C_SOURCE=200809L $(WARN_FLAGS) -O2 -Iinclude -Ilib/cJSON $(VERSION_DEFINE)
 
@@ -218,6 +264,22 @@ analyze: check
 	    -Iinclude -Ilib/cJSON $(SRCS)
 	@echo "cppcheck: OK"
 
+# --- pkg-config template ---
+# Substitutes @VERSION@ and @PREFIX@ in libc-utils.pc.in to produce
+# libc-utils.pc, suitable for dropping into $(PREFIX)/lib/pkgconfig/.
+# PREFIX defaults to /usr/local; override on the command line:
+#     make pc PREFIX=/opt/local
+
+PREFIX ?= /usr/local
+
+libc-utils.pc: libc-utils.pc.in release_version
+	@sed -e 's|@VERSION@|$(RELEASE_VERSION)|g' \
+	     -e 's|@PREFIX@|$(PREFIX)|g' \
+	     libc-utils.pc.in > $@
+	@echo "generated $@ (Version=$(RELEASE_VERSION), prefix=$(PREFIX))"
+
+pc: libc-utils.pc
+
 # Linting
 lint:
 	@echo "=== clang-tidy ==="
@@ -231,6 +293,7 @@ clean-lib:
 clean-test:
 	rm -rf $(TEST_DIR)
 
-clean: clean-lib clean-test
+clean: clean-lib clean-test clean-bench
+	rm -f libc-utils.pc
 
-.PHONY: check test test-junit test-asan coverage debug asan analyze lint clean clean-lib clean-test
+.PHONY: check test test-junit test-asan coverage debug asan analyze lint bench pc clean clean-lib clean-test clean-bench

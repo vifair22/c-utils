@@ -5,6 +5,118 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.1.0] - 2026-05-13
+
+Performance-aware minor release. One new public API for streaming
+query results, one new piece of infrastructure (microbenchmark
+harness), and a `config_get_str` that is 28× faster than 1.0.3 on
+realistic key counts. No public-header function signatures change;
+all additions are appended.
+
+### Added
+
+- **`db_iter_*`** — streaming query iterator paired with the
+  existing `db_execute`. `db_iter_begin` / `db_iter_next` /
+  `db_iter_end` plus the `CUTILS_AUTO_DB_ITER` cleanup macro deliver
+  rows one-at-a-time without materializing the full result set: O(1)
+  heap regardless of row count, and ~31% faster than `db_execute` on
+  the head-to-head `db_iter_1000_rows` benchmark. The API shape is
+  symmetric with `cutils_json_iter_t` — stack-allocate the loop,
+  `_begin` / `_next` / `_end`, `AUTO_*` for scope-exit cleanup. Use
+  the iterator for SELECTs over unknown or large row counts; keep
+  `db_execute` for known-small queries where an indexable array is
+  ergonomic. Documented in `include/cutils/db.h` with the
+  lifetime-ordering rule (iterator must end before `db_close` on
+  the same connection — let `CUTILS_AUTO_DB_ITER` fire in a nested
+  block, or call `db_iter_end` explicitly).
+- **`db_open_with_mode`** — additive sibling to `db_open` that takes
+  a `mode_t` and unconditionally `chmod`s the database file to the
+  requested mode. Idempotent: the file has the requested mode after
+  the call returns, regardless of whether it was created during the
+  open or already existed. Intended for daemons whose DB holds
+  sensitive data (credentials, audit logs) and that don't want to
+  rely on the calling process's umask. WAL/SHM sidecar files are
+  not chmod'd by this call — set `umask(0077)` before opening if
+  strict perms on those matter.
+- **Config file permission warning** — `config_init` now stats the
+  parsed config file and emits a stderr warning if it's group- or
+  world-readable. c-utils config files commonly hold credentials,
+  so a permissive mode is worth flagging at startup. The warning
+  is non-fatal — the consuming app decides whether to act on it.
+- **Microbenchmark harness** — new `bench/` directory and
+  `make bench` target. Auto-calibrating, release-built, dedicated
+  build tree, CSV output at `build-bench/results.csv` for before/
+  after diffing across optimization branches. Six initial
+  benchmarks cover the library's known hot paths. See
+  `bench/README.md` for methodology, baseline numbers, and the
+  recipe for adding new benchmarks.
+
+### Changed
+
+- **`config_get_str` is ~28× faster** on realistic key counts.
+  Two stacked optimizations:
+  - **`config.c`** — registered keys are indexed in a parallel
+    sorted-by-string array built at the tail of each registration
+    phase (`config_init` and `config_attach_db`). Lookups go
+    through `bsearch` (log₂ N strcmps) instead of a linear scan.
+    Drove the read from ~1889 ns to ~1229 ns on the
+    `bench_config_get_str` 300-key fixture.
+  - **`config_yaml.c`** — `doc->entries` is sorted by
+    (section, key) at the end of `yaml_parse_file`; `yaml_get`
+    and `yaml_set`'s lookup go through `bsearch` via a new
+    `yaml_find_entry` helper. Drove the remaining cost from
+    ~1229 ns to ~67 ns.
+  Behavior is unchanged. `yaml_set` only updates an existing
+  entry's value in place and never adds new entries, so the sort
+  invariant is stable across the doc's lifetime.
+
+### Investigated, rejected
+
+Two optimization attempts didn't clear the cycle's merge bar
+(≥5% improvement on one named benchmark, no regression on any
+other) and were not merged. Documented here so the findings
+aren't lost:
+
+- **`db_execute` strpool** — tried replacing 3000 per-cell
+  `strdup` calls with a single growing arena + offset-table +
+  end-of-loop fixup. Result: **7% regression** on
+  `bench_db_execute_1000_rows`, because the bench's small
+  (~10 byte) cells hit glibc's small-bin allocator fast-path,
+  which is cheaper than maintaining the arena's growth +
+  bookkeeping. The optimization would likely win for cells
+  ≥100 bytes; on the common small-cell case it loses. Callers
+  who need O(1) heap should use the new `db_iter_*` API.
+- **`log_write_db_on` flexible-array-member combine** — tried
+  replacing the two allocations in `enqueue_entry` (struct
+  calloc + message strdup) with a single malloc using a flex-
+  array member at the end of `log_entry_t`. Result: **0.7%
+  improvement** — below the bar. The hot-path cost is dominated
+  by synchronous `fprintf` to stdout, the queue mutex, and the
+  writer-thread `cond_signal` — kernel-side costs that can't be
+  optimized at this layer.
+
+### Performance summary
+
+| Benchmark | 1.0.3 | 1.1.0 | Delta |
+|---|---:|---:|---:|
+| `config_get_str` (300-key registry) | 1889 ns | 67 ns | **−96.5%** (28× faster) |
+| `db_iter_1000_rows` (new API) | — | 138 µs | **31% faster than `db_execute`** on the same fixture |
+| Other hot paths (db_execute, log_write_*, json_parse_walk, push_build_postfields) | unchanged within bench noise |
+
+See `bench/README.md` for the full table, methodology, and the
+hot-path-by-hot-path status (every top-5 hot path is either
+optimized-with-numbers or documented as already-optimal-per-bench).
+
+### Public API / ABI
+
+- **No public-header function signatures changed.**
+- New types and functions added to `<cutils/db.h>`:
+  `cutils_db_iter_t`, `db_iter_begin`, `db_iter_next`,
+  `db_iter_ncols`, `db_iter_col_name`, `db_iter_error`,
+  `db_iter_end`, `db_iter_end_p`, `CUTILS_AUTO_DB_ITER`,
+  `db_open_with_mode`.
+- `db_result_t` layout unchanged.
+
 ## [1.0.3] - 2026-05-13
 
 Round of post-1.0.2 polish. Three internal fixes, no public API or ABI

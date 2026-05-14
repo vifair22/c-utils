@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* --- Helpers --- */
 
@@ -68,34 +69,109 @@ static int needs_quoting(const char *value)
     return 0;
 }
 
-static void doc_add_entry(yaml_doc_t *doc, const char *section,
-                          const char *key, const char *value)
+/* Returns 0 on success, -1 on NOMEM (either the realloc or any of the
+ * three strdups). The previous design silently swallowed alloc
+ * failures, leaving the doc with a missing entry that surfaced later
+ * as a confusing "key not found" instead of the real OOM. NOMEM
+ * branches are LCOV_EXCL'd — alloc failure on a few-hundred-byte
+ * realloc / small strdup is not exercisable from test code without
+ * fault injection. */
+static int doc_add_entry(yaml_doc_t *doc, const char *section,
+                         const char *key, const char *value)
 {
     if (doc->nentries >= doc->capacity) {
         int newcap = doc->capacity ? doc->capacity * 2 : 16;
         yaml_entry_t *tmp = realloc(doc->entries,
                                     (size_t)newcap * sizeof(yaml_entry_t));
-        if (!tmp) return;
+        if (!tmp) return -1;  /* LCOV_EXCL_LINE */
         doc->entries = tmp;
         doc->capacity = newcap;
     }
 
+    char *s = strdup(section);
+    char *k = strdup(key);
+    char *v = strdup(value);
+    /* LCOV_EXCL_START */
+    if (!s || !k || !v) {
+        free(s); free(k); free(v);
+        return -1;
+    }
+    /* LCOV_EXCL_STOP */
+
     yaml_entry_t *e = &doc->entries[doc->nentries++];
-    e->section = strdup(section);
-    e->key = strdup(key);
-    e->value = strdup(value);
+    e->section = s;
+    e->key = k;
+    e->value = v;
+    return 0;
 }
 
-static void doc_add_line(yaml_doc_t *doc, const char *line)
+/* Returns 0 on success, -1 on NOMEM. Same propagation rationale as
+ * doc_add_entry above; same LCOV_EXCL for the alloc-failure branches. */
+static int doc_add_line(yaml_doc_t *doc, const char *line)
 {
     if (doc->nlines >= doc->lines_capacity) {
         int newcap = doc->lines_capacity ? doc->lines_capacity * 2 : 64;
         char **tmp = realloc(doc->lines, (size_t)newcap * sizeof(char *));
-        if (!tmp) return;
+        if (!tmp) return -1;  /* LCOV_EXCL_LINE */
         doc->lines = tmp;
         doc->lines_capacity = newcap;
     }
-    doc->lines[doc->nlines++] = strdup(line);
+    char *l = strdup(line);
+    if (!l) return -1;  /* LCOV_EXCL_LINE */
+    doc->lines[doc->nlines++] = l;
+    return 0;
+}
+
+/* --- Entry lookup ---
+ *
+ * Entries are sorted by (section, key) at the end of yaml_parse_file,
+ * letting yaml_get / yaml_set find a row via bsearch in O(log n).
+ * The sort is stable across the doc's lifetime: yaml_set only updates
+ * an existing entry's value (never changes section/key or appends),
+ * and the doc is otherwise immutable post-parse. */
+
+static int yaml_entry_cmp(const void *a, const void *b)
+{
+    const yaml_entry_t *ea = a;
+    const yaml_entry_t *eb = b;
+    int rc = strcmp(ea->section, eb->section);
+    if (rc) return rc;
+    return strcmp(ea->key, eb->key);
+}
+
+/* Find the entry index for a dot-notation key. Returns -1 if not
+ * found or if dotkey is malformed (no dot, or section name overflows
+ * the small stack buffer). */
+static int yaml_find_entry(const yaml_doc_t *doc, const char *dotkey)
+{
+    if (!doc || doc->nentries == 0) return -1;
+    const char *dot = strchr(dotkey, '.');
+    if (!dot) return -1;
+    size_t seclen = (size_t)(dot - dotkey);
+
+    char secbuf[128];
+    char keybuf[256];
+    if (seclen >= sizeof(secbuf)) return -1;
+    memcpy(secbuf, dotkey, seclen);
+    secbuf[seclen] = '\0';
+
+    size_t klen = strlen(dot + 1);
+    if (klen >= sizeof(keybuf)) return -1;
+    memcpy(keybuf, dot + 1, klen + 1);
+
+    /* bsearch's search key is a yaml_entry_t with section / key
+     * populated; the comparator only reads those fields. Stack copies
+     * avoid casting away const on the caller's dotkey. */
+    yaml_entry_t needle;
+    needle.section = secbuf;
+    needle.key     = keybuf;
+    needle.value   = NULL;
+
+    const yaml_entry_t *hit = bsearch(
+        &needle, doc->entries, (size_t)doc->nentries,
+        sizeof(*doc->entries), yaml_entry_cmp);
+    if (!hit) return -1;
+    return (int)(hit - doc->entries);
 }
 
 /* --- Parser --- */
@@ -117,7 +193,13 @@ yaml_doc_t *yaml_parse_file(const char *path)
         strncpy(raw, line, sizeof(raw) - 1);
         raw[sizeof(raw) - 1] = '\0';
         strip_trailing_whitespace(raw);
-        doc_add_line(doc, raw);
+        /* LCOV_EXCL_START — NOMEM propagation; not exercisable from
+         * test code without fault injection. */
+        if (doc_add_line(doc, raw) != 0) {
+            yaml_free(doc);
+            return NULL;
+        }
+        /* LCOV_EXCL_STOP */
 
         /* Skip blank lines and comments */
         const char *trimmed = skip_whitespace(line);
@@ -160,10 +242,25 @@ yaml_doc_t *yaml_parse_file(const char *path)
                 strip_trailing_whitespace(key);
                 strip_comment_and_unquote(val);
                 strip_trailing_whitespace(val);
-                doc_add_entry(doc, current_section, key, val);
+                /* LCOV_EXCL_START — NOMEM propagation. */
+                if (doc_add_entry(doc, current_section, key, val) != 0) {
+                    yaml_free(doc);
+                    return NULL;
+                }
+                /* LCOV_EXCL_STOP */
             }
         }
     }
+
+    /* Sort entries by (section, key) so yaml_get / yaml_set can
+     * bsearch in O(log n) instead of walking every entry. The raw
+     * doc->lines array (used for comment-preserving rewrite in
+     * yaml_write_file) is independent of entries and stays in source
+     * order. yaml_set updates an existing entry's value in place but
+     * never adds new entries, so the sort invariant is stable for
+     * the lifetime of the doc. */
+    qsort(doc->entries, (size_t)doc->nentries, sizeof(*doc->entries),
+          yaml_entry_cmp);
 
     return doc;
 }
@@ -190,48 +287,27 @@ void yaml_free(yaml_doc_t *doc)
 
 const char *yaml_get(const yaml_doc_t *doc, const char *dotkey)
 {
-    /* Split "section.key" */
-    const char *dot = strchr(dotkey, '.');
-    if (!dot) return NULL;
-
-    size_t seclen = (size_t)(dot - dotkey);
-    const char *key = dot + 1;
-
-    for (int i = 0; i < doc->nentries; i++) {
-        if (strlen(doc->entries[i].section) == seclen &&
-            strncmp(doc->entries[i].section, dotkey, seclen) == 0 &&
-            strcmp(doc->entries[i].key, key) == 0) {
-            return doc->entries[i].value;
-        }
-    }
-
-    return NULL;
+    int idx = yaml_find_entry(doc, dotkey);
+    return idx >= 0 ? doc->entries[idx].value : NULL;
 }
 
 /* --- Mutation --- */
 
 int yaml_set(yaml_doc_t *doc, const char *dotkey, const char *value)
 {
-    /* Update structured entry */
+    /* Update structured entry. The bsearch finds the entry; updating
+     * value in place doesn't change the sort key, so the sorted-by-
+     * (section, key) invariant established at parse time is
+     * preserved. */
+    int idx = yaml_find_entry(doc, dotkey);
+    if (idx < 0) return -1;
+    free(doc->entries[idx].value);
+    doc->entries[idx].value = strdup(value);
+
     const char *dot = strchr(dotkey, '.');
     if (!dot) return -1;
-
     size_t seclen = (size_t)(dot - dotkey);
     const char *key = dot + 1;
-    int found = 0;
-
-    for (int i = 0; i < doc->nentries; i++) {
-        if (strlen(doc->entries[i].section) == seclen &&
-            strncmp(doc->entries[i].section, dotkey, seclen) == 0 &&
-            strcmp(doc->entries[i].key, key) == 0) {
-            free(doc->entries[i].value);
-            doc->entries[i].value = strdup(value);
-            found = 1;
-            break;
-        }
-    }
-
-    if (!found) return -1;
 
     /* Update raw lines — find the line with this key under the right section */
     char cur_sec[128] = "";
@@ -367,5 +443,12 @@ int yaml_generate_template(const char *path,
         }
     }
 
+    /* Default-safe permissions: generated templates often hold blank
+     * credential slots (pushover.token, etc.) that the user will fill
+     * in. Make the file 0600 from the start so it doesn't sit at the
+     * umask default (often 0644 = world-readable) between template
+     * generation and the user's first chmod. Caller may chmod after
+     * the fact if a more relaxed mode is intended. */
+    chmod(path, 0600);
     return 0;
 }

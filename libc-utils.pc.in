@@ -1,0 +1,21 @@
+# pkg-config template for c-utils.
+# Substituted at build time by the Makefile's `make pc` target using
+# @VERSION@ from release_version and @PREFIX@ from the install prefix.
+# Output: libc-utils.pc — drop into $(PREFIX)/lib/pkgconfig/ for
+# downstream consumers to discover include/lib paths via
+# `pkg-config --cflags --libs c-utils`.
+
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: c-utils
+Description: Shared C application framework (config, db, log, push, JSON)
+URL: https://git.airies.net/vifair22/c-utils
+Version: @VERSION@
+
+Requires.private: sqlite3 libcurl libcrypto
+Libs: -L${libdir} -lc-utils
+Libs.private: -lsqlite3 -lcurl -lcrypto -lpthread
+Cflags: -I${includedir}
