@@ -391,6 +391,20 @@ This is idempotent: after the call returns the file has the requested mode, whet
 
 WAL/SHM sidecars caveat: sqlite creates `path-wal` and `path-shm` lazily on the first write transaction; their mode is determined by the umask at that moment. If you need strict perms on the sidecars too, set `umask(0077)` before opening so subsequent WAL/SHM creates inherit the restriction.
 
+**Recommended for daemons (1.2.0+)**: let AppGuard handle the full perm dance via `appguard_config_t.db_mode` and `.config_mode`. AppGuard narrows the umask around the DB-open and migration phase so sqlite materializes the sidecars at the right mode, chmod's all three artifacts explicitly after migrations for idempotency, and restores the umask before returning so the change doesn't bleed into the running application:
+
+```c
+appguard_config_t cfg = {
+    .app_name    = "my-daemon",
+    .db_mode     = 0600,   /* .db + .db-wal + .db-shm */
+    .config_mode = 0600,   /* YAML config file */
+    /* ... */
+};
+appguard_t *guard = appguard_init(&cfg);
+```
+
+Set once, forget — no `umask` call required in the app, no follow-up chmod, no knowledge of sqlite sidecar internals. Chmod failure during init is a hard error (`appguard_init` returns NULL). See `include/cutils/appguard.h` for the field documentation, including the mid-session SHM-recreate edge case.
+
 ### Transactions
 
 ```c
