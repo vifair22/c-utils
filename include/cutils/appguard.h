@@ -1,6 +1,8 @@
 #ifndef CUTILS_APPGUARD_H
 #define CUTILS_APPGUARD_H
 
+#include <sys/types.h>           /* mode_t */
+
 #include "cutils/config.h"
 #include "cutils/db.h"
 #include "cutils/log.h"
@@ -53,6 +55,47 @@ typedef struct {
     /* App migrations (compiled runs first if both are set) */
     const db_migration_t   *migrations;      /* compiled-in app migrations, NULL = none */
     const char             *migrations_dir;  /* path to app .sql migrations, NULL = none */
+
+    /* --- File-permission enforcement (1.2.0) ---
+     *
+     * When nonzero, AppGuard chmod's the named artifact(s) to this
+     * mode during init. When 0, file permissions are left at whatever
+     * umask / pre-existing perms produced (current 1.1.0 behavior).
+     *
+     * Typical use for a daemon holding sensitive data:
+     *   .db_mode     = 0600,
+     *   .config_mode = 0600,
+     *
+     * Failure to chmod is a hard error during init — appguard_init
+     * returns NULL and the partially-built guard is torn down. The
+     * rationale: opting in to a mode value is a contract assertion
+     * ("the file MUST be at this mode"); falling back to a more
+     * permissive mode silently would undercut that contract. */
+
+    /* When nonzero, the DB file and its sqlite sidecars (.db-wal,
+     * .db-shm) are chmod'd to this mode. To make sqlite create the
+     * sidecars with restrictive perms in the first place (avoiding a
+     * microsecond race window during init), AppGuard temporarily sets
+     * the process umask to ~db_mode & 0777 around the DB-open and
+     * migration phases and restores it before init returns. The umask
+     * change is localized — it does NOT bleed into the running
+     * application.
+     *
+     * Mid-session edge case: if an external process deletes a sidecar
+     * file while the daemon is running and sqlite recreates it, the
+     * new file inherits the application's then-current umask, not
+     * db_mode. Daemons that need protection against this rare case
+     * should set umask(0077) themselves at startup. */
+    mode_t                  db_mode;
+
+    /* When nonzero, the YAML config file is chmod'd to this mode
+     * after config_init successfully parses it (and after first-run
+     * template generation, when applicable). When 0, the file's
+     * mode is left at whatever umask / pre-existing perms produced —
+     * c-utils does not nag about permissive config files, because
+     * leaving it alone is a legitimate choice the application
+     * author has expressed by not setting this field. */
+    mode_t                  config_mode;
 } appguard_config_t;
 
 /* Opaque handle */
