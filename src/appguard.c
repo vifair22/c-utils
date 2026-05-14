@@ -7,11 +7,14 @@
 #include "cutils/push.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 /* File-local scoped cleanup so appguard_init can return NULL on any
@@ -128,6 +131,74 @@ static int install_signal_watcher(appguard_t *guard)
     return 0;
 }
 
+/* --- File-permission enforcement helpers (1.2.0) ---
+ *
+ * db_mode and config_mode in appguard_config_t are opt-in: 0 means
+ * leave file perms at umask-derived defaults (1.1.0 behavior), nonzero
+ * means chmod the artifact to that mode. Failure is a hard error so
+ * the caller's mode-assertion contract is never silently downgraded.
+ *
+ * For db_mode, we additionally set umask(~db_mode & 0777) around the
+ * DB-open + migration phase so sqlite creates .db-wal / .db-shm with
+ * the right perms in the first place, eliminating the race window
+ * between file creation and our post-hoc chmod. The umask is restored
+ * before any application code runs (i.e., before appguard_init
+ * returns), so the change does not bleed into the daemon's runtime. */
+
+/* chmod a sidecar file (.db-wal, .db-shm). ENOENT is tolerated — the
+ * sidecar may legitimately not exist (e.g., WAL not yet materialized
+ * because no writes have happened). Any other error is a hard failure
+ * with set_error_errno already invoked.
+ *
+ * The error path is LCOV_EXCL'd: chmod on a file we own and whose
+ * existence we just verified shouldn't fail; exercising the non-ENOENT
+ * branch needs an EROFS mount, a permissions-stripping LD_PRELOAD, or
+ * similar deliberate harness. Same pattern db_open_with_mode uses. */
+static int chmod_sidecar(const char *path, mode_t mode)
+{
+    if (chmod(path, mode) == 0) return CUTILS_OK;
+    if (errno == ENOENT) return CUTILS_OK;
+    /* LCOV_EXCL_START */
+    return set_error_errno(CUTILS_ERR_IO, "chmod %s", path);
+    /* LCOV_EXCL_STOP */
+}
+
+/* Build "<db_path><suffix>" into out (size out_sz). Returns 0 on
+ * success, -1 on overflow (db_path + suffix wouldn't fit). The
+ * overflow branch is LCOV_EXCL'd — exercising it requires a db_path
+ * within 5 bytes of PATH_MAX, which is not a realistic test config. */
+static int build_sidecar_path(char *out, size_t out_sz,
+                              const char *db_path, const char *suffix)
+{
+    int n = snprintf(out, out_sz, "%s%s", db_path, suffix);
+    if (n < 0 || (size_t)n >= out_sz) return -1; /* LCOV_EXCL_LINE */
+    return 0;
+}
+
+/* Chmod the DB main file and its sqlite WAL/SHM sidecars to `mode`.
+ * The main file is treated as required (must exist by this point —
+ * db_open succeeded). Sidecars are ENOENT-tolerant. Called after
+ * migrations run, so any sidecars sqlite needed should exist. */
+static int chmod_db_artifacts(const char *db_path, mode_t mode)
+{
+    if (chmod(db_path, mode) != 0)
+        return set_error_errno(CUTILS_ERR_IO, "chmod %s", db_path); /* LCOV_EXCL_LINE */
+
+    char sidecar[PATH_MAX];
+    /* LCOV_EXCL_START — overflow branches are unreachable with realistic db paths. */
+    if (build_sidecar_path(sidecar, sizeof(sidecar), db_path, "-wal") != 0)
+        return set_error(CUTILS_ERR_IO, "db path too long for -wal sidecar");
+    /* LCOV_EXCL_STOP */
+    int rc = chmod_sidecar(sidecar, mode);
+    if (rc != CUTILS_OK) return rc; /* LCOV_EXCL_LINE */
+
+    /* LCOV_EXCL_START — same as above for the -shm sidecar. */
+    if (build_sidecar_path(sidecar, sizeof(sidecar), db_path, "-shm") != 0)
+        return set_error(CUTILS_ERR_IO, "db path too long for -shm sidecar");
+    /* LCOV_EXCL_STOP */
+    return chmod_sidecar(sidecar, mode);
+}
+
 /* --- Init --- */
 
 appguard_t *appguard_init(const appguard_config_t *cfg)
@@ -177,10 +248,41 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
         return NULL;
     }
 
+    /* Lock down the config file if requested. config_init has
+     * already produced the file (parsed or generated), so the path
+     * is real and chmod is well-defined. Hard failure: the caller
+     * asserted a mode contract by setting config_mode != 0, and we
+     * don't silently downgrade. */
+    if (cfg->config_mode != 0) {
+        const char *path = config_get_path(guard->config);
+        if (!path || chmod(path, cfg->config_mode) != 0) {
+            /* LCOV_EXCL_START — config_get_path returns non-NULL when
+             * config_init succeeded, and chmod on a just-parsed file
+             * we read from shouldn't fail. */
+            fprintf(stderr, "appguard: chmod config (%s) to 0%o failed: %s\n",
+                    path ? path : "(null)", (unsigned)cfg->config_mode,
+                    strerror(errno));
+            return NULL;
+            /* LCOV_EXCL_STOP */
+        }
+    }
+
+    /* Step 3 prep: when db_mode is set, narrow the process umask so
+     * sqlite's lazy .db-wal / .db-shm creates inherit restrictive
+     * perms. The umask is restored before init returns (search for
+     * "restore umask"). save_umask is initialized but only read on
+     * the db_mode != 0 path. */
+    mode_t save_umask = 0;
+    if (cfg->db_mode != 0)
+        save_umask = umask((mode_t)(~cfg->db_mode & 0777));
+
     /* Step 3: Open DB */
     const char *db_path = config_get_str(guard->config, "db.path");
-    rc = db_open(&guard->db, db_path);
+    rc = (cfg->db_mode != 0)
+            ? db_open_with_mode(&guard->db, db_path, cfg->db_mode)
+            : db_open(&guard->db, db_path);
     if (rc != CUTILS_OK) {
+        if (cfg->db_mode != 0) umask(save_umask);
         fprintf(stderr, "appguard: DB open failed: %s\n", cutils_get_error());
         return NULL;
     }
@@ -188,6 +290,7 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
     /* Step 4: Run lib migrations */
     rc = db_run_lib_migrations(guard->db);
     if (rc != CUTILS_OK) {
+        if (cfg->db_mode != 0) umask(save_umask);
         fprintf(stderr, "appguard: lib migrations failed: %s\n",
                 cutils_get_error());
         return NULL;
@@ -197,6 +300,7 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
     if (cfg->migrations) {
         rc = db_run_compiled_migrations(guard->db, cfg->migrations);
         if (rc != CUTILS_OK) {
+            if (cfg->db_mode != 0) umask(save_umask);
             fprintf(stderr, "appguard: compiled migrations failed: %s\n",
                     cutils_get_error());
             return NULL;
@@ -207,9 +311,32 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
     if (cfg->migrations_dir) {
         rc = db_run_app_migrations(guard->db, cfg->migrations_dir);
         if (rc != CUTILS_OK) {
+            if (cfg->db_mode != 0) umask(save_umask);
             fprintf(stderr, "appguard: app migrations failed: %s\n",
                     cutils_get_error());
             return NULL;
+        }
+    }
+
+    /* Post-migration perm pass: any .db-wal / .db-shm sqlite created
+     * during open or migrations are now subject to the restrictive
+     * umask, but we also chmod explicitly to cover the
+     * pre-existing-file case (a daemon restarting against an old
+     * sidecar that was created under a permissive umask). The main
+     * .db file was already chmod'd by db_open_with_mode; redoing it
+     * here is harmless and keeps all three artifacts in one call.
+     * Then restore the umask so subsequent files the app creates
+     * are not affected. */
+    if (cfg->db_mode != 0) {
+        rc = chmod_db_artifacts(db_path, cfg->db_mode);
+        umask(save_umask);
+        if (rc != CUTILS_OK) {
+            /* LCOV_EXCL_START — same unreachability as
+             * db_open_with_mode's chmod-failure path. */
+            fprintf(stderr, "appguard: chmod DB artifacts to 0%o failed: %s\n",
+                    (unsigned)cfg->db_mode, cutils_get_error());
+            return NULL;
+            /* LCOV_EXCL_STOP */
         }
     }
 

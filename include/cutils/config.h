@@ -115,6 +115,13 @@ int config_init(cutils_config_t **cfg,
 /* Free the config handle. */
 void config_free(cutils_config_t *cfg);
 
+/* Returns the resolved YAML config file path the handle is bound to.
+ * Useful for callers that need to operate on the file directly (e.g.,
+ * chmod after parsing for credential-bearing configs). The returned
+ * pointer is owned by the config handle and remains valid until
+ * config_free. Returns NULL if cfg is NULL. */
+const char *config_get_path(const cutils_config_t *cfg);
+
 /* --- Read API (file-backed keys) --- */
 
 /* Get a string value. Returns the value or default.

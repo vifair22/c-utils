@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <setjmp.h>
 #include <cmocka.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -760,6 +761,284 @@ static void test_sigterm_clean_exit(void **state)
     assert_int_equal(WEXITSTATUS(status), 0);
 }
 
+/* --- File-permission enforcement (1.2.0) --- */
+
+static mode_t file_mode(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return st.st_mode & 0777;
+}
+
+/* db_mode = 0 (default / unset): existing 1.1.0 behavior preserved.
+ * The DB file's mode is whatever the calling process's umask
+ * produced; no chmod is performed by appguard. We can't pin a
+ * specific value here because the test runner's umask varies, but
+ * we can assert that the file exists. The "no chmod was performed"
+ * property is exercised implicitly by the no-bleed test below. */
+static void test_db_mode_zero_unchanged(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n");
+
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+        /* .db_mode = 0 (implicit) */
+    };
+
+    appguard_t *guard = appguard_init(&cfg);
+    assert_non_null(guard);
+
+    struct stat st;
+    assert_int_equal(stat(TEST_DB, &st), 0);
+
+    appguard_shutdown(guard);
+}
+
+/* db_mode != 0: the main DB file and any sqlite sidecars that have
+ * been materialized by the time appguard_init returns are all at the
+ * requested mode. WAL is created on first write (which happens during
+ * lib migrations); SHM is created when sqlite opens in WAL mode. Both
+ * should exist by the time we observe. */
+static void test_db_mode_enforces_main_and_sidecars(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n");
+
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+        .db_mode = 0600,
+    };
+
+    appguard_t *guard = appguard_init(&cfg);
+    assert_non_null(guard);
+
+    assert_int_equal((int)file_mode(TEST_DB), 0600);
+    /* Sidecars are ENOENT-tolerant in the implementation, but in
+     * practice both should exist after migrations. If a future
+     * sqlite or build flag changes that, the test still passes for
+     * the ones that do exist — we only assert on existing files. */
+    if (access(TEST_DB "-wal", F_OK) == 0)
+        assert_int_equal((int)file_mode(TEST_DB "-wal"), 0600);
+    if (access(TEST_DB "-shm", F_OK) == 0)
+        assert_int_equal((int)file_mode(TEST_DB "-shm"), 0600);
+
+    appguard_shutdown(guard);
+}
+
+/* db_mode != 0 against a pre-existing DB file with permissive perms:
+ * the post-init mode must match db_mode regardless of the file's
+ * starting state. Covers the "daemon restart against an old DB
+ * created under a permissive umask" case. */
+static void test_db_mode_idempotent_on_existing(void **state)
+{
+    (void)state;
+    /* Seed a pre-existing DB with loose perms. */
+    cutils_db_t *seed = NULL;
+    assert_int_equal(db_open(&seed, TEST_DB), CUTILS_OK);
+    db_close(seed);
+    assert_int_equal(chmod(TEST_DB, 0644), 0);
+    assert_int_equal((int)file_mode(TEST_DB), 0644);
+
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n");
+
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+        .db_mode = 0600,
+    };
+
+    appguard_t *guard = appguard_init(&cfg);
+    assert_non_null(guard);
+
+    assert_int_equal((int)file_mode(TEST_DB), 0600);
+
+    appguard_shutdown(guard);
+}
+
+/* No bleed: the localized umask used during DB init must be restored
+ * before appguard_init returns. Set a known-permissive umask before
+ * init, run init with db_mode=0600, then create a sentinel file
+ * AFTER init returns — its perms should reflect the test's umask,
+ * not the 0077 we used internally. This is the load-bearing
+ * regression check for the "umask change does not bleed into the
+ * application" contract. */
+static void test_db_mode_no_umask_bleed(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n");
+
+    /* Permissive umask so a sentinel file would be 0666 & ~0000 = 0666.
+     * If appguard leaked its 0077 umask, the sentinel would be 0600. */
+    mode_t prev = umask(0000);
+
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+        .db_mode = 0600,
+    };
+
+    appguard_t *guard = appguard_init(&cfg);
+    assert_non_null(guard);
+
+    /* Create a sentinel file under whatever umask is now active.
+     * O_CREAT requests mode 0666; the kernel applies umask. With
+     * umask(0000) — restored — the file is 0666. */
+    const char *sentinel = "/tmp/cutils_test_appguard.sentinel";
+    int fd = open(sentinel, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+    assert_true(fd >= 0);
+    close(fd);
+
+    assert_int_equal((int)file_mode(sentinel), 0666);
+
+    unlink(sentinel);
+    appguard_shutdown(guard);
+    umask(prev);
+}
+
+/* config_mode != 0: the config file is chmod'd to the requested mode
+ * after parsing. Covers both the explicit-mode and warning-suppression
+ * angles (1.1.0's permissive-mode warning is moot once we've enforced
+ * the mode ourselves). */
+static void test_config_mode_enforces(void **state)
+{
+    (void)state;
+    /* Note: write_file() chmods 0600 — explicitly chmod 0644 here so
+     * we can prove the config_mode field changed it to 0600. */
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n");
+    assert_int_equal(chmod(TEST_CFG, 0644), 0);
+    assert_int_equal((int)file_mode(TEST_CFG), 0644);
+
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+        .config_mode = 0600,
+    };
+
+    appguard_t *guard = appguard_init(&cfg);
+    assert_non_null(guard);
+
+    assert_int_equal((int)file_mode(TEST_CFG), 0600);
+
+    appguard_shutdown(guard);
+}
+
+/* Both modes set together — the typical daemon configuration.
+ * Verifies they compose correctly and don't interfere with each
+ * other (e.g., the config chmod happens before the umask is
+ * narrowed for DB init). */
+static void test_db_and_config_mode_combined(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n");
+    assert_int_equal(chmod(TEST_CFG, 0644), 0);
+
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+        .db_mode = 0600,
+        .config_mode = 0640,
+    };
+
+    appguard_t *guard = appguard_init(&cfg);
+    assert_non_null(guard);
+
+    assert_int_equal((int)file_mode(TEST_DB),  0600);
+    assert_int_equal((int)file_mode(TEST_CFG), 0640);
+
+    appguard_shutdown(guard);
+}
+
+/* Failed migration with db_mode set: the migration error path must
+ * restore the test's original umask before returning NULL. Covers the
+ * umask-restore-on-error logic in appguard_init's migration branches.
+ * Without this test, the umask save/restore lines on the error paths
+ * are uncovered. */
+static void test_db_mode_migration_failure_restores_umask(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n");
+
+    const db_migration_t bad_migs[] = {
+        { "001_bad.sql", "THIS IS NOT VALID SQL;" },
+        { NULL, NULL }
+    };
+
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+        .db_mode = 0600,
+        .migrations = bad_migs,
+    };
+
+    mode_t prev = umask(0022);
+    assert_null(appguard_init(&cfg));
+
+    /* Confirm umask was restored to 0022 (not left at the
+     * appguard-internal 0177) by checking the value of a no-op umask
+     * call — umask() returns the previous value, so the next call
+     * also reads back what we just set. */
+    mode_t observed = umask(prev);
+    assert_int_equal((int)observed, 0022);
+}
+
+/* config_get_path accessor — load-bearing for appguard's config-chmod
+ * path. Verify it returns the configured path. */
+static void test_config_get_path_accessor(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n");
+
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+    };
+
+    appguard_t *guard = appguard_init(&cfg);
+    assert_non_null(guard);
+
+    const char *path = config_get_path(appguard_config(guard));
+    assert_non_null(path);
+    assert_string_equal(path, TEST_CFG);
+    assert_null(config_get_path(NULL));
+
+    appguard_shutdown(guard);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -792,6 +1071,14 @@ int main(void)
         cmocka_unit_test_teardown(test_systemd_autodetect_on_no_env, teardown),
         cmocka_unit_test_teardown(test_retention_days, teardown),
         cmocka_unit_test_teardown(test_sigterm_clean_exit, teardown),
+        cmocka_unit_test_teardown(test_db_mode_zero_unchanged, teardown),
+        cmocka_unit_test_teardown(test_db_mode_enforces_main_and_sidecars, teardown),
+        cmocka_unit_test_teardown(test_db_mode_idempotent_on_existing, teardown),
+        cmocka_unit_test_teardown(test_db_mode_no_umask_bleed, teardown),
+        cmocka_unit_test_teardown(test_config_mode_enforces, teardown),
+        cmocka_unit_test_teardown(test_db_and_config_mode_combined, teardown),
+        cmocka_unit_test_teardown(test_db_mode_migration_failure_restores_umask, teardown),
+        cmocka_unit_test_teardown(test_config_get_path_accessor, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
