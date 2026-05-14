@@ -520,6 +520,11 @@ void config_free(cutils_config_t *cfg)
     free(cfg);
 }
 
+const char *config_get_path(const cutils_config_t *cfg)
+{
+    return cfg ? cfg->config_path : NULL;
+}
+
 /* --- DB config integration --- */
 
 /* Find the cache slot for `key`, creating it if missing. Returns NULL on

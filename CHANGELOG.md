@@ -5,6 +5,64 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.2.0] - 2026-05-13
+
+Security-focused minor release. Wires the v1.1.0 `db_open_with_mode`
+primitive through the AppGuard lifecycle manager so daemons get
+end-to-end perm enforcement on the DB, its sqlite sidecars, and the
+config file with three new `appguard_config_t` fields and zero
+application-side umask gymnastics. No public-header function
+signatures change; the additions are two new fields and one new
+accessor.
+
+### Added
+
+- **`appguard_config_t.db_mode`** — when nonzero, the database file
+  and its `.db-wal` / `.db-shm` sidecars all end up at this mode by
+  the time `appguard_init` returns. Internally, AppGuard narrows the
+  process umask to `~db_mode & 0777` for the duration of the DB-open
+  and migration phase (so sqlite materializes the sidecars with the
+  right perms in the first place), then chmod's all three artifacts
+  explicitly (idempotent — handles pre-existing files from a prior
+  run under a more permissive umask), and finally restores the
+  caller's original umask before returning. The umask change is
+  scoped to internal init steps only and does **not** bleed into the
+  running application — files the daemon creates after init still
+  honor whatever umask the app sets. Documented mid-session edge
+  case: if an external process deletes a sidecar and sqlite recreates
+  it, the new file inherits the app's then-current umask; daemons
+  needing protection against this rare case should set `umask(0077)`
+  themselves at startup.
+- **`appguard_config_t.config_mode`** — when nonzero, the YAML config
+  file is chmod'd to this mode after `config_init` parses it (and
+  after first-run template generation, when applicable). Supersedes
+  the v1.1.0 permissive-mode stderr warning when opted in — the
+  warning still fires when this field is 0 and the file is
+  group/world-readable.
+- **`config_get_path(cfg)`** — accessor returning the resolved YAML
+  config file path the handle is bound to. Used internally by
+  AppGuard to drive the `config_mode` chmod, but available to any
+  caller that needs to operate on the config file directly (e.g.,
+  reload-on-SIGHUP patterns that want to stat the file).
+
+### Behavior
+
+- Both fields default to `0` (additive change — existing callers
+  retain v1.1.0 behavior exactly).
+- Chmod failures during init are **hard errors**: `appguard_init`
+  tears down the partially-built guard and returns NULL. Rationale:
+  setting `db_mode` or `config_mode` is a contract assertion ("the
+  file MUST be at this mode"), and silently falling back to a more
+  permissive mode would undercut that contract.
+
+### Public API / ABI
+
+- No public-header function signatures changed.
+- New fields appended to the end of `appguard_config_t`:
+  `db_mode`, `config_mode` (both `mode_t`).
+- New function added to `<cutils/config.h>`: `config_get_path`.
+- `appguard.h` now includes `<sys/types.h>` for `mode_t`.
+
 ## [1.1.0] - 2026-05-13
 
 Performance-aware minor release. One new public API for streaming
