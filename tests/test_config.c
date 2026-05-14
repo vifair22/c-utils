@@ -33,10 +33,11 @@ static void write_file(const char *path, const char *content)
     assert_non_null(f);
     fputs(content, f);
     fclose(f);
-    /* chmod 0600 so the new config_init permissive-mode warning
-     * (introduced in 1.1.0) doesn't fire on every test that writes a
-     * config file. Tests that specifically exercise the warning path
-     * chmod the file back to a permissive mode after this returns. */
+    /* chmod 0600 — tests using this helper produce config files
+     * holding stand-in credentials; restrictive perms keep the test
+     * tree tidy and match what a real-world app would have on the
+     * file. Tests that need a specific mode chmod the file
+     * themselves after this returns. */
     chmod(path, 0600);
 }
 
@@ -348,29 +349,6 @@ static void test_env_not_observed_after_init(void **state)
     setenv("TESTAPP_DB_PATH", "late_value.db", 1);
     assert_string_equal(config_get_str(cfg, "db.path"), "file_value.db");
 
-    config_free(cfg);
-}
-
-/* config_init emits a stderr warning when the config file is group-
- * or world-readable, since these files often hold credentials. The
- * warning is non-fatal — config_init still succeeds. This test
- * exercises the "permissive mode" path. The warning message itself
- * isn't validated (it goes to stderr and we don't want to add
- * stream-capture machinery for one path), but the lines run and the
- * call returns OK. */
-static void test_permissive_config_file_warns_non_fatal(void **state)
-{
-    (void)state;
-    write_file(TEST_CFG, "db:\n  path: test.db\n");
-    /* Force group/world-readable. */
-    assert_int_equal(chmod(TEST_CFG, 0644), 0);
-
-    cutils_config_t *cfg = NULL;
-    assert_int_equal(config_init(&cfg, "testapp", TEST_CFG,
-                                 CFG_FIRST_RUN_CONTINUE, NULL, NULL),
-                     CUTILS_OK);
-    /* Reading works fine — warning is informational only. */
-    assert_string_equal(config_get_str(cfg, "db.path"), "test.db");
     config_free(cfg);
 }
 
@@ -996,7 +974,6 @@ int main(void)
         cmocka_unit_test_teardown(test_get_str_default, teardown),
         cmocka_unit_test_teardown(test_get_env_override, teardown_env),
         cmocka_unit_test_teardown(test_env_not_observed_after_init, teardown_env),
-        cmocka_unit_test_teardown(test_permissive_config_file_warns_non_fatal, teardown),
         cmocka_unit_test_teardown(test_set_file_key, teardown),
         cmocka_unit_test_teardown(test_set_internal_key_fails, teardown),
         cmocka_unit_test_teardown(test_set_unknown_key_fails, teardown),

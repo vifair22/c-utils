@@ -35,10 +35,9 @@ accessor.
   themselves at startup.
 - **`appguard_config_t.config_mode`** — when nonzero, the YAML config
   file is chmod'd to this mode after `config_init` parses it (and
-  after first-run template generation, when applicable). Supersedes
-  the v1.1.0 permissive-mode stderr warning when opted in — the
-  warning still fires when this field is 0 and the file is
-  group/world-readable.
+  after first-run template generation, when applicable). When 0, the
+  file's mode is left alone (see Removed for the corresponding drop
+  of the v1.1.0 permissive-mode warning).
 - **`config_get_path(cfg)`** — accessor returning the resolved YAML
   config file path the handle is bound to. Used internally by
   AppGuard to drive the `config_mode` chmod, but available to any
@@ -54,6 +53,20 @@ accessor.
   setting `db_mode` or `config_mode` is a contract assertion ("the
   file MUST be at this mode"), and silently falling back to a more
   permissive mode would undercut that contract.
+
+### Removed
+
+- **Permissive-mode config file warning (1.1.0)** — `config_init` no
+  longer stats the config file and emits a stderr warning when it's
+  group- or world-readable. The warning second-guessed a choice the
+  application author has implicitly made by not setting
+  `config_mode`: if they wanted enforcement, they would have asked
+  for it. With `config_mode` available as the explicit "I want this
+  mode" expression, the warning was redundant noise — and worse,
+  fired before the chmod when an app set `config_mode` against a
+  pre-existing permissive file, which was confusing UX. The
+  underlying enforcement primitive `db_open_with_mode` (1.1.0) is
+  unaffected; only the stderr nag is gone.
 
 ### Public API / ABI
 

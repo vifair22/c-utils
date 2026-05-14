@@ -38,8 +38,8 @@ static void write_file(const char *path, const char *content)
     assert_non_null(f);
     fputs(content, f);
     fclose(f);
-    /* chmod 0600 so config_init's permissive-mode warning (1.1.0)
-     * doesn't fire on every test that writes a config file. */
+    /* Restrictive perms match what a real-world app would have on
+     * its credential-bearing config file. */
     chmod(path, 0600);
 }
 
@@ -915,9 +915,7 @@ static void test_db_mode_no_umask_bleed(void **state)
 }
 
 /* config_mode != 0: the config file is chmod'd to the requested mode
- * after parsing. Covers both the explicit-mode and warning-suppression
- * angles (1.1.0's permissive-mode warning is moot once we've enforced
- * the mode ourselves). */
+ * after parsing. */
 static void test_config_mode_enforces(void **state)
 {
     (void)state;

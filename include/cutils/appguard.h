@@ -90,9 +90,11 @@ typedef struct {
 
     /* When nonzero, the YAML config file is chmod'd to this mode
      * after config_init successfully parses it (and after first-run
-     * template generation, when applicable). Supersedes the v1.1.0
-     * permissive-mode stderr warning — the warning still fires when
-     * this field is 0 and the file is group/world-readable. */
+     * template generation, when applicable). When 0, the file's
+     * mode is left at whatever umask / pre-existing perms produced —
+     * c-utils does not nag about permissive config files, because
+     * leaving it alone is a legitimate choice the application
+     * author has expressed by not setting this field. */
     mode_t                  config_mode;
 } appguard_config_t;
 

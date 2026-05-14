@@ -9,7 +9,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 /* Internal auto-cleanup for config handles used inside this file. */
 static void config_free_p(cutils_config_t **p)
@@ -437,28 +436,6 @@ int config_init(cutils_config_t **out,
     if (!cfg->doc)
         return set_error(CUTILS_ERR_IO, "failed to parse config file '%s'",
                          cfg->config_path);
-
-    /* Warn (don't fail) if the config file is group- or world-readable.
-     * c-utils config files commonly hold credentials (pushover token,
-     * DB connection strings, etc.) so a permissive mode is a real-
-     * world misconfiguration we want to surface. Emitted to stderr
-     * because the log subsystem isn't up yet at this point in init;
-     * the consuming app's stderr capture (systemd journal, etc.)
-     * picks it up. Skipped for symlinks and special files — stat
-     * follows them, but for unusual layouts (e.g. /dev/stdin in a
-     * test) we don't want to whine. */
-    {
-        struct stat cst;
-        if (stat(cfg->config_path, &cst) == 0 && S_ISREG(cst.st_mode) &&
-            (cst.st_mode & (S_IRGRP | S_IROTH))) {
-            fprintf(stderr,
-                "warning: config file '%s' is group/world-readable "
-                "(mode 0%o) — consider chmod 0600 to protect "
-                "credentials it may contain.\n",
-                cfg->config_path,
-                cst.st_mode & 0777);
-        }
-    }
 
     /* Validate required keys */
     for (int i = 0; i < cfg->nkeys; i++) {
