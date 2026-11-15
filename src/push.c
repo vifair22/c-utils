@@ -83,12 +83,48 @@ static int                               push_stop    = 0;  /* push_mutex */
 static _Atomic int                       push_running = 0;
 static int                               push_notify  = 0;  /* push_mutex */
 
+/* Delivery counters (1.4.0), read by push_get_stats from any thread.
+ * Before these, a message the worker gave up on left one log line and
+ * nothing an application could count or alert on. */
+static _Atomic unsigned long long        push_n_sent    = 0;
+static _Atomic unsigned long long        push_n_failed  = 0;
+static _Atomic unsigned long long        push_n_expired = 0;
+static _Atomic unsigned long long        push_n_retried = 0;
+
+/* The endpoint. Fixed in production; the test suite points it at a local
+ * listener to exercise accepted and rejected sends without the network. */
+static _Atomic(const char *)             push_url = PUSHOVER_URL;
+
+/* Non-static for the test suite only (see tests/test_push.c); not part of
+ * the public header. NULL restores the Pushover endpoint. */
+void cutils_push_set_url(const char *url);
+void cutils_push_set_url(const char *url)
+{
+    atomic_store(&push_url, url ? url : PUSHOVER_URL);
+}
+
 /* --- curl write callback (discard response body) --- */
+
+/* Keeps the start of the response body: on a rejection Pushover says why
+ * there ("application token is invalid"), which is the part an operator
+ * needs and the status code alone does not give. */
+typedef struct {
+    char   buf[256];
+    size_t len;
+} resp_snip_t;
 
 static size_t discard_cb(void *ptr, size_t size, size_t nmemb, void *userdata)
 {
-    (void)ptr; (void)userdata;
-    return size * nmemb;
+    resp_snip_t *r = userdata;
+    size_t n = size * nmemb;
+    if (r) {
+        size_t room = sizeof(r->buf) - 1 - r->len;
+        size_t take = n < room ? n : room;
+        memcpy(r->buf + r->len, ptr, take);
+        r->len += take;
+        r->buf[r->len] = '\0';
+    }
+    return n;
 }
 
 /* --- Message splitting ---
@@ -264,13 +300,16 @@ char *cutils_push_build_postfields(CURL *curl,
 static send_result_t send_one(const char *token, const char *user,
                               const char *title, const char *message,
                               const char *timestamp, const char *ttl,
-                              int html, int priority)
+                              int html, int priority,
+                              long *http_out, resp_snip_t *resp)
 {
+    *http_out = 0;
     CUTILS_AUTO_CURL CURL *curl = curl_easy_init();
     if (!curl) return SEND_TRANSIENT_FAIL;
 
-    curl_easy_setopt(curl, CURLOPT_URL, PUSHOVER_URL);
+    curl_easy_setopt(curl, CURLOPT_URL, atomic_load(&push_url));
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discard_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, resp);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
 
     CUTILS_AUTOFREE char *postfields = cutils_push_build_postfields(
@@ -286,6 +325,7 @@ static send_result_t send_one(const char *token, const char *user,
     CURLcode res = curl_easy_perform(curl);
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    *http_out = http_code;
 
     if (res == CURLE_OK && http_code >= 200 && http_code < 300)
         return SEND_OK;
@@ -418,12 +458,18 @@ static void *push_worker_thread(void *arg)
                 CUTILS_UNUSED(db_execute_non_query(push_db,
                     "UPDATE push SET failed = 1 WHERE rowid = ?",
                     fail_params, NULL));
+                atomic_fetch_add(&push_n_failed, 1);
+                atomic_fetch_add(&push_n_expired, 1);
                 log_warn("push expired before delivery (ttl reached): %s", title);
                 continue;
             }
 
+            long http_code = 0;
+            resp_snip_t resp = { .len = 0 };
+            resp.buf[0] = '\0';
             send_result_t sr = send_one(token, user, title, message,
-                                        timestamp, ttl, html, priority);
+                                        timestamp, ttl, html, priority,
+                                        &http_code, &resp);
 
             if (sr == SEND_OK) {
                 const char *del_params[] = { rowid, NULL };
@@ -431,6 +477,7 @@ static void *push_worker_thread(void *arg)
                  * next cycle. Not catastrophic — Pushover collapses dupes. */
                 CUTILS_UNUSED(db_execute_non_query(push_db,
                     "DELETE FROM push WHERE rowid = ?", del_params, NULL));
+                atomic_fetch_add(&push_n_sent, 1);
                 log_debug("push sent: %s", title);
             } else if (sr == SEND_PERMANENT_FAIL) {
                 const char *fail_params[] = { rowid, NULL };
@@ -438,7 +485,9 @@ static void *push_worker_thread(void *arg)
                 CUTILS_UNUSED(db_execute_non_query(push_db,
                     "UPDATE push SET failed = 1 WHERE rowid = ?",
                     fail_params, NULL));
-                log_error("push permanently failed: %s", title);
+                atomic_fetch_add(&push_n_failed, 1);
+                log_error("push permanently failed (HTTP %ld%s%s): %s",
+                          http_code, resp.len ? ", " : "", resp.buf, title);
             } else {
                 int next_attempts = attempts + 1;
                 int delay         = push_backoff_seconds(next_attempts);
@@ -452,6 +501,7 @@ static void *push_worker_thread(void *arg)
                 CUTILS_UNUSED(db_execute_non_query(push_db,
                     "UPDATE push SET attempts = ?, next_retry_at = ? "
                     "WHERE rowid = ?", upd_params, NULL));
+                atomic_fetch_add(&push_n_retried, 1);
                 log_warn("push transient failure (attempt %d, retry in %ds): %s",
                          next_attempts, delay, title);
                 /* Don't break — the retried row drops out of the
@@ -470,6 +520,12 @@ static void *push_worker_thread(void *arg)
 
 int push_init(cutils_db_t *db, const cutils_config_t *cfg)
 {
+    /* Counters describe this worker's lifetime, like a process counter. */
+    atomic_store(&push_n_sent, 0);
+    atomic_store(&push_n_failed, 0);
+    atomic_store(&push_n_expired, 0);
+    atomic_store(&push_n_retried, 0);
+
     atomic_store(&push_db, db);
     atomic_store(&push_cfg, cfg);
     push_stop = 0;
@@ -578,5 +634,30 @@ int push_send_opts(const push_opts_t *opts)
         pthread_cond_signal(&push_cond);
     }
 
+    return CUTILS_OK;
+}
+
+int push_get_stats(push_stats_t *out)
+{
+    if (!out) return set_error(CUTILS_ERR_INVALID, "push_get_stats: null argument");
+    out->sent    = atomic_load(&push_n_sent);
+    out->failed  = atomic_load(&push_n_failed);
+    out->expired = atomic_load(&push_n_expired);
+    out->retried = atomic_load(&push_n_retried);
+    out->pending = 0;
+
+    /* Disabled, or shut down: nothing is queued that will be sent. */
+    cutils_db_t *db = atomic_load(&push_db);
+    if (!db) return CUTILS_OK;
+
+    CUTILS_AUTO_DBRES db_result_t *result = NULL;
+    int rc = db_execute(db, "SELECT COUNT(*) FROM push WHERE failed = 0",
+                        NULL, &result);
+    if (rc != CUTILS_OK || !result || result->nrows != 1) {
+        out->pending = -1;
+        return rc != CUTILS_OK ? rc
+                               : set_error(CUTILS_ERR, "push_get_stats: no count"); /* LCOV_EXCL_LINE */
+    }
+    out->pending = strtoll(result->rows[0][0], NULL, 10);
     return CUTILS_OK;
 }

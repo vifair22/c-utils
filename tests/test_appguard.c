@@ -326,6 +326,115 @@ static void test_init_log_level_error(void **state)
     appguard_shutdown(guard);
 }
 
+/* --- Config validation (1.4.0) --- */
+
+static const config_key_t validate_keys[] = {
+    { "log.level",   CFG_STRING, "info", "Log level", CFG_STORE_FILE, 0 },
+    { "app.workers", CFG_INT,    "2",    "Workers",   CFG_STORE_FILE, 0 },
+    { NULL, 0, NULL, NULL, 0, 0 }
+};
+
+static appguard_t *init_validating(config_validate_t mode)
+{
+    appguard_config_t cfg = {
+        .app_name        = "testguard",
+        .config_path     = TEST_CFG,
+        .on_first_run    = CFG_FIRST_RUN_CONTINUE,
+        .file_keys       = validate_keys,
+        .config_validate = mode,
+    };
+    return appguard_init(&cfg);
+}
+
+/* "warn" is what applications document; it used to be read as the
+ * default level, silently. */
+static void test_init_log_level_warn_alias(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n"
+        "log:\n"
+        "  level: warn\n");
+    appguard_t *guard = init_validating(CFG_VALIDATE_OFF);
+    assert_non_null(guard);
+    assert_int_equal(log_get_level(), LOG_WARNING);
+    appguard_shutdown(guard);
+}
+
+static void test_validate_strict_refuses_bad_log_level(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n"
+        "log:\n"
+        "  level: chatty\n");
+    assert_null(init_validating(CFG_VALIDATE_STRICT));
+    /* Refused before the database was opened. */
+    assert_int_not_equal(access(TEST_DB, F_OK), 0);
+}
+
+static void test_validate_warn_continues_on_bad_log_level(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n"
+        "log:\n"
+        "  level: chatty\n");
+    appguard_t *guard = init_validating(CFG_VALIDATE_WARN);
+    assert_non_null(guard);
+    appguard_shutdown(guard);
+}
+
+/* Off is the default: a bad level loads as it did in 1.3. */
+static void test_validate_off_ignores_bad_log_level(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n"
+        "log:\n"
+        "  level: chatty\n"
+        "app:\n"
+        "  workerz: 4\n");
+    appguard_t *guard = init_validating(CFG_VALIDATE_OFF);
+    assert_non_null(guard);
+    appguard_shutdown(guard);
+}
+
+static void test_validate_strict_refuses_unknown_key(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n"
+        "app:\n"
+        "  workerz: 4\n");
+    assert_null(init_validating(CFG_VALIDATE_STRICT));
+    assert_int_not_equal(access(TEST_DB, F_OK), 0);
+}
+
+static void test_validate_strict_accepts_clean_file(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n"
+        "log:\n"
+        "  level: error\n"
+        "app:\n"
+        "  workers: 4\n"
+        "pushover:\n"
+        "  token: \"\"\n"
+        "  user: \"\"\n");
+    appguard_t *guard = init_validating(CFG_VALIDATE_STRICT);
+    assert_non_null(guard);
+    assert_int_equal(log_get_level(), LOG_ERROR);
+    appguard_shutdown(guard);
+}
+
 static void test_init_log_level_info(void **state)
 {
     (void)state;
@@ -1198,6 +1307,12 @@ static void test_config_get_path_accessor(void **state)
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_teardown(test_init_log_level_warn_alias, teardown),
+        cmocka_unit_test_teardown(test_validate_strict_refuses_bad_log_level, teardown),
+        cmocka_unit_test_teardown(test_validate_warn_continues_on_bad_log_level, teardown),
+        cmocka_unit_test_teardown(test_validate_off_ignores_bad_log_level, teardown),
+        cmocka_unit_test_teardown(test_validate_strict_refuses_unknown_key, teardown),
+        cmocka_unit_test_teardown(test_validate_strict_accepts_clean_file, teardown),
         cmocka_unit_test_teardown(test_init_null_config, teardown),
         cmocka_unit_test_teardown(test_init_no_app_name, teardown),
         cmocka_unit_test_teardown(test_init_basic, teardown),
