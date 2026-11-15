@@ -5,6 +5,39 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.6.0] - 2026-11-15
+
+`json_req_parse` is strict about what it accepts. No signature changes,
+but bodies that parsed under 1.5.x can now fail, hence the minor bump.
+Found in c-backup's UAT.
+
+### Changed
+
+- **Behaviour change: `json_req_parse` refuses data after the JSON
+  value.** It used to succeed once cJSON had read one value from the
+  front of the buffer, so `{"a":1} junk` and `{"a":1}{"b":2}` were
+  accepted with part of the body never read. Now all `len` bytes must be
+  the one object; only JSON whitespace (space, tab, CR, LF) may follow
+  it. A NUL counted in `len` is data and is refused, so a caller passing
+  `sizeof("...")` rather than the string length now fails. The result is
+  `CUTILS_ERR_JSON`, the code a malformed body already returned (a 400
+  for an HTTP service), with `unexpected data after the JSON value, at
+  byte N: ...`.
+- **Behaviour change: `json_req_parse` refuses duplicate member names**
+  in any object at any depth. `{"role":"user","role":"admin"}` used to
+  parse, the getters returning the first while a proxy, validator or
+  logger in front of the service may honour the last. It is now
+  `CUTILS_ERR_JSON` with the key and its location, as in `duplicate key
+  'x' in object 'items[1]'`. Names compare byte-for-byte, as the getters
+  look them up, so `"a"` and `"A"` are different names. The check is
+  O(n log n) per object, and costs about 60 ns on a small request.
+
+### Fixed
+
+- **A parse error could read past the end of the buffer.** The `near:`
+  excerpt was printed with `%.32s`, which reads until a NUL, and an HTTP
+  body has none. It is now bounded by `len`.
+
 ## [1.5.1] - 2026-11-15
 
 Three fixes found in c-backup's UAT against 1.5.0: a data race in JSON
