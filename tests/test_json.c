@@ -127,6 +127,183 @@ static void test_parse_concurrent_errors_stay_per_thread(void **state)
     assert_int_equal(atomic_load(&g_parse_ok), PARSE_THREADS * PARSE_ROUNDS);
 }
 
+/* --- Strict parse (1.6.0): trailing data and duplicate names --- */
+
+static int parse_str(const char *s, cutils_json_req_t **req)
+{
+    *req = NULL;
+    return json_req_parse(s, strlen(s), req);
+}
+
+static void test_parse_trailing_whitespace_ok(void **state)
+{
+    (void)state;
+    cutils_json_req_t *req = NULL;
+    assert_int_equal(parse_str("  {\"a\":1} \t\r\n ", &req), CUTILS_OK);
+    assert_non_null(req);
+    json_req_free(req);
+}
+
+static void test_parse_trailing_garbage_rejected(void **state)
+{
+    (void)state;
+    static const char *bad[] = {
+        "{\"a\":1} x",
+        "{\"a\":1}{\"b\":2}",
+        "{\"a\":1},",
+        "{\"a\":1}\n]",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        cutils_json_req_t *req = NULL;
+        assert_int_equal(parse_str(bad[i], &req), CUTILS_ERR_JSON);
+        assert_null(req);
+        assert_non_null(strstr(cutils_get_error(), "after the JSON value"));
+    }
+}
+
+/* A NUL counted in len is data, not an end marker: a caller passing
+ * sizeof("...") instead of the string length is refused. */
+static void test_parse_trailing_nul_in_len_rejected(void **state)
+{
+    (void)state;
+    cutils_json_req_t *req = NULL;
+    static const char body[] = "{\"a\":1}";
+    assert_int_equal(json_req_parse(body, sizeof(body), &req), CUTILS_ERR_JSON);
+    assert_null(req);
+}
+
+/* An HTTP body is not NUL-terminated. The error excerpt stops at len
+ * rather than reading on into whatever follows the buffer. */
+static void test_parse_error_excerpt_bounded_by_len(void **state)
+{
+    (void)state;
+    struct { char body[7]; char after[9]; } m;
+    memcpy(m.body, "{\"a\":#!", 7);
+    memcpy(m.after, "ZZZZZZZZ", 9);
+    cutils_json_req_t *req = NULL;
+    assert_int_equal(json_req_parse(m.body, sizeof(m.body), &req), CUTILS_ERR_JSON);
+    assert_null(strchr(cutils_get_error(), 'Z'));
+
+    struct { char body[9]; char after[9]; } t;
+    memcpy(t.body, "{\"a\":1} x", 9);
+    memcpy(t.after, "ZZZZZZZZ", 9);
+    assert_int_equal(json_req_parse(t.body, sizeof(t.body), &req), CUTILS_ERR_JSON);
+    assert_non_null(strstr(cutils_get_error(), "after the JSON value"));
+    assert_null(strchr(cutils_get_error(), 'Z'));
+}
+
+static void expect_dup(const char *body, const char *msg)
+{
+    cutils_json_req_t *req = NULL;
+    assert_int_equal(parse_str(body, &req), CUTILS_ERR_JSON);
+    assert_null(req);
+    assert_string_equal(cutils_get_error(), msg);
+}
+
+static void test_parse_duplicate_keys_rejected(void **state)
+{
+    (void)state;
+    expect_dup("{\"a\":1,\"a\":2}", "duplicate key 'a' at the top level");
+    expect_dup("{\"role\":\"user\",\"x\":0,\"role\":\"admin\"}",
+               "duplicate key 'role' at the top level");
+    expect_dup("{\"\":1,\"\":2}", "duplicate key '' at the top level");
+    /* Same value twice is still two members. */
+    expect_dup("{\"a\":1,\"a\":1}", "duplicate key 'a' at the top level");
+}
+
+static void test_parse_nested_duplicate_keys_rejected(void **state)
+{
+    (void)state;
+    expect_dup("{\"user\":{\"name\":\"a\",\"name\":\"b\"}}",
+               "duplicate key 'name' in object 'user'");
+    expect_dup("{\"a\":{\"b\":{\"c\":{\"d\":1,\"d\":2}}}}",
+               "duplicate key 'd' in object 'a.b.c'");
+    expect_dup("{\"items\":[{\"x\":1},{\"x\":1,\"x\":2}]}",
+               "duplicate key 'x' in object 'items[1]'");
+    expect_dup("{\"m\":[[1,{\"k\":[{\"z\":0,\"z\":0}]}]]}",
+               "duplicate key 'z' in object 'm[0][1].k[0]'");
+}
+
+/* Repeated names that are not in the same object are fine, and names
+ * compare case-sensitively, as the getters look them up. */
+static void test_parse_non_duplicates_accepted(void **state)
+{
+    (void)state;
+    static const char *ok[] = {
+        "{\"a\":{\"x\":1},\"b\":{\"x\":1}}",
+        "{\"x\":{\"x\":{\"x\":1}}}",
+        "{\"items\":[{\"x\":1},{\"x\":2}]}",
+        "{\"a\":1,\"A\":2}",
+        "{\"ab\":1,\"a\":2,\"b\":3}",
+        "{}",
+    };
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+        cutils_json_req_t *req = NULL;
+        assert_int_equal(parse_str(ok[i], &req), CUTILS_OK);
+        json_req_free(req);
+    }
+}
+
+/* A location longer than the report keeps its innermost part, marked as
+ * cut, rather than overflowing or dropping the key. */
+static void test_parse_duplicate_deep_path_cut(void **state)
+{
+    (void)state;
+    char outer[301];
+    memset(outer, 'o', 300);
+    outer[300] = '\0';
+    char body[512];
+    snprintf(body, sizeof(body), "{\"%s\":{\"in\":{\"d\":1,\"d\":2}}}", outer);
+    cutils_json_req_t *req = NULL;
+    assert_int_equal(parse_str(body, &req), CUTILS_ERR_JSON);
+    assert_null(req);
+    const char *e = cutils_get_error();
+    assert_non_null(strstr(e, "duplicate key 'd' in object '..."));
+    assert_non_null(strstr(e, "in'"));
+}
+
+/* A large object: names are sorted, not compared pairwise. With 200000
+ * members a pairwise check is 2e10 comparisons and would not finish in
+ * the test's lifetime; sorted it is a fraction of a second. The duplicate
+ * is the last member repeating the first, the worst place for a scan. */
+#define BIG_N 200000
+
+static char *big_object(int dup_last)
+{
+    size_t cap = (size_t)BIG_N * 20 + 16;
+    char *b = malloc(cap);
+    assert_non_null(b);
+    size_t n = 0;
+    b[n++] = '{';
+    for (int i = 0; i < BIG_N; i++) {
+        int k = (dup_last && i == BIG_N - 1) ? 0 : i;
+        n += (size_t)snprintf(b + n, cap - n, "%s\"k%d\":%d", i ? "," : "", k, i);
+    }
+    b[n++] = '}';
+    b[n] = '\0';
+    return b;
+}
+
+static void test_parse_large_object(void **state)
+{
+    (void)state;
+    char *b = big_object(0);
+    cutils_json_req_t *req = NULL;
+    assert_int_equal(parse_str(b, &req), CUTILS_OK);
+    uint32_t v = 0;
+    assert_int_equal(json_req_get_u32(req, "k199999", &v, 0, UINT32_MAX), CUTILS_OK);
+    assert_int_equal(v, 199999);
+    json_req_free(req);
+    free(b);
+
+    b = big_object(1);
+    req = NULL;
+    assert_int_equal(parse_str(b, &req), CUTILS_ERR_JSON);
+    assert_null(req);
+    assert_string_equal(cutils_get_error(), "duplicate key 'k0' at the top level");
+    free(b);
+}
+
 static void test_parse_non_object(void **state)
 {
     (void)state;
@@ -1317,6 +1494,15 @@ static void test_auto_json_elem_honors_commit(void **state)
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_parse_trailing_whitespace_ok),
+        cmocka_unit_test(test_parse_trailing_garbage_rejected),
+        cmocka_unit_test(test_parse_trailing_nul_in_len_rejected),
+        cmocka_unit_test(test_parse_error_excerpt_bounded_by_len),
+        cmocka_unit_test(test_parse_duplicate_keys_rejected),
+        cmocka_unit_test(test_parse_nested_duplicate_keys_rejected),
+        cmocka_unit_test(test_parse_non_duplicates_accepted),
+        cmocka_unit_test(test_parse_large_object),
+        cmocka_unit_test(test_parse_duplicate_deep_path_cut),
         cmocka_unit_test(test_parse_concurrent_errors_stay_per_thread),
         /* Parse / free */
         cmocka_unit_test_setup(test_parse_simple_object,         setup_clear_error),
