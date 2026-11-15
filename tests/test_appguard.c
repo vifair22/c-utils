@@ -469,6 +469,136 @@ static void test_validate_app_check(void **state)
     assert_int_not_equal(access(TEST_DB, F_OK), 0);
 }
 
+/* --- Each config error reported once (1.5.1) ---
+ *
+ * Validation printed its list, then AppGuard printed cutils_get_error(),
+ * which repeats the first problem: an invalid log.level appeared twice.
+ * These run init with stderr redirected to a file and count how often
+ * the problem's text appears in it. */
+
+#define STDERR_CAPTURE "/tmp/cutils_test_appguard.stderr"
+
+static int g_saved_stderr = -1;
+
+static void stderr_capture_begin(void)
+{
+    fflush(stderr);
+    g_saved_stderr = dup(STDERR_FILENO);
+    assert_true(g_saved_stderr >= 0);
+    int fd = open(STDERR_CAPTURE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assert_true(fd >= 0);
+    assert_int_equal(dup2(fd, STDERR_FILENO), STDERR_FILENO);
+    close(fd);
+}
+
+static char g_captured[8192];
+
+/* Restores stderr and keeps what was written to it in g_captured. */
+static void stderr_capture_end(void)
+{
+    fflush(stderr);
+    assert_int_equal(dup2(g_saved_stderr, STDERR_FILENO), STDERR_FILENO);
+    close(g_saved_stderr);
+    g_saved_stderr = -1;
+
+    FILE *f = fopen(STDERR_CAPTURE, "r");
+    assert_non_null(f);
+    size_t n = fread(g_captured, 1, sizeof(g_captured) - 1, f);
+    fclose(f);
+    unlink(STDERR_CAPTURE);
+    g_captured[n] = '\0';
+}
+
+static int captured_count(const char *needle)
+{
+    int count = 0;
+    for (const char *p = strstr(g_captured, needle); p; p = strstr(p + 1, needle))
+        count++;
+    return count;
+}
+
+static void test_strict_config_error_printed_once(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n"
+        "log:\n"
+        "  level: chatty\n");
+    stderr_capture_begin();
+    appguard_t *guard = init_validating(CFG_VALIDATE_STRICT);
+    stderr_capture_end();
+    assert_null(guard);
+    assert_int_equal(captured_count("chatty"), 1);
+}
+
+/* Several problems: each once, none echoed by AppGuard's own line. */
+static void test_strict_config_errors_each_printed_once(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n"
+        "log:\n"
+        "  level: chatty\n"
+        "app:\n"
+        "  workerz: 4\n");
+    stderr_capture_begin();
+    appguard_t *guard = init_validating(CFG_VALIDATE_STRICT);
+    stderr_capture_end();
+    assert_null(guard);
+    assert_int_equal(captured_count("chatty"), 1);
+    assert_int_equal(captured_count("workerz"), 1);
+}
+
+static const config_key_t required_keys[] = {
+    { "app.required_key", CFG_STRING, "", "Must be set", CFG_STORE_FILE, 1 },
+    { NULL, 0, NULL, NULL, 0, 0 }
+};
+
+static appguard_t *init_required(config_validate_t mode)
+{
+    appguard_config_t cfg = {
+        .app_name        = "testguard",
+        .config_path     = TEST_CFG,
+        .on_first_run    = CFG_FIRST_RUN_CONTINUE,
+        .file_keys       = required_keys,
+        .config_validate = mode,
+    };
+    return appguard_init(&cfg);
+}
+
+/* Under WARN the missing key is printed in the list as a warning, and
+ * the required-key check after validation then fails init with the same
+ * text. */
+static void test_warn_missing_required_printed_once(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n");
+    stderr_capture_begin();
+    appguard_t *guard = init_required(CFG_VALIDATE_WARN);
+    stderr_capture_end();
+    assert_null(guard);
+    assert_int_equal(captured_count("app.required_key"), 1);
+}
+
+/* With validation off nothing else prints it: AppGuard's line is the
+ * only report, and it must still be there. */
+static void test_off_missing_required_still_reported(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n");
+    stderr_capture_begin();
+    appguard_t *guard = init_required(CFG_VALIDATE_OFF);
+    stderr_capture_end();
+    assert_null(guard);
+    assert_int_equal(captured_count("app.required_key"), 1);
+}
+
 static void test_log_level_parse(void **state)
 {
     (void)state;
@@ -1362,6 +1492,10 @@ int main(void)
         cmocka_unit_test_teardown(test_validate_strict_refuses_unknown_key, teardown),
         cmocka_unit_test_teardown(test_validate_strict_accepts_clean_file, teardown),
         cmocka_unit_test_teardown(test_validate_app_check, teardown),
+        cmocka_unit_test_teardown(test_strict_config_error_printed_once, teardown),
+        cmocka_unit_test_teardown(test_strict_config_errors_each_printed_once, teardown),
+        cmocka_unit_test_teardown(test_warn_missing_required_printed_once, teardown),
+        cmocka_unit_test_teardown(test_off_missing_required_still_reported, teardown),
 
         cmocka_unit_test_teardown(test_log_level_parse, teardown),
         cmocka_unit_test_teardown(test_init_null_config, teardown),
