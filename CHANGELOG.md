@@ -7,6 +7,41 @@ the public-header level (see README "API stability").
 
 ## [1.4.0] - unreleased
 
+Lets an application refuse a config file it cannot honour, and count
+Pushover deliveries. Both are opt-in: no signature changes, and an
+application that sets nothing new behaves as under 1.3.1 apart from the
+fixes below. Found in c-backup's UAT (B081, B083).
+
+### Added
+
+- **Config validation: `config_validate_t`, `config_init_opts()`,
+  `appguard_config_t.config_validate`.** Until now a config file was
+  accepted whatever it said: `log: [unclosed` loaded as if the line were
+  not there, `security.key_dri` was just an unread entry, and
+  `port: eighty` read as the default. With `CFG_VALIDATE_WARN` each
+  problem is printed as `<path>:<line>: warning: ...`; with
+  `CFG_VALIDATE_STRICT` they are printed as errors and init fails with
+  `CUTILS_ERR_CONFIG` (AppGuard: before the database is opened). Checked:
+  - lines outside the supported YAML subset, now documented in Manual
+    section 5: flow collections, nested mappings, top-level scalars,
+    inconsistent indentation, single or unbalanced quotes, anchors and
+    block scalars, `: ` in an unquoted value, keys outside a section,
+    duplicate keys, lines over 1023 bytes;
+  - unknown keys, with a suggestion when a registered key is within two
+    edits (`did you mean 'security.key_dir'?`);
+  - DB-backed keys written in the file, where they have no effect;
+  - `CFG_INT` / `CFG_BOOL` values, in the file and in environment
+    overrides;
+  - under AppGuard, `log.level`.
+  The default, `CFG_VALIDATE_OFF`, keeps 1.3 behaviour; the parser produces
+  exactly the entries it did before and only records the problems.
+- **`config_key_line()`** - the line a key was set on, for application
+  checks that want to point at it.
+- **`push_get_stats()` / `push_stats_t`** - lock-free sent, failed,
+  expired and retried counters plus the pending queue depth. A message
+  Pushover rejected, or one that expired, used to leave only a log line;
+  an application can now export it as a metric and alert on it.
+
 ### Fixed
 
 - **A version bump now rebuilds the object that reports the version.**
@@ -15,6 +50,12 @@ the public-header level (see README "API stability").
   bump kept the old `version.o`, and `cutils_version()` reported the
   previous release. Found when c-backup's daemon logged c-utils 1.2.0
   while linked against 1.3.1.
+- **`log.level: warn` is honoured.** AppGuard knew `warning` but not
+  `warn`, the spelling most applications document, and fell back to the
+  compiled-in level without a word.
+- **A rejected push says why.** The log line now carries the HTTP status
+  and the start of Pushover's response body:
+  `push permanently failed (HTTP 400, {"user":"invalid",...}): <title>`.
 
 ## [1.3.1] - 2026-11-15
 
