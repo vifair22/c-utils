@@ -5,7 +5,7 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
-## [1.4.0] - unreleased
+## [1.4.0] - 2026-11-15
 
 Lets an application refuse a config file it cannot honour, and count
 Pushover deliveries. Both are opt-in: no signature changes, and an
