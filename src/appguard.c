@@ -39,6 +39,8 @@ struct appguard {
     int              shutdown_called;
     pthread_t        signal_thread;
     int              signal_thread_started;
+    void           (*on_signal)(int sig, void *ctx);
+    void            *on_signal_ctx;
 };
 
 /* Saved argv for restart */
@@ -91,13 +93,26 @@ static void *signal_watcher(void *arg)
     appguard_signal_set(&set);
 
     int sig = 0;
-    if (sigwait(&set, &sig) != 0)
-        return NULL;
+    int delivered = 0;
+    for (;;) {
+        if (sigwait(&set, &sig) != 0)
+            return NULL;
 
-    if (sig == SIGUSR1) {
-        /* appguard_shutdown is driving teardown from the main thread
-         * — leave it to do the work and just exit the watcher. */
-        return NULL;
+        if (sig == SIGUSR1) {
+            /* appguard_shutdown is driving teardown from the main thread,
+             * so leave it to do the work and just exit the watcher. */
+            return NULL;
+        }
+
+        /* The app asked to run its own shutdown. Tell it once and keep
+         * waiting: its appguard_shutdown wakes us with SIGUSR1, and a
+         * second SIGINT/SIGTERM falls through to the forced exit below. */
+        if (guard->on_signal && !delivered) {
+            delivered = 1;
+            guard->on_signal(sig, guard->on_signal_ctx);
+            continue;
+        }
+        break;
     }
 
     /* SIGINT or SIGTERM: drive the exit ourselves. We're a regular
@@ -388,6 +403,8 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
     }
 
     /* Step 9: Spawn signal watcher thread (sigwait-based, see file header). */
+    guard->on_signal     = cfg->on_signal;
+    guard->on_signal_ctx = cfg->on_signal_ctx;
     if (install_signal_watcher(guard) != 0) {
         log_warn("signal watcher spawn failed: %s",
                  "shutdown via SIGINT/SIGTERM will not drain subsystems");
