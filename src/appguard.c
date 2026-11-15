@@ -266,7 +266,20 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
         return NULL;
     }
     if (rc != CUTILS_OK) {
-        fprintf(stderr, "appguard: config init failed: %s\n", cutils_get_error());
+        /* With validation on, every CUTILS_ERR_CONFIG names a problem
+         * validation has already printed: under STRICT the error is the
+         * first of that list, and under WARN the only CUTILS_ERR_CONFIG
+         * left is a missing required key, which the list printed as a
+         * warning. The error buffer repeats it for callers that print
+         * nothing themselves, so printing it here showed every config
+         * error twice (1.5.1). With validation off nothing was printed,
+         * and the buffer is the only report. */
+        if (rc == CUTILS_ERR_CONFIG && cfg->config_validate != CFG_VALIDATE_OFF)
+            fprintf(stderr, "appguard: config init failed; the problems are "
+                    "listed above\n");
+        else
+            fprintf(stderr, "appguard: config init failed: %s\n",
+                    cutils_get_error());
         return NULL;
     }
 

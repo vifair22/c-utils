@@ -5,6 +5,37 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.5.1] - 2026-11-15
+
+Three fixes found in c-backup's UAT against 1.5.0: a data race in JSON
+parsing, and two to what is reported (NIT-4, NIT-5). No API or ABI
+changes.
+
+### Fixed
+
+- **Concurrent JSON parses raced, and could crash.** The vendored cJSON
+  kept its parse error position in a plain global written by every parse,
+  so `json_req_parse` on two threads at once raced on it (ThreadSanitizer
+  reports it). A failed parse could then report a position inside
+  another thread's buffer, or dereference a torn pointer and crash. The
+  global is now `_Thread_local`, a marked local change to
+  `lib/cJSON/cJSON.c`.
+- **Config errors printed twice under AppGuard.** Validation prints each
+  problem, then keeps the first in the error buffer for callers that print
+  nothing themselves; `appguard_init` printed that buffer as well, so an
+  invalid `log.level` appeared once from validation and again as
+  `appguard: config init failed: ...`. With validation on, AppGuard now
+  says init failed and points at the list above it. With validation off,
+  nothing else reports the error, so the buffer is still printed. The
+  buffer's text is unchanged.
+- **The push retry line gave no cause.** A transient failure logged the
+  attempt and the delay only; the HTTP status and body reached the
+  permanent-failure line alone, and a curl error was dropped on every
+  path. Both lines now carry the cause: curl's error message when there
+  was no response, otherwise `HTTP <status>, <start of body>`, as in
+  `push transient failure (HTTP 503, {...}; attempt 1, retry in 30s):
+  <title>`. The permanent line reads as before.
+
 ## [1.5.0] - 2026-11-15
 
 Closes the gaps c-backup's UAT found in 1.4.0's config validation (B081

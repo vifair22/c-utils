@@ -1145,7 +1145,11 @@ concurrently with `push_shutdown` / `appguard_shutdown`.
 
 A rejection is also logged with the HTTP status and the start of Pushover's
 response body, which says why (`push permanently failed (HTTP 400,
-{"user":"invalid",...}): <title>`).
+{"user":"invalid",...}): <title>`). A transient failure carries its cause
+the same way, before the attempt count: the HTTP status and body for a 5xx,
+or curl's error for a send that got no response (`push transient failure
+(curl: Failed to connect to api.pushover.net port 443 ...; attempt 2, retry
+in 60s): <title>`).
 
 ### Disabled contract
 
@@ -1751,6 +1755,8 @@ The `analyze` target runs three checks in sequence:
 ### Vendored code
 
 cJSON is built with relaxed warning flags (`-Wno-conversion -Wno-sign-conversion -Wno-cast-qual -Wno-double-promotion -Wno-unused-parameter`) since it is vendored code outside the project's control.
+
+One local change is carried in `lib/cJSON/cJSON.c` (1.5.1): the parse error position `global_error` is `_Thread_local`. Upstream keeps it a plain global, which makes concurrent parses race and lets `cJSON_GetErrorPtr` read another thread's error. Re-apply it when updating cJSON; it is marked with a comment, and `test_parse_concurrent_errors_stay_per_thread` in `tests/test_json.c` fails (usually by crashing) without it.
 
 ### Linking from a consuming application
 
