@@ -119,6 +119,22 @@ typedef struct {
      * keeps the 1.2.0 behavior. */
     void                  (*on_signal)(int sig, void *ctx);
     void                   *on_signal_ctx;
+
+    /* --- Config validation (1.4.0) ---
+     *
+     * What to do with a config file that has lines outside the supported
+     * YAML subset, unknown or misspelled keys, DB-backed keys written in
+     * the file, values of the wrong type, or a log.level that is not one
+     * of debug, info, warn, warning, error. See config_validate_t.
+     *
+     * CFG_VALIDATE_OFF (0, the default) keeps 1.3 behavior: all of that
+     * loads silently. CFG_VALIDATE_WARN prints each problem to stderr as
+     * "<path>:<line>: warning: ..." and continues. CFG_VALIDATE_STRICT
+     * prints them as errors and appguard_init returns NULL before the
+     * database is opened, which is what a daemon whose config is written
+     * by hand wants: a setting that is accepted and ignored is worse
+     * than a refusal to start. */
+    config_validate_t       config_validate;
 } appguard_config_t;
 
 /* Opaque handle */

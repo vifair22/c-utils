@@ -2,6 +2,7 @@
 #include "cutils/config.h"
 #include "cutils/mem.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,7 +78,7 @@ static int needs_quoting(const char *value)
  * realloc / small strdup is not exercisable from test code without
  * fault injection. */
 static int doc_add_entry(yaml_doc_t *doc, const char *section,
-                         const char *key, const char *value)
+                         const char *key, const char *value, int line)
 {
     if (doc->nentries >= doc->capacity) {
         int newcap = doc->capacity ? doc->capacity * 2 : 16;
@@ -102,7 +103,107 @@ static int doc_add_entry(yaml_doc_t *doc, const char *section,
     e->section = s;
     e->key = k;
     e->value = v;
+    e->line = line;
     return 0;
+}
+
+/* Record a line outside the supported subset. Returns 0, or -1 on NOMEM
+ * (LCOV_EXCL'd like the other allocators here). */
+__attribute__((format(printf, 3, 4)))
+static int doc_add_issue(yaml_doc_t *doc, int line, const char *fmt, ...)
+{
+    if (doc->nissues >= doc->issues_capacity) {
+        int newcap = doc->issues_capacity ? doc->issues_capacity * 2 : 8;
+        yaml_issue_t *tmp = realloc(doc->issues,
+                                    (size_t)newcap * sizeof(*tmp));
+        if (!tmp) return -1;  /* LCOV_EXCL_LINE */
+        doc->issues = tmp;
+        doc->issues_capacity = newcap;
+    }
+    yaml_issue_t *is = &doc->issues[doc->nissues++];
+    is->line = line;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(is->msg, sizeof(is->msg), fmt, ap);
+    va_end(ap);
+    return 0;
+}
+
+/* --- Subset checks ---
+ *
+ * The parser below predates these and skips what it does not understand,
+ * which is how `log: [unclosed` or a nested mapping used to load as if it
+ * were not there. These functions only describe what is wrong; they never
+ * change which entries the parser produces, so an application that has not
+ * opted into validation sees the 1.3 result. */
+
+/* A value as written, after the colon and its whitespace, before quotes
+ * and inline comments are stripped. */
+static int check_value(yaml_doc_t *doc, int line, const char *val)
+{
+    if (val[0] == '"') {
+        const char *close = strchr(val + 1, '"');
+        if (!close)
+            return doc_add_issue(doc, line,
+                "unterminated double-quoted value");
+        const char *rest = skip_whitespace(close + 1);
+        if (*rest && *rest != '#')
+            return doc_add_issue(doc, line,
+                "unexpected text after the closing quote: '%.40s' "
+                "(escapes are not supported inside quotes)", rest);
+        return 0;
+    }
+    if (val[0] == '\'')
+        return doc_add_issue(doc, line,
+            "single-quoted values are not supported; use double quotes");
+    if (val[0] == '[' || val[0] == '{')
+        return doc_add_issue(doc, line,
+            "flow collections ('[...]', '{...}') are not supported");
+    if (val[0] && strchr("&*!|>", val[0]))
+        return doc_add_issue(doc, line,
+            "anchors, aliases, tags and block scalars ('%c') are not "
+            "supported; double-quote the value if it is literal", val[0]);
+
+    /* Unquoted: a ": " before any inline comment is a nested mapping in
+     * real YAML and an error in most parsers. Here it would be taken as
+     * part of the value, so say so instead. */
+    for (const char *p = val; *p; p++) {
+        if (*p == '#' && (p == val || p[-1] == ' ' || p[-1] == '\t'))
+            break;
+        if (*p == ':' && (p[1] == ' ' || p[1] == '\t' || p[1] == '\0'))
+            return doc_add_issue(doc, line,
+                "': ' inside an unquoted value; double-quote the value");
+    }
+    return 0;
+}
+
+/* A column-0 line that is not "name:" on its own. */
+static int check_top_level(yaml_doc_t *doc, int line, const char *trimmed)
+{
+    const char *colon = strchr(trimmed, ':');
+    if (!colon)
+        return doc_add_issue(doc, line,
+            "'%.40s' is not a section header ('name:') or a comment", trimmed);
+    int namelen = (int)(colon - trimmed > 40 ? 40 : colon - trimmed);
+    const char *after = skip_whitespace(colon + 1);
+    if (*after == '[' || *after == '{')
+        return doc_add_issue(doc, line,
+            "flow collections ('[...]', '{...}') are not supported; put "
+            "each key on its own indented line under '%.*s:'",
+            namelen, trimmed);
+    if (colon[1] != ' ' && colon[1] != '\t' && colon[1] != '\0')
+        return doc_add_issue(doc, line,
+            "'%.40s' is not a section header ('name:') or a comment", trimmed);
+    return doc_add_issue(doc, line,
+        "'%.*s: %.40s' at the top level is not supported; keys go indented "
+        "under a section", namelen, trimmed, after);
+}
+
+static int issue_cmp(const void *a, const void *b)
+{
+    const yaml_issue_t *ia = a;
+    const yaml_issue_t *ib = b;
+    return (ia->line > ib->line) - (ia->line < ib->line);
 }
 
 /* Returns 0 on success, -1 on NOMEM. Same propagation rationale as
@@ -166,6 +267,7 @@ static int yaml_find_entry(const yaml_doc_t *doc, const char *dotkey)
     needle.section = secbuf;
     needle.key     = keybuf;
     needle.value   = NULL;
+    needle.line    = 0;
 
     const yaml_entry_t *hit = bsearch(
         &needle, doc->entries, (size_t)doc->nentries,
@@ -186,16 +288,28 @@ yaml_doc_t *yaml_parse_file(const char *path)
 
     char line[1024];
     char current_section[128] = "";
+    int  lineno = 0;
+    int  continuation = 0;   /* this chunk is the tail of an overlong line */
+    int  sec_indent = -1;    /* indent of the current section's first key */
+    int  rc = 0;
 
     while (fgets(line, sizeof(line), f)) {
+        size_t got = strlen(line);
+        int whole = (got > 0 && line[got - 1] == '\n') || feof(f);
+        if (!continuation) lineno++;
+        if (!whole && !continuation)
+            rc |= doc_add_issue(doc, lineno,
+                "line is longer than %zu bytes", sizeof(line) - 1);
+        continuation = !whole;
+
         /* Store raw line (with newline stripped) */
         char raw[1024];
         strncpy(raw, line, sizeof(raw) - 1);
         raw[sizeof(raw) - 1] = '\0';
         strip_trailing_whitespace(raw);
-        /* LCOV_EXCL_START — NOMEM propagation; not exercisable from
+        /* LCOV_EXCL_START - NOMEM propagation; not exercisable from
          * test code without fault injection. */
-        if (doc_add_line(doc, raw) != 0) {
+        if (doc_add_line(doc, raw) != 0 || rc != 0) {
             yaml_free(doc);
             return NULL;
         }
@@ -223,33 +337,67 @@ yaml_doc_t *yaml_parse_file(const char *path)
                 if (*after == '\0') {
                     *colon = '\0';
                     snprintf(current_section, sizeof(current_section), "%s", secbuf);
+                    sec_indent = -1;
                     continue;
                 }
             }
+            /* A document start marker is harmless; anything else at
+             * column 0 is outside the subset. The section in force does
+             * not change, as in 1.3. */
+            if (strcmp(trimmed, "---") != 0)
+                rc |= check_top_level(doc, lineno, trimmed);
+            continue;
         }
 
         /* Key: value (indented under a section) */
-        if ((line[0] == ' ' || line[0] == '\t') && current_section[0]) {
-            char kvbuf[1024];
-            snprintf(kvbuf, sizeof(kvbuf), "%s", trimmed);
-            char *colon = strchr(kvbuf, ':');
-            if (colon) {
-                *colon = '\0';
-                char *key = kvbuf;
-                /* Walk past whitespace on the mutable local — no const cast. */
-                char *val = colon + 1;
-                while (*val == ' ' || *val == '\t') val++;
-                strip_trailing_whitespace(key);
-                strip_comment_and_unquote(val);
-                strip_trailing_whitespace(val);
-                /* LCOV_EXCL_START — NOMEM propagation. */
-                if (doc_add_entry(doc, current_section, key, val) != 0) {
-                    yaml_free(doc);
-                    return NULL;
-                }
-                /* LCOV_EXCL_STOP */
-            }
+        if (!current_section[0]) {
+            rc |= doc_add_issue(doc, lineno,
+                "indented line outside any section");
+            continue;
         }
+
+        int indent = (int)(trimmed - line);
+        if (sec_indent < 0)
+            sec_indent = indent;
+        else if (indent > sec_indent)
+            rc |= doc_add_issue(doc, lineno,
+                "indented deeper than the other keys of section '%s'; "
+                "nested mappings are not supported", current_section);
+        else if (indent < sec_indent)
+            rc |= doc_add_issue(doc, lineno,
+                "indentation does not match the other keys of section '%s'",
+                current_section);
+
+        char kvbuf[1024];
+        snprintf(kvbuf, sizeof(kvbuf), "%s", trimmed);
+        char *colon = strchr(kvbuf, ':');
+        if (!colon) {
+            rc |= doc_add_issue(doc, lineno, "expected 'key: value'");
+            continue;
+        }
+        if (colon[1] != '\0' && colon[1] != ' ' && colon[1] != '\t')
+            rc |= doc_add_issue(doc, lineno,
+                "missing space after ':' (write 'key: value')");
+        *colon = '\0';
+        char *key = kvbuf;
+        /* Walk past whitespace on the mutable local - no const cast. */
+        char *val = colon + 1;
+        while (*val == ' ' || *val == '\t') val++;
+        strip_trailing_whitespace(key);
+        if (key[0] == '\0')
+            rc |= doc_add_issue(doc, lineno, "empty key");
+        else if (strpbrk(key, " \t\"'"))
+            rc |= doc_add_issue(doc, lineno, "invalid key name '%.60s'", key);
+        rc |= check_value(doc, lineno, val);
+        strip_comment_and_unquote(val);
+        strip_trailing_whitespace(val);
+        /* LCOV_EXCL_START - NOMEM propagation. */
+        if (rc != 0 ||
+            doc_add_entry(doc, current_section, key, val, lineno) != 0) {
+            yaml_free(doc);
+            return NULL;
+        }
+        /* LCOV_EXCL_STOP */
     }
 
     /* Sort entries by (section, key) so yaml_get / yaml_set can
@@ -261,6 +409,24 @@ yaml_doc_t *yaml_parse_file(const char *path)
      * the lifetime of the doc. */
     qsort(doc->entries, (size_t)doc->nentries, sizeof(*doc->entries),
           yaml_entry_cmp);
+
+    /* A key set twice: bsearch would return either one, so which value
+     * won was unspecified. Sorted, the duplicates are neighbours. */
+    for (int i = 1; i < doc->nentries; i++) {
+        const yaml_entry_t *a = &doc->entries[i - 1];
+        const yaml_entry_t *b = &doc->entries[i];
+        if (yaml_entry_cmp(a, b) != 0) continue;
+        int first = a->line < b->line ? a->line : b->line;
+        int later = a->line < b->line ? b->line : a->line;
+        /* LCOV_EXCL_START - NOMEM propagation. */
+        if (doc_add_issue(doc, later, "duplicate key '%s.%s' (also on line %d)",
+                          a->section, a->key, first) != 0) {
+            yaml_free(doc);
+            return NULL;
+        }
+        /* LCOV_EXCL_STOP */
+    }
+    qsort(doc->issues, (size_t)doc->nissues, sizeof(*doc->issues), issue_cmp);
 
     return doc;
 }
@@ -279,6 +445,7 @@ void yaml_free(yaml_doc_t *doc)
     for (int i = 0; i < doc->nlines; i++)
         free(doc->lines[i]);
     free(doc->lines);
+    free(doc->issues);
 
     free(doc);
 }
@@ -289,6 +456,12 @@ const char *yaml_get(const yaml_doc_t *doc, const char *dotkey)
 {
     int idx = yaml_find_entry(doc, dotkey);
     return idx >= 0 ? doc->entries[idx].value : NULL;
+}
+
+int yaml_get_line(const yaml_doc_t *doc, const char *dotkey)
+{
+    int idx = yaml_find_entry(doc, dotkey);
+    return idx >= 0 ? doc->entries[idx].line : 0;
 }
 
 /* --- Mutation --- */
