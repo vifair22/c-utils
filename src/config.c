@@ -317,6 +317,7 @@ static const char *const cutils_implicit_keys[] = {
 typedef struct {
     int   line;   /* file line, or 0 for a problem with no line */
     int   seq;    /* order found, the tie-break for equal lines */
+    int   file;   /* lineless but about the file (a missing key): name it */
     char *msg;
 } cfg_problem_t;
 
@@ -368,6 +369,7 @@ static int problem_add(cfg_problems_t *p, int line, const char *fmt, ...)
     char *m = strdup(buf);
     if (!m) return set_error(CUTILS_ERR_NOMEM, "config problem alloc"); /* LCOV_EXCL_LINE */
     p->v[p->n].line = line;
+    p->v[p->n].file = 0;
     p->v[p->n].msg  = m;
     p->n++;
     return CUTILS_OK;
@@ -524,6 +526,7 @@ static int collect_problems(const cutils_config_t *cfg,
         rc = problem_add(out, line,
                          "required config key '%s' is missing or empty; "
                          "it has no default", cfg->keys[i].key);
+        if (rc == CUTILS_OK) out->v[out->n - 1].file = 1;
     }
 
     /* Environment overrides win over the file, so a bad one is as silent
@@ -629,6 +632,9 @@ static int validate_config(const cutils_config_t *cfg,
         if (probs.v[i].line > 0)
             fprintf(stderr, "%s:%d: %s: %s\n", cfg->config_path,
                     probs.v[i].line, kind, probs.v[i].msg);
+        else if (probs.v[i].file)
+            fprintf(stderr, "%s: %s: %s\n", cfg->config_path, kind,
+                    probs.v[i].msg);
         else
             fprintf(stderr, "%s: %s\n", kind, probs.v[i].msg);
     }
@@ -641,6 +647,9 @@ static int validate_config(const cutils_config_t *cfg,
         if (probs.v[0].line > 0)
             rc = set_error(CUTILS_ERR_CONFIG, "%s:%d: %s%s", cfg->config_path,
                            probs.v[0].line, probs.v[0].msg, more);
+        else if (probs.v[0].file)
+            rc = set_error(CUTILS_ERR_CONFIG, "%s: %s%s", cfg->config_path,
+                           probs.v[0].msg, more);
         else
             rc = set_error(CUTILS_ERR_CONFIG, "%s%s", probs.v[0].msg, more);
     }

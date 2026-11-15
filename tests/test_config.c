@@ -1177,8 +1177,8 @@ static void test_validate_required_joins_the_list(void **state)
     assert_strict_error("http:\n  port: abc\n",
                         "(and 1 more, printed above)");
     assert_strict_error("http:\n  port: 1\n",
-                        "required config key 'db.path' is missing or empty; "
-                        "it has no default");
+                        TEST_CFG ": required config key 'db.path' is missing "
+                        "or empty; it has no default");
 }
 
 /* The environment satisfies a required key, as it does every read. */

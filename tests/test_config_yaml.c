@@ -954,6 +954,9 @@ static void test_issue_tab_indent(void **state)
     yaml_free(doc);
     doc = expect_issue("db:\n \tpath: x\n", 2, "tab in the indentation");
     yaml_free(doc);
+    /* One message, not a second about the indentation not matching. */
+    doc = expect_issue("db:\n  path: x\n\turl: y\n", 3, "tab in the indentation");
+    yaml_free(doc);
 }
 
 /* CRLF is legal YAML. Blank CRLF lines were reported as "'' is not a

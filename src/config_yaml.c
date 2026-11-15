@@ -372,12 +372,17 @@ yaml_doc_t *yaml_parse_file(const char *path)
          * as one column each, so a tab-indented section loaded, and a
          * file mixing tabs and spaces reported a mismatch nobody could
          * see. Say what it is. */
-        if (memchr(line, '\t', (size_t)(trimmed - line)))
+        int tabbed = memchr(line, '\t', (size_t)(trimmed - line)) != NULL;
+        if (tabbed)
             rc |= doc_add_issue(doc, lineno,
                 "tab in the indentation; YAML indents with spaces only");
 
+        /* A tabbed line's width means nothing, so comparing it with the
+         * section's only adds a second message about the same mistake. */
         int indent = (int)(trimmed - line);
-        if (sec_indent < 0)
+        if (tabbed)
+            ;
+        else if (sec_indent < 0)
             sec_indent = indent;
         else if (indent > sec_indent)
             rc |= doc_add_issue(doc, lineno,
