@@ -12,9 +12,9 @@ Shared C application framework. Static library providing config management, SQLi
 |--------|--------|---------|
 | **Error** | `cutils/error.h` | Thread-local error buffer with enum return codes |
 | **DB** | `cutils/db.h` | Mutex-protected SQLite connection (WAL mode), migration runner |
-| **Config** | `cutils/config.h` | Two-store config (YAML file + SQLite), env var overrides |
+| **Config** | `cutils/config.h` | Two-store config (YAML file + SQLite), env var overrides, opt-in strict validation |
 | **Log** | `cutils/log.h` | Async logging to console (TTY-aware color, optional systemd-native mode) + SQLite, configurable retention |
-| **Push** | `cutils/push.h` | Background Pushover notification worker with retry |
+| **Push** | `cutils/push.h` | Background Pushover notification worker with retry and delivery counters |
 | **Error Loop** | `cutils/error_loop.h` | Detects repeating errors with message normalization |
 | **AppGuard** | `cutils/appguard.h` | Lifecycle manager, orchestrates init/shutdown of all subsystems |
 

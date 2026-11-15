@@ -960,6 +960,201 @@ static void test_concurrent_cfg_db_readers_writers(void **state)
     config_free(cfg);
 }
 
+/* --- Validation (1.4.0) ---
+ *
+ * Each of these loaded silently before: the daemon started and did
+ * something other than what the file said. */
+
+static const config_key_t v_keys[] = {
+    { "security.key_dir", CFG_STRING, "/etc/keys", "Keys",    CFG_STORE_FILE, 0 },
+    { "http.port",        CFG_INT,    "8765",      "Port",    CFG_STORE_FILE, 0 },
+    { "http.secure",      CFG_BOOL,   "false",     "Secure",  CFG_STORE_FILE, 0 },
+    { "ui.theme",         CFG_STRING, "dark",      "Theme",   CFG_STORE_DB,   0 },
+    { NULL, 0, NULL, NULL, 0, 0 }
+};
+
+static int init_v(cutils_config_t **cfg, config_validate_t mode)
+{
+    config_init_opts_t o = { .validate = mode };
+    return config_init_opts(cfg, "testapp", TEST_CFG, CFG_FIRST_RUN_CONTINUE,
+                            v_keys, NULL, &o);
+}
+
+static void assert_strict_error(const char *yaml, const char *needle)
+{
+    write_file(TEST_CFG, yaml);
+    cutils_config_t *cfg = NULL;
+    assert_int_equal(init_v(&cfg, CFG_VALIDATE_STRICT), CUTILS_ERR_CONFIG);
+    assert_null(cfg);
+    const char *err = cutils_get_error();
+    if (!strstr(err, needle))
+        fail_msg("error '%s' lacks '%s'", err, needle);
+}
+
+static void test_validate_clean_file_passes(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "---\n"
+        "# comment\n"
+        "db:\n"
+        "  path: test.db  # trailing\n"
+        "security:\n"
+        "  key_dir: \"/srv/keys # not a comment\"\n"
+        "http:\n"
+        "  port: 9000\n"
+        "  secure: yes\n"
+        "log:\n"
+        "  level: debug\n"
+        "pushover:\n"
+        "  token: \"\"\n"
+        "  user:\n");
+    cutils_config_t *cfg = NULL;
+    assert_int_equal(init_v(&cfg, CFG_VALIDATE_STRICT), CUTILS_OK);
+    assert_int_equal(config_get_int(cfg, "http.port", 0), 9000);
+    assert_string_equal(config_get_str(cfg, "security.key_dir"),
+                        "/srv/keys # not a comment");
+    assert_int_equal(config_key_line(cfg, "http.port"), 8);
+    assert_int_equal(config_key_line(cfg, "http.nope"), 0);
+    assert_int_equal(config_key_line(NULL, "http.port"), 0);
+    config_free(cfg);
+}
+
+static void test_validate_typo_suggests_key(void **state)
+{
+    (void)state;
+    assert_strict_error("db:\n  path: test.db\nsecurity:\n  key_dri: /x\n",
+                        TEST_CFG ":4: unknown key 'security.key_dri' "
+                        "(did you mean 'security.key_dir'?)");
+}
+
+static void test_validate_unknown_section(void **state)
+{
+    (void)state;
+    assert_strict_error("db:\n  path: test.db\nbogus:\n  thing: 1\n",
+                        TEST_CFG ":4: unknown key 'bogus.thing'");
+}
+
+static void test_validate_unknown_top_level_scalar(void **state)
+{
+    (void)state;
+    assert_strict_error("db:\n  path: test.db\nverbose: true\n",
+                        TEST_CFG ":3: 'verbose: true' at the top level");
+}
+
+static void test_validate_flow_collection(void **state)
+{
+    (void)state;
+    assert_strict_error("log: [unclosed\ndb:\n  path: test.db\n",
+                        TEST_CFG ":1: flow collections");
+}
+
+static void test_validate_bad_int(void **state)
+{
+    (void)state;
+    assert_strict_error("db:\n  path: test.db\nhttp:\n  port: eighty\n",
+                        TEST_CFG ":4: http.port: 'eighty' is not an integer");
+    assert_strict_error("db:\n  path: test.db\nhttp:\n  port: 99999999999\n",
+                        "is out of range");
+    assert_strict_error("db:\n  path: test.db\nhttp:\n  port: 80x\n",
+                        "is not an integer");
+}
+
+static void test_validate_bad_bool(void **state)
+{
+    (void)state;
+    assert_strict_error("db:\n  path: test.db\nhttp:\n  secure: maybe\n",
+                        "http.secure: 'maybe' is not a boolean");
+}
+
+static void test_validate_db_key_in_file(void **state)
+{
+    (void)state;
+    assert_strict_error("db:\n  path: test.db\nui:\n  theme: light\n",
+                        "ui.theme is kept in the database");
+
+    /* Also when the DB key list arrives separately, as from AppGuard. */
+    static const config_key_t only_file[] = {
+        { "http.port", CFG_INT, "1", "Port", CFG_STORE_FILE, 0 },
+        { NULL, 0, NULL, NULL, 0, 0 }
+    };
+    static const config_key_t only_db[] = {
+        { "ui.theme", CFG_STRING, "dark", "Theme", CFG_STORE_DB, 0 },
+        { NULL, 0, NULL, NULL, 0, 0 }
+    };
+    write_file(TEST_CFG, "db:\n  path: test.db\nui:\n  theme: light\n");
+    config_init_opts_t o = { .validate = CFG_VALIDATE_STRICT, .db_keys = only_db };
+    cutils_config_t *cfg = NULL;
+    assert_int_equal(config_init_opts(&cfg, "testapp", TEST_CFG,
+                                      CFG_FIRST_RUN_CONTINUE, only_file, NULL, &o),
+                     CUTILS_ERR_CONFIG);
+    assert_non_null(strstr(cutils_get_error(), "kept in the database"));
+}
+
+static void test_validate_counts_every_problem(void **state)
+{
+    (void)state;
+    assert_strict_error("db:\n  path: test.db\nhttp:\n  port: x\n  secure: y\n"
+                        "  nope: 1\n",
+                        TEST_CFG ":4: http.port: 'x' is not an integer "
+                        "(and 2 more, printed above)");
+}
+
+static void test_validate_env_override(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG, "db:\n  path: test.db\n");
+    setenv("TESTAPP_HTTP_PORT", "lots", 1);
+    cutils_config_t *cfg = NULL;
+    assert_int_equal(init_v(&cfg, CFG_VALIDATE_STRICT), CUTILS_ERR_CONFIG);
+    unsetenv("TESTAPP_HTTP_PORT");
+    assert_non_null(strstr(cutils_get_error(),
+                           "environment TESTAPP_HTTP_PORT (http.port): 'lots' "
+                           "is not an integer"));
+}
+
+/* Warn reports and continues; off and NULL opts load as 1.3 did. */
+static void test_validate_warn_and_off(void **state)
+{
+    (void)state;
+    const char *yaml = "db:\n  path: test.db\nhttp:\n  port: eighty\n"
+                       "  prot: 1\n  nested:\n    deep: 1\n";
+    config_validate_t modes[] = { CFG_VALIDATE_WARN, CFG_VALIDATE_OFF };
+    for (size_t i = 0; i < 2; i++) {
+        write_file(TEST_CFG, yaml);
+        cutils_config_t *cfg = NULL;
+        assert_int_equal(init_v(&cfg, modes[i]), CUTILS_OK);
+        assert_int_equal(config_get_int(cfg, "http.port", 7), 7);
+        config_free(cfg);
+    }
+    write_file(TEST_CFG, yaml);
+    cutils_config_t *cfg = NULL;
+    assert_int_equal(config_init_opts(&cfg, "testapp", TEST_CFG,
+                                      CFG_FIRST_RUN_CONTINUE, v_keys, NULL, NULL),
+                     CUTILS_OK);
+    config_free(cfg);
+}
+
+/* A validated init still reports a missing required key as before. */
+static void test_validate_then_required(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG, "db:\n  path:\n");
+    cutils_config_t *cfg = NULL;
+    assert_int_equal(init_v(&cfg, CFG_VALIDATE_STRICT), CUTILS_ERR_CONFIG);
+    assert_non_null(strstr(cutils_get_error(), "required config key 'db.path'"));
+}
+
+/* A generated template validates cleanly, or first run would refuse. */
+static void test_validate_generated_template(void **state)
+{
+    (void)state;
+    unlink(TEST_CFG);
+    cutils_config_t *cfg = NULL;
+    assert_int_equal(init_v(&cfg, CFG_VALIDATE_STRICT), CUTILS_OK);
+    config_free(cfg);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -994,6 +1189,19 @@ int main(void)
         cmocka_unit_test_teardown(test_get_db_str_stable_across_reads, teardown),
         cmocka_unit_test_teardown(test_init_env_config_path, teardown_envpath),
         cmocka_unit_test_teardown(test_concurrent_cfg_db_readers_writers, teardown),
+        cmocka_unit_test_teardown(test_validate_clean_file_passes, teardown),
+        cmocka_unit_test_teardown(test_validate_typo_suggests_key, teardown),
+        cmocka_unit_test_teardown(test_validate_unknown_section, teardown),
+        cmocka_unit_test_teardown(test_validate_unknown_top_level_scalar, teardown),
+        cmocka_unit_test_teardown(test_validate_flow_collection, teardown),
+        cmocka_unit_test_teardown(test_validate_bad_int, teardown),
+        cmocka_unit_test_teardown(test_validate_bad_bool, teardown),
+        cmocka_unit_test_teardown(test_validate_db_key_in_file, teardown),
+        cmocka_unit_test_teardown(test_validate_counts_every_problem, teardown),
+        cmocka_unit_test_teardown(test_validate_env_override, teardown),
+        cmocka_unit_test_teardown(test_validate_warn_and_off, teardown),
+        cmocka_unit_test_teardown(test_validate_then_required, teardown),
+        cmocka_unit_test_teardown(test_validate_generated_template, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

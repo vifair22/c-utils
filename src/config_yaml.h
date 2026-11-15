@@ -15,7 +15,14 @@
  * Inline comments (" # ...") are stripped unless the value is quoted.
  * Double quotes around a value are removed during parse.
  * Values containing " #" are auto-quoted on write for safe roundtrip.
- * Comments and blank lines are preserved during mutation. */
+ * Comments and blank lines are preserved during mutation.
+ *
+ * Anything outside that subset is recorded in doc->issues with its line
+ * number (1.4.0). The entries the parser produces are unchanged by this:
+ * a line it never understood is still skipped, so a caller that ignores
+ * the issues sees exactly what 1.3 produced. Whether an issue stops the
+ * application is the config layer's decision (config_validate_t), not the
+ * parser's. */
 
 #include <stddef.h>
 
@@ -24,7 +31,14 @@ typedef struct {
     char *section;  /* "ups" (without trailing colon) */
     char *key;      /* "device" */
     char *value;    /* "9600" */
+    int   line;     /* 1-based line number in the file */
 } yaml_entry_t;
+
+/* A line the parser could not take at face value. */
+typedef struct {
+    int  line;      /* 1-based */
+    char msg[224];
+} yaml_issue_t;
 
 /* Parsed YAML document — maintains both structured data and raw lines */
 typedef struct {
@@ -37,6 +51,11 @@ typedef struct {
     char **lines;
     int    nlines;
     int    lines_capacity;
+
+    /* Lines outside the supported subset, in file order */
+    yaml_issue_t *issues;
+    int           nissues;
+    int           issues_capacity;
 } yaml_doc_t;
 
 /* Parse a YAML file. Returns NULL on read failure.
@@ -49,6 +68,9 @@ void yaml_free(yaml_doc_t *doc);
 /* Look up a value by dot-notation key ("ups.device").
  * Returns NULL if not found. */
 const char *yaml_get(const yaml_doc_t *doc, const char *dotkey);
+
+/* Line number of a dot-notation key, or 0 if the key is not in the file. */
+int yaml_get_line(const yaml_doc_t *doc, const char *dotkey);
 
 /* Update a value in the document (both structured and raw lines).
  * Returns 0 on success, -1 if key not found. */

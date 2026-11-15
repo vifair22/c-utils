@@ -41,11 +41,14 @@
  *
  * The YAML format is controlled by c-utils: simple section/key/value,
  * no flow syntax, no anchors. Comments are preserved on mutation.
+ * Manual section 5 lists the exact subset. Lines outside it are skipped,
+ * as they always were, and since 1.4.0 also reported when the
+ * application opts in (config_validate_t below).
  *
  * YAML line-length limit: individual lines in the YAML file MUST be
  * ≤1024 bytes including the trailing newline. The parser reads lines
- * into fixed-size stack buffers; longer lines truncate silently and
- * may produce a partial parse. This is sufficient for any realistic
+ * into fixed-size stack buffers; longer lines are split and may produce
+ * a partial parse (reported as a problem since 1.4.0). This is sufficient for any realistic
  * key/value pair (a 1024-byte value would be longer than most URLs
  * or shell-style command strings), but is documented so callers
  * working with abnormally large values know to set them via the DB
@@ -87,6 +90,38 @@ typedef enum {
     CFG_FIRST_RUN_CONTINUE, /* generate template with defaults and continue */
 } config_first_run_t;
 
+/* What config init does with a config file it cannot take at face value
+ * (1.4.0). Zero is OFF, so an application that does not ask behaves as
+ * under 1.3.
+ *
+ * Checked:
+ *   - lines outside the YAML subset the parser supports (flow
+ *     collections, nested mappings, unbalanced quotes, inconsistent
+ *     indentation, top-level scalars, overlong lines, duplicate keys);
+ *   - keys the application never registered, with a suggestion when one
+ *     is a likely typo of a registered key;
+ *   - keys registered as DB-backed but written in the file, where they
+ *     have no effect;
+ *   - CFG_INT values that are not a decimal integer in int range and
+ *     CFG_BOOL values that are not true/false/yes/no/1/0, in the file and
+ *     in <APP>_<KEY> environment overrides.
+ *
+ * Every problem is printed to stderr as "<path>:<line>: <what>". */
+typedef enum {
+    CFG_VALIDATE_OFF = 0, /* problems ignored, as in 1.3 */
+    CFG_VALIDATE_WARN,    /* problems printed as warnings; init continues */
+    CFG_VALIDATE_STRICT,  /* any problem fails init with CUTILS_ERR_CONFIG */
+} config_validate_t;
+
+/* Options for config_init_opts. Zero-initialise and set what you need. */
+typedef struct {
+    config_validate_t   validate;
+    /* DB-backed keys the application will attach later, NULL-terminated.
+     * Only used to tell "this key belongs in the database" apart from
+     * "unknown key" when one turns up in the file. May be NULL. */
+    const config_key_t *db_keys;
+} config_init_opts_t;
+
 /* Opaque config handle */
 typedef struct cutils_config cutils_config_t;
 
@@ -111,6 +146,25 @@ int config_init(cutils_config_t **cfg,
                 config_first_run_t first_run,
                 const config_key_t *file_keys,
                 const config_section_t *sections);
+
+/* config_init with options (1.4.0). opts may be NULL, which is exactly
+ * config_init. With opts->validate at CFG_VALIDATE_STRICT, a file with any
+ * problem listed under config_validate_t returns CUTILS_ERR_CONFIG; the
+ * error buffer holds the first problem as "<path>:<line>: <what>" and
+ * every problem has been printed to stderr. */
+CUTILS_MUST_USE
+int config_init_opts(cutils_config_t **cfg,
+                     const char *app_name,
+                     const char *config_path,
+                     config_first_run_t first_run,
+                     const config_key_t *file_keys,
+                     const config_section_t *sections,
+                     const config_init_opts_t *opts);
+
+/* The line of the config file that sets a file-backed key, or 0 when the
+ * file does not set it (or cfg is NULL). For application-level checks
+ * that want to point at the line, as the built-in ones do. */
+int config_key_line(const cutils_config_t *cfg, const char *key);
 
 /* Free the config handle. */
 void config_free(cutils_config_t *cfg);
