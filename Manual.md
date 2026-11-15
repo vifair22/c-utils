@@ -403,6 +403,8 @@ appguard_config_t cfg = {
 appguard_t *guard = appguard_init(&cfg);
 ```
 
+The config file is chmod'ed only when its mode differs from `config_mode` (1.3.1). One already at the mode is left alone, so a config bind-mounted read-only into a container works. One at the wrong mode on a filesystem that refuses the change (`EROFS`, `EPERM`) produces a warning on stderr and init continues; any other chmod failure makes `appguard_init` return NULL.
+
 Set once, forget — no `umask` call required in the app, no follow-up chmod, no knowledge of sqlite sidecar internals. Chmod failure during init is a hard error (`appguard_init` returns NULL). See `include/cutils/appguard.h` for the field documentation, including the mid-session SHM-recreate edge case.
 
 ### Transactions
