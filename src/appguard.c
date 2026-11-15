@@ -214,6 +214,21 @@ static int chmod_db_artifacts(const char *db_path, mode_t mode)
     return chmod_sidecar(sidecar, mode);
 }
 
+/* log.level as written, to a level. Returns 0 and sets *out, or -1 for
+ * anything else. "warn" is accepted beside "warning": the shorter
+ * spelling is what most applications document, and until 1.4.0 it was
+ * silently read as the compiled-in default. */
+static int parse_log_level(const char *s, log_level_t *out)
+{
+    if (strcmp(s, "debug") == 0)        *out = LOG_DEBUG;
+    else if (strcmp(s, "info") == 0)    *out = LOG_INFO;
+    else if (strcmp(s, "warn") == 0 ||
+             strcmp(s, "warning") == 0) *out = LOG_WARNING;
+    else if (strcmp(s, "error") == 0)   *out = LOG_ERROR;
+    else return -1;
+    return 0;
+}
+
 /* --- Init --- */
 
 appguard_t *appguard_init(const appguard_config_t *cfg)
@@ -247,12 +262,17 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
     /* cppcheck-suppress-begin memleak */
 
     /* Step 1-2: Config file (parse or generate + validate) */
-    int rc = config_init(&guard->config,
-                         cfg->app_name,
-                         cfg->config_path,
-                         cfg->on_first_run,
-                         cfg->file_keys,
-                         cfg->sections);
+    config_init_opts_t copts = {
+        .validate = cfg->config_validate,
+        .db_keys  = cfg->db_keys,
+    };
+    int rc = config_init_opts(&guard->config,
+                              cfg->app_name,
+                              cfg->config_path,
+                              cfg->on_first_run,
+                              cfg->file_keys,
+                              cfg->sections,
+                              &copts);
 
     if (rc == CUTILS_ERR_NOT_FOUND) {
         /* Template generated, first_run = EXIT — silent cleanup. */
@@ -261,6 +281,30 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
     if (rc != CUTILS_OK) {
         fprintf(stderr, "appguard: config init failed: %s\n", cutils_get_error());
         return NULL;
+    }
+
+    /* log.level is AppGuard's to interpret, so AppGuard checks it, here
+     * rather than at step 7 so a bad value stops the process before the
+     * database is touched. An unrecognised level used to fall back to
+     * cfg->log_level without a word. */
+    log_level_t level = cfg->log_level ? cfg->log_level : LOG_INFO;
+    {
+        const char *lv = config_get_str(guard->config, "log.level");
+        if (lv && lv[0] && parse_log_level(lv, &level) != 0 &&
+            cfg->config_validate != CFG_VALIDATE_OFF) {
+            int strict = cfg->config_validate == CFG_VALIDATE_STRICT;
+            int line = config_key_line(guard->config, "log.level");
+            char where[512] = "";
+            if (line > 0)
+                snprintf(where, sizeof(where), "%s:%d: ",
+                         config_get_path(guard->config), line);
+            fprintf(stderr, "%s%s: log.level: '%s' is not one of debug, info, "
+                    "warn, error\n", where, strict ? "error" : "warning", lv);
+            if (strict) {
+                fprintf(stderr, "appguard: config init failed: invalid log.level\n");
+                return NULL;
+            }
+        }
     }
 
     /* Lock down the config file if requested. config_init has
@@ -383,18 +427,7 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
         return NULL;
     }
 
-    /* Step 7: Start log writer */
-    log_level_t level = cfg->log_level ? cfg->log_level : LOG_INFO;
-
-    /* Check if log level is overridden in config */
-    const char *log_level_str = config_get_str(guard->config, "log.level");
-    if (log_level_str && log_level_str[0]) {
-        if (strcmp(log_level_str, "debug") == 0)        level = LOG_DEBUG;
-        else if (strcmp(log_level_str, "info") == 0)    level = LOG_INFO;
-        else if (strcmp(log_level_str, "warning") == 0) level = LOG_WARNING;
-        else if (strcmp(log_level_str, "error") == 0)   level = LOG_ERROR;
-    }
-
+    /* Step 7: Start log writer, at the level resolved after step 1. */
     rc = log_init(guard->db, level, cfg->log_retention_days);
     if (rc != CUTILS_OK) {
         fprintf(stderr, "appguard: log init failed: %s\n", cutils_get_error());
