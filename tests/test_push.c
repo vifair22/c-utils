@@ -930,6 +930,122 @@ static void test_push_stats_count_outcomes(void **state)
     free_fixture(&fix);
 }
 
+/* --- Failure causes in the log (1.5.1) ---
+ *
+ * A retried send logged "push transient failure (attempt N, retry in Ns)"
+ * and nothing about why; only the permanent line carried the HTTP status
+ * and body. These capture the worker's first failure line and check it
+ * names the cause. */
+
+static pthread_mutex_t g_fail_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_fail_line[512];
+
+static void fail_line_cb(const char *ts, const char *level, const char *func,
+                         const char *msg, void *userdata)
+{
+    (void)ts; (void)level; (void)func; (void)userdata;
+    if (!msg) return;
+    if (strncmp(msg, "push transient failure", 22) != 0 &&
+        strncmp(msg, "push permanently failed", 23) != 0)
+        return;
+    pthread_mutex_lock(&g_fail_mu);
+    if (!g_fail_line[0])
+        snprintf(g_fail_line, sizeof(g_fail_line), "%s", msg);
+    pthread_mutex_unlock(&g_fail_mu);
+}
+
+/* Sends one message to url and returns the first failure line logged,
+ * in out, within 10 seconds. */
+static void first_failure_line(const char *url, char *out, size_t out_sz)
+{
+    pthread_mutex_lock(&g_fail_mu);
+    g_fail_line[0] = '\0';
+    pthread_mutex_unlock(&g_fail_mu);
+    cutils_push_set_url(url);
+
+    push_fixture_t fix = make_fixture(1);
+    int h = log_stream_register(fail_line_cb, NULL);
+    assert_true(h >= 0);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+    assert_int_equal(push_send("cause title", "cause body"), CUTILS_OK);
+
+    out[0] = '\0';
+    for (int i = 0; i < 200 && !out[0]; i++) {
+        pthread_mutex_lock(&g_fail_mu);
+        snprintf(out, out_sz, "%s", g_fail_line);
+        pthread_mutex_unlock(&g_fail_mu);
+        struct timespec ts = { 0, 50 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+
+    log_stream_unregister(h);
+    push_shutdown();
+    cutils_push_set_url(NULL);
+    free_fixture(&fix);
+}
+
+static void test_push_transient_http_logs_status_and_body(void **state)
+{
+    (void)state;
+    fake_pushover_t fp;
+    fake_pushover_start(&fp, 503);
+    char url[64];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%d/1/messages.json", fp.port);
+
+    char line[512];
+    first_failure_line(url, line, sizeof(line));
+    fake_pushover_stop(&fp);
+
+    assert_non_null(strstr(line, "push transient failure (HTTP 503, "));
+    assert_non_null(strstr(line, "token is invalid"));
+    assert_non_null(strstr(line, "attempt 1"));
+    assert_non_null(strstr(line, "cause title"));
+}
+
+/* No HTTP status at all: the cause is curl's. A port that was bound and
+ * closed again refuses the connection. */
+static void test_push_transient_curl_logs_error(void **state)
+{
+    (void)state;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert_true(fd >= 0);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert_int_equal(bind(fd, (struct sockaddr *)&sa, sizeof(sa)), 0);
+    socklen_t slen = sizeof(sa);
+    assert_int_equal(getsockname(fd, (struct sockaddr *)&sa, &slen), 0);
+    int port = ntohs(sa.sin_port);
+    close(fd);
+
+    char url[64];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%d/1/messages.json", port);
+    char line[512];
+    first_failure_line(url, line, sizeof(line));
+
+    assert_non_null(strstr(line, "push transient failure (curl: "));
+    assert_non_null(strstr(line, "attempt 1"));
+}
+
+/* The permanent line reads as it did before the cause moved into
+ * send_one. */
+static void test_push_permanent_logs_status_and_body(void **state)
+{
+    (void)state;
+    fake_pushover_t fp;
+    fake_pushover_start(&fp, 400);
+    char url[64];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%d/1/messages.json", fp.port);
+
+    char line[512];
+    first_failure_line(url, line, sizeof(line));
+    fake_pushover_stop(&fp);
+
+    assert_non_null(strstr(line, "push permanently failed (HTTP 400, "));
+    assert_non_null(strstr(line, "token is invalid\"]}): cause title"));
+}
+
 static void test_push_stats_null_and_disabled(void **state)
 {
     (void)state;
@@ -992,6 +1108,9 @@ int main(void)
         cmocka_unit_test_teardown(test_shutdown_responsive_with_future_retry, teardown),
         cmocka_unit_test_teardown(test_build_postfields_no_truncation_oversize, teardown),
         cmocka_unit_test_teardown(test_push_stats_count_outcomes, teardown),
+        cmocka_unit_test_teardown(test_push_transient_http_logs_status_and_body, teardown),
+        cmocka_unit_test_teardown(test_push_transient_curl_logs_error, teardown),
+        cmocka_unit_test_teardown(test_push_permanent_logs_status_and_body, teardown),
         cmocka_unit_test_teardown(test_push_stats_null_and_disabled, teardown),
         cmocka_unit_test_teardown(test_push_stats_query_failure, teardown),
     };
