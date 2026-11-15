@@ -96,6 +96,29 @@ typedef struct {
      * leaving it alone is a legitimate choice the application
      * author has expressed by not setting this field. */
     mode_t                  config_mode;
+
+    /* --- Application-driven shutdown (1.3.0) ---
+     *
+     * By default the first SIGINT or SIGTERM is handled entirely inside
+     * AppGuard: the signal watcher drains push, log and DB, then calls
+     * exit(0). The application never hears about it, which is fine for a
+     * tool and wrong for a daemon with worker threads in flight: the DB is
+     * closed underneath them, and the app's own teardown (stop accepting
+     * requests, cancel jobs, remove a socket) never runs.
+     *
+     * When on_signal is set, the first SIGINT or SIGTERM instead calls
+     * on_signal(sig, on_signal_ctx) from the watcher thread and AppGuard
+     * keeps running. The app is expected to wind down and call
+     * appguard_shutdown() itself, in its own order. The callback runs on a
+     * regular thread, so it may lock, log, or signal a condition variable,
+     * but it should return promptly: setting a flag the main loop watches
+     * is the intended use.
+     *
+     * A second SIGINT or SIGTERM takes the default path and exits, so an
+     * operator can still stop a process whose shutdown has wedged. NULL
+     * keeps the 1.2.0 behavior. */
+    void                  (*on_signal)(int sig, void *ctx);
+    void                   *on_signal_ctx;
 } appguard_config_t;
 
 /* Opaque handle */

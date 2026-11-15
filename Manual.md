@@ -164,7 +164,7 @@ int main(int argc, char **argv)
 
 **What happens on first run:** AppGuard generates `config.yaml` with all file-backed keys (including `db.path`, which c-utils registers automatically), prints a message, and returns `NULL`. The user edits the config and restarts.
 
-**What happens on SIGINT/SIGTERM:** AppGuard's signal handler calls `appguard_shutdown()` and then `_exit(0)`. The main loop does not get control back — cleanup is handled by the shutdown sequence (log writer drained, push worker drained, DB closed). If the application needs to do its own cleanup before exit, see [Signal handling](#signal-handling) in Section 9.
+**What happens on SIGINT/SIGTERM:** by default AppGuard's signal watcher drains the log writer and push worker, closes the DB and calls `exit(0)`; the main loop does not get control back. An application that needs to run its own shutdown sets `on_signal` (1.3.0) and is told instead. See [Signal handling](#signal-handling) in Section 9.
 
 ---
 
@@ -1121,7 +1121,7 @@ appguard_config_t cfg = {
 6. **Attach DB config** — registers DB-backed keys, seeds defaults for new keys.
 7. **Start log writer** — background thread for async DB persistence. Checks for `log.level` override in config.
 8. **Start push worker** — if `enable_pushover` is set and credentials are configured.
-9. **Install signal handlers** — `SIGINT` and `SIGTERM` trigger graceful shutdown.
+9. **Start the signal watcher**: `SIGINT` and `SIGTERM` trigger a graceful shutdown, or call the application's `on_signal` when one is set.
 
 After `appguard_init()` returns successfully, all subsystems are running. Logging and push are available globally (no handle needed). The database and config handles are available via `appguard_db()` and `appguard_config()`.
 
@@ -1138,7 +1138,7 @@ Performs the reverse of initialization:
 3. Close database
 4. Free config
 
-Safe to call multiple times (guarded by internal flag). Also called by the signal handler on `SIGINT`/`SIGTERM`.
+Safe to call multiple times (guarded by internal flag). An application using `on_signal` calls it after its own teardown.
 
 ### Restart
 
@@ -1192,39 +1192,40 @@ The new process starts from scratch — `main()` runs again, `appguard_init()` r
 
 ### Signal handling
 
-AppGuard installs handlers for `SIGINT` (Ctrl-C) and `SIGTERM` (kill/systemd stop). The handler performs a graceful shutdown (drains log writer, drains push worker, closes database) and then calls `_exit(0)`. The application's main loop does not get control back.
+AppGuard blocks `SIGINT` (Ctrl-C), `SIGTERM` (kill, systemd stop) and `SIGUSR1` in every thread at the start of `appguard_init()`, and a dedicated watcher thread receives them with `sigwait`. Because the signals are blocked process-wide, **a handler the application installs with `signal()` or `sigaction()` never runs**: the watcher takes the signal first. Earlier versions of this manual recommended exactly that override, and it silently did nothing.
 
-This means:
+By default the watcher handles the first `SIGINT` or `SIGTERM` itself: it drains the log writer and the push worker, closes the database, and calls `exit(0)`. The application's main loop does not get control back. That suits a tool. It does not suit a daemon with worker threads in flight, because the database is closed underneath them and the application's own teardown (stop accepting requests, cancel jobs, remove a socket or pidfile) never runs.
 
-- The application does not need to implement its own signal handling for graceful shutdown — AppGuard handles it.
-- Any cleanup the application needs to do (closing hardware connections, writing final state) will **not** happen automatically. If the application needs custom cleanup on shutdown, it has two options:
-
-**Option 1: Cooperative shutdown flag.** Use a `volatile sig_atomic_t` flag and check it in the main loop. Install your own signal handler *after* `appguard_init()` that sets the flag instead of calling `_exit`:
+**Application-driven shutdown (1.3.0).** Set `on_signal` in `appguard_config_t`. The first `SIGINT` or `SIGTERM` then calls `on_signal(sig, on_signal_ctx)` on the watcher thread instead, and AppGuard keeps running. The application winds down in its own order and calls `appguard_shutdown()`, which stops the watcher and the subsystems as usual. A **second** `SIGINT` or `SIGTERM` takes the default path and exits, so an operator can still stop a process whose shutdown has wedged.
 
 ```c
-static volatile sig_atomic_t running = 1;
+#include <stdatomic.h>
 
-static void my_signal_handler(int sig)
+static atomic_int running = 1;
+
+static void on_signal(int sig, void *ctx)
 {
-    (void)sig;
-    running = 0;
+    (void)sig; (void)ctx;
+    atomic_store(&running, 0);
 }
 
 int main(int argc, char **argv)
 {
     appguard_set_argv(argc, argv);
+    appguard_config_t cfg = {
+        .app_name  = "myapp",
+        .on_signal = on_signal,
+        /* ... */
+    };
     appguard_t *guard = appguard_init(&cfg);
     if (!guard) return 1;
 
-    /* Override AppGuard's signal handler */
-    signal(SIGINT, my_signal_handler);
-    signal(SIGTERM, my_signal_handler);
-
-    while (running) {
+    while (atomic_load(&running)) {
         /* ... main loop ... */
     }
 
-    /* Custom cleanup here */
+    /* The application's teardown, while the DB and logging still work. */
+    stop_workers();
     close_hardware();
 
     appguard_shutdown(guard);
@@ -1232,7 +1233,9 @@ int main(int argc, char **argv)
 }
 ```
 
-**Option 2: Accept the default.** For many applications, the AppGuard shutdown sequence is sufficient — logs are drained, notifications are sent, the database is closed cleanly. If no additional cleanup is needed, the default signal behavior is the simplest option.
+The callback runs on an ordinary thread, so it may lock, log or signal a condition variable, but it should return promptly; setting a flag the main loop watches is the intended use.
+
+**Or accept the default.** For many applications the AppGuard sequence is sufficient: logs are drained, notifications are sent, the database is closed cleanly. Resources that still need cleanup on that path (a pidfile, say) can be registered with `atexit`, which `exit(0)` runs.
 
 ### Accessors
 
@@ -1255,7 +1258,7 @@ c-utils manages three internal background threads. The consuming application doe
 |---|---|---|---|---|
 | **Log writer** | Drains the log entry queue to SQLite. Periodically (once per day) deletes log rows older than `log_retention_days`. | `log_init()` (when called with a non-NULL `db`) | `log_shutdown()` | `log_mutex` + `log_cond` for queue; goes through `db_execute_non_query()` (so the DB mutex too) for inserts. |
 | **Push worker** | Polls the `push` table for ready-to-send notifications, delivers them via libcurl, applies backoff on transient failures, marks `failed=1` on permanent failures. | `push_init()` (when creds are configured AND `appguard_config_t.enable_pushover` is set) | `push_shutdown()` | `push_mutex` + `push_cond` to throttle; reads/writes the `push` table via `db_execute*` (DB mutex). |
-| **Signal watcher** | Receives SIGINT / SIGTERM / SIGUSR1 via `sigwait` — the dedicated synchronous handler that replaces the pre-1.0.1 async signal handler. On SIGINT/SIGTERM it tears down subsystems and `exit(0)`s. On SIGUSR1 (sent by `appguard_shutdown`) it exits the watcher cleanly. | `appguard_init()` (always — last init step) | `appguard_shutdown()` sends SIGUSR1 then joins. | None during steady state; on signal-driven shutdown it takes the same locks as `appguard_shutdown`. |
+| **Signal watcher** | Receives SIGINT / SIGTERM / SIGUSR1 via `sigwait`, the dedicated synchronous handler that replaces the pre-1.0.1 async signal handler. On SIGINT/SIGTERM it tears down subsystems and `exit(0)`s, unless `on_signal` is set, in which case the first one calls it and only a second forces the exit. On SIGUSR1 (sent by `appguard_shutdown`) it exits the watcher cleanly. | `appguard_init()` (always, as the last init step) | `appguard_shutdown()` sends SIGUSR1 then joins. | None during steady state; on signal-driven shutdown it takes the same locks as `appguard_shutdown`. |
 
 All three threads are started by `appguard_init()` in the order above and stopped by `appguard_shutdown()` in reverse. Each *_init() / *_shutdown() pair is also exposed individually, so applications not using AppGuard can manage them directly.
 
@@ -1287,7 +1290,7 @@ A handful of cross-thread flags use `_Atomic` rather than a mutex because the re
 - **Direct callers must order init+shutdown carefully.** `db_open` first, then `log_init(db, ...)` and `push_init(db, cfg)`. At shutdown: stop the workers (`push_shutdown`, `log_shutdown`) before `db_close`. The DB is the bottom of the stack.
 - **Iterator scopes must end before `db_close`.** A `cutils_db_iter_t` holds the connection mutex from `db_iter_begin` to `db_iter_end`. See the Streaming queries section under Database.
 - **Stream-callback userdata must outlive in-flight `log_*` calls.** `log_stream_unregister` can return while a concurrent `fire_streams` snapshot still holds a pointer to the just-unregistered slot. Apps that unregister at runtime must keep `userdata` alive until any in-flight `log_*` calls on other threads have returned.
-- **Signal-driven shutdown is one-way.** When the watcher takes the SIGINT/SIGTERM path, it drains the worker queues, runs `atexit` handlers, and `exit(0)`s — the consuming app's `main()` does not return. Resources that need explicit cleanup (e.g. unlinking a pidfile) should be registered via `atexit`.
+- **Default signal-driven shutdown is one-way.** When the watcher takes the SIGINT/SIGTERM path (no `on_signal`, or a second signal), it drains the worker queues, runs `atexit` handlers, and `exit(0)`s, so the consuming app's `main()` does not return. Resources that need explicit cleanup (e.g. unlinking a pidfile) should be registered via `atexit`.
 
 ### Thread-safety quick reference
 
