@@ -5,6 +5,17 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.4.0] - unreleased
+
+### Fixed
+
+- **A version bump now rebuilds the object that reports the version.**
+  `version.c` takes the version from `release_version` through a compiler
+  define, so make never saw the dependency: an incremental build after a
+  bump kept the old `version.o`, and `cutils_version()` reported the
+  previous release. Found when c-backup's daemon logged c-utils 1.2.0
+  while linked against 1.3.1.
+
 ## [1.3.1] - 2026-11-15
 
 ### Fixed

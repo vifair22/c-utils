@@ -99,6 +99,11 @@ $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/vendor/%.o: lib/cJSON/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(VENDOR_RELAX) $(VENDOR_CJSON_ALLOW) -c $< -o $@
 
+# version.c embeds release_version through VERSION_DEFINE, which make cannot
+# see as a prerequisite. Without this an object built before a version bump
+# survived it, and the library went on reporting the old version.
+$(BUILD_DIR)/version.o $(TEST_DIR)/obj/version.o $(BENCH_DIR)/lib/version.o: release_version
+
 # Syntax check
 check:
 	@$(CC) $(CFLAGS) -fsyntax-only $(SRCS)
