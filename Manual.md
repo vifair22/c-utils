@@ -1145,7 +1145,11 @@ concurrently with `push_shutdown` / `appguard_shutdown`.
 
 A rejection is also logged with the HTTP status and the start of Pushover's
 response body, which says why (`push permanently failed (HTTP 400,
-{"user":"invalid",...}): <title>`).
+{"user":"invalid",...}): <title>`). A transient failure carries its cause
+the same way, before the attempt count: the HTTP status and body for a 5xx,
+or curl's error for a send that got no response (`push transient failure
+(curl: Failed to connect to api.pushover.net port 443 ...; attempt 2, retry
+in 60s): <title>`).
 
 ### Disabled contract
 
