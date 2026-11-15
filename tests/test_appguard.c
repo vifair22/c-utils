@@ -761,6 +761,82 @@ static void test_sigterm_clean_exit(void **state)
     assert_int_equal(WEXITSTATUS(status), 0);
 }
 
+/* --- Application-driven shutdown (1.3.0) --- */
+
+static volatile int g_signalled = 0;
+static void note_signal(int sig, void *ctx)
+{
+    (void)sig;
+    *(volatile int *)ctx = 1;
+}
+
+/* Fork a child that inits AppGuard with on_signal set and, once told, runs
+ * its own shutdown and exits with 7. With ignore_first, it never acts on the
+ * callback, so only a second signal can end it. */
+static pid_t spawn_hooked_child(int ignore_first)
+{
+    write_file(TEST_CFG, "db:\n  path: " TEST_DB "\n");
+    pid_t pid = fork();
+    if (pid == 0) {
+        appguard_config_t cfg = {
+            .app_name = "testguard",
+            .config_path = TEST_CFG,
+            .on_first_run = CFG_FIRST_RUN_CONTINUE,
+            .log_level = LOG_ERROR,
+            .on_signal = note_signal,
+            .on_signal_ctx = (void *)&g_signalled,
+        };
+        appguard_t *guard = appguard_init(&cfg);
+        if (!guard) _exit(2);
+        for (;;) {
+            struct timespec t = { 0, 10 * 1000 * 1000 };
+            nanosleep(&t, NULL);
+            if (g_signalled && !ignore_first) {
+                /* The app's own teardown, then AppGuard's. */
+                appguard_shutdown(guard);
+                _exit(7);
+            }
+        }
+    }
+    assert_true(pid > 0);
+    struct timespec gap = { 0, 300 * 1000 * 1000 };
+    nanosleep(&gap, NULL);
+    return pid;
+}
+
+/* The first SIGTERM reaches the app, which shuts down in its own order. The
+ * exit status proves the app's path ran rather than AppGuard's exit(0). */
+static void test_on_signal_lets_the_app_shut_down(void **state)
+{
+    (void)state;
+    pid_t pid = spawn_hooked_child(0);
+    assert_int_equal(kill(pid, SIGTERM), 0);
+    int status = -1;
+    assert_int_equal(waitpid(pid, &status, 0), pid);
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 7);
+}
+
+/* An app whose shutdown never comes can still be stopped: the second
+ * signal takes AppGuard's forced exit. */
+static void test_second_signal_forces_exit(void **state)
+{
+    (void)state;
+    pid_t pid = spawn_hooked_child(1);
+    assert_int_equal(kill(pid, SIGTERM), 0);
+
+    /* Still running after the first: the hook took it. */
+    struct timespec gap = { 0, 200 * 1000 * 1000 };
+    nanosleep(&gap, NULL);
+    int status = -1;
+    assert_int_equal(waitpid(pid, &status, WNOHANG), 0);
+
+    assert_int_equal(kill(pid, SIGINT), 0);
+    assert_int_equal(waitpid(pid, &status, 0), pid);
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 0);
+}
+
 /* --- File-permission enforcement (1.2.0) --- */
 
 static mode_t file_mode(const char *path)
@@ -1077,6 +1153,8 @@ int main(void)
         cmocka_unit_test_teardown(test_db_and_config_mode_combined, teardown),
         cmocka_unit_test_teardown(test_db_mode_migration_failure_restores_umask, teardown),
         cmocka_unit_test_teardown(test_config_get_path_accessor, teardown),
+        cmocka_unit_test_teardown(test_on_signal_lets_the_app_shut_down, teardown),
+        cmocka_unit_test_teardown(test_second_signal_forces_exit, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

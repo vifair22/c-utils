@@ -5,6 +5,34 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.3.0] - 2026-11-15
+
+Lets a daemon own its shutdown. One new optional `appguard_config_t`
+pair; no signatures change and an application that does not set it
+behaves exactly as under 1.2.0.
+
+### Added
+
+- **`appguard_config_t.on_signal` / `on_signal_ctx`** - when set, the
+  first SIGINT or SIGTERM calls `on_signal(sig, ctx)` on the signal
+  watcher thread instead of draining the subsystems and calling
+  `exit(0)`. The application stops its own work in its own order and
+  then calls `appguard_shutdown()`. A second SIGINT or SIGTERM takes
+  the default forced exit, so a wedged shutdown can still be stopped.
+
+  Without it there was no way for an application to run its own
+  teardown on a signal: the signals are blocked in every thread and
+  the watcher receives them, so a handler installed with `signal()` or
+  `sigaction()` never ran. c-backupd had one, and `systemctl stop`
+  closed the database underneath running backup jobs without the
+  daemon's shutdown path ever executing.
+
+### Fixed
+
+- **Manual: signal handling.** The documented way to run custom
+  cleanup, installing a `signal()` handler after `appguard_init()`,
+  could not work for the reason above. Rewritten around `on_signal`.
+
 ## [1.2.0] - 2026-05-13
 
 Security-focused minor release. Wires the v1.1.0 `db_open_with_mode`
