@@ -300,7 +300,15 @@ yaml_doc_t *yaml_parse_file(const char *path)
         if (!whole && !continuation)
             rc |= doc_add_issue(doc, lineno,
                 "line is longer than %zu bytes", sizeof(line) - 1);
+        int first_chunk = lineno == 1 && !continuation;
         continuation = !whole;
+
+        /* A UTF-8 byte order mark is legal YAML and what several Windows
+         * editors write. Left in, it glued itself to the first section
+         * name and the line was reported as something it visibly was not.
+         * Dropped here, it also does not survive a rewrite. */
+        if (first_chunk && strncmp(line, "\xEF\xBB\xBF", 3) == 0)
+            memmove(line, line + 3, strlen(line + 3) + 1);
 
         /* Store raw line (with newline stripped) */
         char raw[1024];
@@ -315,12 +323,16 @@ yaml_doc_t *yaml_parse_file(const char *path)
         }
         /* LCOV_EXCL_STOP */
 
+        /* Trailing whitespace goes first, CR included, so a CRLF file
+         * parses like an LF one. A blank CRLF line used to be "\r", not
+         * blank, and was reported as "'' is not a section header" with
+         * the CR invisible in the message. */
+        strip_trailing_whitespace(line);
+
         /* Skip blank lines and comments */
         const char *trimmed = skip_whitespace(line);
-        if (*trimmed == '\0' || *trimmed == '\n' || *trimmed == '#')
+        if (*trimmed == '\0' || *trimmed == '#')
             continue;
-
-        strip_trailing_whitespace(line);
 
         /* Section header: "section:" at column 0, no leading whitespace */
         if (line[0] != ' ' && line[0] != '\t') {
@@ -355,6 +367,14 @@ yaml_doc_t *yaml_parse_file(const char *path)
                 "indented line outside any section");
             continue;
         }
+
+        /* YAML forbids tabs in indentation. This parser measured them
+         * as one column each, so a tab-indented section loaded, and a
+         * file mixing tabs and spaces reported a mismatch nobody could
+         * see. Say what it is. */
+        if (memchr(line, '\t', (size_t)(trimmed - line)))
+            rc |= doc_add_issue(doc, lineno,
+                "tab in the indentation; YAML indents with spaces only");
 
         int indent = (int)(trimmed - line);
         if (sec_indent < 0)

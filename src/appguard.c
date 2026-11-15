@@ -214,21 +214,6 @@ static int chmod_db_artifacts(const char *db_path, mode_t mode)
     return chmod_sidecar(sidecar, mode);
 }
 
-/* log.level as written, to a level. Returns 0 and sets *out, or -1 for
- * anything else. "warn" is accepted beside "warning": the shorter
- * spelling is what most applications document, and until 1.4.0 it was
- * silently read as the compiled-in default. */
-static int parse_log_level(const char *s, log_level_t *out)
-{
-    if (strcmp(s, "debug") == 0)        *out = LOG_DEBUG;
-    else if (strcmp(s, "info") == 0)    *out = LOG_INFO;
-    else if (strcmp(s, "warn") == 0 ||
-             strcmp(s, "warning") == 0) *out = LOG_WARNING;
-    else if (strcmp(s, "error") == 0)   *out = LOG_ERROR;
-    else return -1;
-    return 0;
-}
-
 /* --- Init --- */
 
 appguard_t *appguard_init(const appguard_config_t *cfg)
@@ -263,8 +248,10 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
 
     /* Step 1-2: Config file (parse or generate + validate) */
     config_init_opts_t copts = {
-        .validate = cfg->config_validate,
-        .db_keys  = cfg->db_keys,
+        .validate  = cfg->config_validate,
+        .db_keys   = cfg->db_keys,
+        .check     = cfg->config_check,
+        .check_ctx = cfg->config_check_ctx,
     };
     int rc = config_init_opts(&guard->config,
                               cfg->app_name,
@@ -283,28 +270,15 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
         return NULL;
     }
 
-    /* log.level is AppGuard's to interpret, so AppGuard checks it, here
-     * rather than at step 7 so a bad value stops the process before the
-     * database is touched. An unrecognised level used to fall back to
-     * cfg->log_level without a word. */
+    /* An unrecognised log.level keeps cfg->log_level. Validation has
+     * already reported it (and refused it under STRICT) since 1.5.0, in
+     * the same list as everything else; AppGuard checked it here, after
+     * config init, which dropped it whenever init failed on another
+     * problem. */
     log_level_t level = cfg->log_level ? cfg->log_level : LOG_INFO;
     {
         const char *lv = config_get_str(guard->config, "log.level");
-        if (lv && lv[0] && parse_log_level(lv, &level) != 0 &&
-            cfg->config_validate != CFG_VALIDATE_OFF) {
-            int strict = cfg->config_validate == CFG_VALIDATE_STRICT;
-            int line = config_key_line(guard->config, "log.level");
-            char where[512] = "";
-            if (line > 0)
-                snprintf(where, sizeof(where), "%s:%d: ",
-                         config_get_path(guard->config), line);
-            fprintf(stderr, "%s%s: log.level: '%s' is not one of debug, info, "
-                    "warn, error\n", where, strict ? "error" : "warning", lv);
-            if (strict) {
-                fprintf(stderr, "appguard: config init failed: invalid log.level\n");
-                return NULL;
-            }
-        }
+        if (lv && lv[0]) (void)log_level_parse(lv, &level);
     }
 
     /* Lock down the config file if requested. config_init has

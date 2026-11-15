@@ -1155,6 +1155,163 @@ static void test_validate_generated_template(void **state)
     config_free(cfg);
 }
 
+/* --- 1.5.0 --- */
+
+/* log.level is checked in the same pass, so it is reported beside the
+ * file's other problems instead of dropped when one of them fails init. */
+static void test_validate_log_level_joins_the_list(void **state)
+{
+    (void)state;
+    assert_strict_error("db:\n  path: test.db\nhttp:\n  port: abc\n"
+                        "log:\n  level: verbose\n",
+                        TEST_CFG ":4: http.port: 'abc' is not an integer "
+                        "(and 1 more, printed above)");
+    assert_strict_error("db:\n  path: test.db\nlog:\n  level: verbose\n",
+                        TEST_CFG ":4: log.level: 'verbose' is not one of debug");
+}
+
+/* A missing required key is one more problem in the list. */
+static void test_validate_required_joins_the_list(void **state)
+{
+    (void)state;
+    assert_strict_error("http:\n  port: abc\n",
+                        "(and 1 more, printed above)");
+    assert_strict_error("http:\n  port: 1\n",
+                        "required config key 'db.path' is missing or empty; "
+                        "it has no default");
+}
+
+/* The environment satisfies a required key, as it does every read. */
+static void test_required_satisfied_by_env(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG, "http:\n  port: 1\n");
+    setenv("TESTAPP_DB_PATH", "env.db", 1);
+    cutils_config_t *cfg = NULL;
+    int rc = init_v(&cfg, CFG_VALIDATE_STRICT);
+    unsetenv("TESTAPP_DB_PATH");
+    assert_int_equal(rc, CUTILS_OK);
+    assert_string_equal(config_get_str(cfg, "db.path"), "env.db");
+    config_free(cfg);
+
+    /* OFF mode takes the post-validation check, which names the file. */
+    cfg = NULL;
+    assert_int_equal(init_v(&cfg, CFG_VALIDATE_OFF), CUTILS_ERR_CONFIG);
+    assert_non_null(strstr(cutils_get_error(),
+                           TEST_CFG ": required config key 'db.path'"));
+}
+
+static const char *const themes[] = { "dark", "light", NULL };
+
+static void app_check(const cutils_config_t *cfg, config_check_t *chk, void *ctx)
+{
+    (void)cfg;
+    int *calls = ctx;
+    (*calls)++;
+    config_check_int_range(chk, "http.port", 1, 65535);
+    config_check_one_of(chk, "security.key_dir", themes);
+    if (config_get_bool(cfg, "http.secure", 0))
+        config_check_fail(chk, "http.secure", "needs %s", "TLS");
+}
+
+static int init_checked(cutils_config_t **cfg, config_validate_t mode,
+                        int *calls)
+{
+    config_init_opts_t o = { .validate = mode, .check = app_check,
+                             .check_ctx = calls };
+    return config_init_opts(cfg, "testapp", TEST_CFG, CFG_FIRST_RUN_CONTINUE,
+                            v_keys, NULL, &o);
+}
+
+static void assert_checked_error(const char *yaml, const char *needle)
+{
+    write_file(TEST_CFG, yaml);
+    cutils_config_t *cfg = NULL;
+    int calls = 0;
+    assert_int_equal(init_checked(&cfg, CFG_VALIDATE_STRICT, &calls),
+                     CUTILS_ERR_CONFIG);
+    assert_int_equal(calls, 1);
+    const char *err = cutils_get_error();
+    if (!strstr(err, needle))
+        fail_msg("error '%s' lacks '%s'", err, needle);
+}
+
+static void test_check_reports_in_file_order(void **state)
+{
+    (void)state;
+    assert_checked_error("db:\n  path: t.db\nsecurity:\n  key_dir: dark\nhttp:\n  port: 99999\n",
+                         TEST_CFG ":6: http.port: '99999' is not between 1 "
+                         "and 65535");
+    assert_checked_error("db:\n  path: t.db\nsecurity:\n  key_dir: dark\nhttp:\n  port: 0\n",
+                         "'0' is not between");
+    /* Sorted with the built-in problems by line. */
+    assert_checked_error("db:\n  path: t.db\nsecurity:\n  key_dir: dark\nhttp:\n  port: -1\n  prot: 1\n",
+                         TEST_CFG ":6: http.port: '-1' is not between 1 and "
+                         "65535 (and 1 more, printed above)");
+    assert_checked_error("db:\n  path: t.db\nsecurity:\n  key_dir: blue\n",
+                         "security.key_dir: 'blue' is not one of dark, light");
+    assert_checked_error("db:\n  path: t.db\nsecurity:\n  key_dir: dark\nhttp:\n  secure: yes\n",
+                         TEST_CFG ":6: http.secure: needs TLS");
+}
+
+static void test_check_env_and_default(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG, "db:\n  path: t.db\nsecurity:\n  key_dir: dark\n");
+    setenv("TESTAPP_HTTP_PORT", "70000", 1);
+    cutils_config_t *cfg = NULL;
+    int calls = 0;
+    int rc = init_checked(&cfg, CFG_VALIDATE_STRICT, &calls);
+    unsetenv("TESTAPP_HTTP_PORT");
+    assert_int_equal(rc, CUTILS_ERR_CONFIG);
+    assert_non_null(strstr(cutils_get_error(),
+        "environment TESTAPP_HTTP_PORT (http.port): '70000' is not between"));
+
+    /* At its default the key has no line and no variable to name. The
+     * default /etc/keys is not a theme. */
+    write_file(TEST_CFG, "db:\n  path: t.db\n");
+    cfg = NULL;
+    assert_int_equal(init_checked(&cfg, CFG_VALIDATE_STRICT, &calls),
+                     CUTILS_ERR_CONFIG);
+    assert_non_null(strstr(cutils_get_error(),
+        "security.key_dir: '/etc/keys' is not one of"));
+}
+
+/* A non-integer is the type check's to report, once. Clean files pass,
+ * WARN loads, OFF does not call the check at all. */
+static void test_check_modes(void **state)
+{
+    (void)state;
+    assert_checked_error("db:\n  path: t.db\nhttp:\n  port: abc\n"
+                         "security:\n  key_dir: dark\n",
+                         TEST_CFG ":4: http.port: 'abc' is not an integer");
+    const char *err = cutils_get_error();
+    assert_null(strstr(err, "more"));
+
+    write_file(TEST_CFG, "db:\n  path: t.db\nhttp:\n  port: 8080\n"
+                         "security:\n  key_dir: light\n");
+    cutils_config_t *cfg = NULL;
+    int calls = 0;
+    assert_int_equal(init_checked(&cfg, CFG_VALIDATE_STRICT, &calls), CUTILS_OK);
+    config_free(cfg);
+
+    write_file(TEST_CFG, "db:\n  path: t.db\nhttp:\n  port: 0\n");
+    cfg = NULL;
+    assert_int_equal(init_checked(&cfg, CFG_VALIDATE_WARN, &calls), CUTILS_OK);
+    config_free(cfg);
+
+    calls = 0;
+    cfg = NULL;
+    assert_int_equal(init_checked(&cfg, CFG_VALIDATE_OFF, &calls), CUTILS_OK);
+    assert_int_equal(calls, 0);
+    config_free(cfg);
+
+    /* NULL arguments are ignored rather than crashing a check. */
+    config_check_fail(NULL, "k", "x");
+    config_check_int_range(NULL, "k", 0, 1);
+    config_check_one_of(NULL, "k", themes);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1202,6 +1359,12 @@ int main(void)
         cmocka_unit_test_teardown(test_validate_warn_and_off, teardown),
         cmocka_unit_test_teardown(test_validate_then_required, teardown),
         cmocka_unit_test_teardown(test_validate_generated_template, teardown),
+        cmocka_unit_test_teardown(test_validate_log_level_joins_the_list, teardown),
+        cmocka_unit_test_teardown(test_validate_required_joins_the_list, teardown),
+        cmocka_unit_test_teardown(test_required_satisfied_by_env, teardown),
+        cmocka_unit_test_teardown(test_check_reports_in_file_order, teardown),
+        cmocka_unit_test_teardown(test_check_env_and_default, teardown),
+        cmocka_unit_test_teardown(test_check_modes, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
