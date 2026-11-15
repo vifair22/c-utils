@@ -804,13 +804,13 @@ static void test_issue_none_for_supported_subset(void **state)
         "  quoted: \"a # b\"  # c\n"
         "  empty:\n"
         "  hash: a#b\n"
-        "tabbed:\n"
-        "\tkey: v\n");
+        "other:\n"
+        "    key: v\n");
     yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
     assert_non_null(doc);
     assert_int_equal(doc->nissues, 0);
     assert_int_equal(yaml_get_line(doc, "db.url"), 6);
-    assert_int_equal(yaml_get_line(doc, "tabbed.key"), 11);
+    assert_int_equal(yaml_get_line(doc, "other.key"), 11);
     assert_int_equal(yaml_get_line(doc, "db.missing"), 0);
     yaml_free(doc);
 }
@@ -941,6 +941,74 @@ static void test_issue_order(void **state)
     yaml_free(doc);
 }
 
+/* --- 1.5.0 --- */
+
+/* YAML forbids tabs in indentation; 1.4.0 took one as a column. The
+ * entry still loads, as every issue's line does. */
+static void test_issue_tab_indent(void **state)
+{
+    (void)state;
+    yaml_doc_t *doc = expect_issue("db:\n\tpath: x\n", 2,
+                                   "tab in the indentation");
+    assert_string_equal(yaml_get(doc, "db.path"), "x");
+    yaml_free(doc);
+    doc = expect_issue("db:\n \tpath: x\n", 2, "tab in the indentation");
+    yaml_free(doc);
+    /* One message, not a second about the indentation not matching. */
+    doc = expect_issue("db:\n  path: x\n\turl: y\n", 3, "tab in the indentation");
+    yaml_free(doc);
+}
+
+/* CRLF is legal YAML. Blank CRLF lines were reported as "'' is not a
+ * section header", one per blank line, with the CR invisible. */
+static void test_crlf_parses_like_lf(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML,
+        "# comment\r\n"
+        "\r\n"
+        "db:\r\n"
+        "  path: test.db\r\n"
+        "\r\n"
+        "http:\r\n"
+        "  bind: \"0.0.0.0\"\r\n");
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    if (doc->nissues)
+        fail_msg("unexpected issue: %s", doc->issues[0].msg);
+    assert_string_equal(yaml_get(doc, "db.path"), "test.db");
+    assert_string_equal(yaml_get(doc, "http.bind"), "0.0.0.0");
+    assert_int_equal(yaml_get_line(doc, "http.bind"), 7);
+    yaml_free(doc);
+}
+
+/* A UTF-8 BOM glued itself to the first section name. */
+static void test_bom_is_dropped(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML, "\xEF\xBB\xBF" "db:\n  path: test.db\n");
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    assert_int_equal(doc->nissues, 0);
+    assert_string_equal(yaml_get(doc, "db.path"), "test.db");
+    yaml_free(doc);
+
+    /* Only at the start of the file: elsewhere it is ordinary bytes, here
+     * part of a section name. */
+    write_file(TEST_YAML, "db:\n  path: test.db\n" "\xEF\xBB\xBF" "x:\n  k: v\n");
+    doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    assert_null(yaml_get(doc, "x.k"));
+    assert_string_equal(yaml_get(doc, "\xEF\xBB\xBF" "x.k"), "v");
+    yaml_free(doc);
+
+    /* A file shorter than a BOM. */
+    write_file(TEST_YAML, "\xEF");
+    doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    yaml_free(doc);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -959,6 +1027,9 @@ int main(void)
         cmocka_unit_test_teardown(test_issue_duplicate_key, teardown),
         cmocka_unit_test_teardown(test_issue_overlong_line, teardown),
         cmocka_unit_test_teardown(test_issue_order, teardown),
+        cmocka_unit_test_teardown(test_issue_tab_indent, teardown),
+        cmocka_unit_test_teardown(test_crlf_parses_like_lf, teardown),
+        cmocka_unit_test_teardown(test_bom_is_dropped, teardown),
         cmocka_unit_test_teardown(test_parse_basic, teardown),
         cmocka_unit_test_teardown(test_parse_comments_and_blanks, teardown),
         cmocka_unit_test_teardown(test_parse_missing_file, teardown),

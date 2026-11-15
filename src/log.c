@@ -413,6 +413,20 @@ log_level_t log_get_level(void)
     return atomic_load(&log_min_level);
 }
 
+/* "warn" beside "warning": the shorter spelling is what most applications
+ * document, and until 1.4.0 it was silently read as the default. */
+int log_level_parse(const char *s, log_level_t *out)
+{
+    if (!s || !out) return -1;
+    if (strcmp(s, "debug") == 0)        *out = LOG_DEBUG;
+    else if (strcmp(s, "info") == 0)    *out = LOG_INFO;
+    else if (strcmp(s, "warn") == 0 ||
+             strcmp(s, "warning") == 0) *out = LOG_WARNING;
+    else if (strcmp(s, "error") == 0)   *out = LOG_ERROR;
+    else return -1;
+    return 0;
+}
+
 void log_set_systemd_mode(int enabled)
 {
     atomic_store(&log_systemd_mode, enabled ? 1 : 0);

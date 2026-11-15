@@ -104,7 +104,14 @@ typedef enum {
  *     have no effect;
  *   - CFG_INT values that are not a decimal integer in int range and
  *     CFG_BOOL values that are not true/false/yes/no/1/0, in the file and
- *     in <APP>_<KEY> environment overrides.
+ *     in <APP>_<KEY> environment overrides;
+ *   - log.level, when set, against log_level_parse (1.5.0);
+ *   - required keys that are missing or empty (1.5.0: reported with the
+ *     rest rather than on their own after them);
+ *   - tabs in indentation (1.5.0);
+ *   - whatever the application's check function reports (1.5.0).
+ *
+ * A UTF-8 byte order mark and CRLF line endings are accepted (1.5.0).
  *
  * Every problem is printed to stderr as "<path>:<line>: <what>". */
 typedef enum {
@@ -113,6 +120,47 @@ typedef enum {
     CFG_VALIDATE_STRICT,  /* any problem fails init with CUTILS_ERR_CONFIG */
 } config_validate_t;
 
+/* Opaque config handle */
+typedef struct cutils_config cutils_config_t;
+
+/* --- Application checks (1.5.0) ---
+ *
+ * The built-in checks know types, not meaning: 99999 is a fine integer
+ * and a useless port, and "verbose" is a fine string. An application
+ * that wants those refused passes a check function, which validation
+ * calls after its own checks and before it prints anything, so the
+ * application's problems are reported in the same list, sorted by line,
+ * under the same validate mode. Before 1.5.0 an application could only
+ * check after init returned, and only if init succeeded, so one run
+ * reported either the file's problems or the application's, never both.
+ *
+ * The check runs on the main thread inside config_init_opts, with every
+ * file-backed key readable through config_get_* (database-backed keys
+ * are not attached yet). It runs only when validate is not OFF. */
+typedef struct config_check config_check_t;
+typedef void (*config_check_fn)(const cutils_config_t *cfg,
+                                config_check_t *chk, void *ctx);
+
+/* Report a problem with `key`, prefixed and located the way built-in
+ * problems are: "<path>:<line>: <key>: <message>" when the file sets the
+ * key, "environment <VAR> (<key>): <message>" when an environment
+ * override does, "<key>: <message>" when it is at its default. */
+__attribute__((format(printf, 3, 4)))
+void config_check_fail(config_check_t *chk, const char *key,
+                       const char *fmt, ...);
+
+/* Refuse an integer key outside [min, max]. A value that is not an
+ * integer at all is left to the built-in type check, which has already
+ * reported it. */
+void config_check_int_range(config_check_t *chk, const char *key,
+                            long min, long max);
+
+/* Refuse a string key whose value is not one of `allowed` (a
+ * NULL-terminated list, compared exactly). An empty value is "unset"
+ * and passes, as it does for the type check. */
+void config_check_one_of(config_check_t *chk, const char *key,
+                         const char *const *allowed);
+
 /* Options for config_init_opts. Zero-initialise and set what you need. */
 typedef struct {
     config_validate_t   validate;
@@ -120,10 +168,10 @@ typedef struct {
      * Only used to tell "this key belongs in the database" apart from
      * "unknown key" when one turns up in the file. May be NULL. */
     const config_key_t *db_keys;
+    /* Application checks (1.5.0), see config_check_fn. May be NULL. */
+    config_check_fn     check;
+    void               *check_ctx;
 } config_init_opts_t;
-
-/* Opaque config handle */
-typedef struct cutils_config cutils_config_t;
 
 /* --- Init / teardown --- */
 
