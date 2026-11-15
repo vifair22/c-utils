@@ -390,22 +390,181 @@ static int append_at_path(cJSON *root, const char *path, cJSON *item)
 /* Request — lifecycle                                           */
 /* ============================================================ */
 
+/* --- Duplicate member names (1.6.0) ---
+ *
+ * cJSON keeps every member of an object, duplicates included, and the
+ * getters return the first match. A body with "role" twice therefore
+ * meant whatever the first occurrence said, while a proxy, validator or
+ * logger in front of the service may have read the last: two parties
+ * disagreeing about the same request. RFC 8259 leaves duplicate names
+ * undefined, so they are refused.
+ *
+ * Each object's member names are copied into one scratch array, sorted
+ * and compared with their neighbour: O(n log n) per object, linear-ish
+ * over the document, where a pairwise check is O(n^2) on a large object
+ * an attacker controls. The scratch array is reused across objects and
+ * an object's names are checked before descending into its members, so
+ * one buffer serves the whole walk. It starts on the stack and moves to
+ * the heap only for an object wider than DUP_STACK_NAMES; an object of
+ * DUP_PAIRWISE_MAX members or fewer is compared pairwise, which for a
+ * handful of names is cheaper than calling qsort. Recursion depth is bounded by
+ * cJSON's parse nesting limit (CJSON_NESTING_LIMIT, 1000). Names compare
+ * byte-for-byte, as the getters look them up (case-sensitive). */
+
+/* Longest location reported for a duplicate; deeper paths are cut. */
+#define DUP_PATH_MAX 256
+#define DUP_STACK_NAMES  32
+#define DUP_PAIRWISE_MAX 8
+
+typedef struct {
+    const char **names;   /* stack_names, or a heap block once grown */
+    size_t       cap;
+    const char  *stack_names[DUP_STACK_NAMES];
+} dup_scratch_t;
+
+/* Where the duplicate was found. Built only on failure, right to left as
+ * the recursion unwinds, so a document without duplicates never formats
+ * a path: building it on the way down cost an snprintf per nested
+ * container, which was most of the check's cost on a small request. */
+typedef struct {
+    const char *dup;      /* the repeated name */
+    char        buf[DUP_PATH_MAX];
+    size_t      start;    /* path is buf[start .. DUP_PATH_MAX - 1) */
+    int         cut;      /* outer segments did not fit */
+} dup_where_t;
+
+static void where_prepend(dup_where_t *w, const char *seg, size_t seglen)
+{
+    if (w->cut || seglen > w->start) { w->cut = 1; return; }
+    w->start -= seglen;
+    memcpy(w->buf + w->start, seg, seglen);
+}
+
+static int cmp_name(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Returns CUTILS_ERR_JSON with w filled when a duplicate is found; the
+ * caller formats the message. Allocation failure sets the error itself. */
+static int check_dup_names(const cJSON *node, dup_scratch_t *s, dup_where_t *w)
+{
+    if (cJSON_IsObject(node)) {
+        size_t n = 0;
+        for (const cJSON *c = node->child; c; c = c->next) n++;
+        if (n > 1) {
+            if (n > s->cap) {
+                const char **grown = s->names == s->stack_names
+                    ? malloc(n * sizeof(*grown))
+                    : realloc(s->names, n * sizeof(*grown));
+                if (!grown)
+                    return set_error(CUTILS_ERR_NOMEM, /* LCOV_EXCL_LINE */
+                                     "duplicate-key check alloc failed");
+                s->names = grown;
+                s->cap   = n;
+            }
+            size_t i = 0;
+            for (const cJSON *c = node->child; c; c = c->next)
+                s->names[i++] = c->string ? c->string : "";
+            if (n <= DUP_PAIRWISE_MAX) {
+                for (i = 1; i < n; i++)
+                    for (size_t j = 0; j < i; j++)
+                        if (strcmp(s->names[j], s->names[i]) == 0) {
+                            w->dup = s->names[i];
+                            return CUTILS_ERR_JSON;
+                        }
+            } else {
+                qsort(s->names, n, sizeof(*s->names), cmp_name);
+                for (i = 1; i < n; i++)
+                    if (strcmp(s->names[i - 1], s->names[i]) == 0) {
+                        w->dup = s->names[i];
+                        return CUTILS_ERR_JSON;
+                    }
+            }
+        }
+        for (const cJSON *c = node->child; c; c = c->next) {
+            if (!cJSON_IsObject(c) && !cJSON_IsArray(c)) continue;
+            int rv = check_dup_names(c, s, w);
+            if (rv == CUTILS_ERR_JSON) {
+                const char *k = c->string ? c->string : "";
+                where_prepend(w, k, strlen(k));
+                where_prepend(w, ".", 1);
+            }
+            if (rv != CUTILS_OK) return rv;
+        }
+    } else if (cJSON_IsArray(node)) {
+        long idx = 0;
+        for (const cJSON *c = node->child; c; c = c->next, idx++) {
+            if (!cJSON_IsObject(c) && !cJSON_IsArray(c)) continue;
+            int rv = check_dup_names(c, s, w);
+            if (rv == CUTILS_ERR_JSON) {
+                char seg[24];
+                int sl = snprintf(seg, sizeof(seg), "[%ld]", idx);
+                where_prepend(w, seg, (size_t)sl);
+            }
+            if (rv != CUTILS_OK) return rv;
+        }
+    }
+    return CUTILS_OK;
+}
+
 int json_req_parse(const char *buf, size_t len, cutils_json_req_t **out)
 {
     if (!out) return set_error(CUTILS_ERR_INVALID, "null out");
     *out = NULL;
     if (!buf) return set_error(CUTILS_ERR_INVALID, "null buf");
 
-    CUTILS_AUTO_CJSON cJSON *root = cJSON_ParseWithLength(buf, len);
+    const char *end = NULL;
+    const char *stop = buf + len;
+    CUTILS_AUTO_CJSON cJSON *root =
+        cJSON_ParseWithLengthOpts(buf, len, &end, 0);
     if (!root) {
-        const char *errp = cJSON_GetErrorPtr();
-        if (errp && *errp)
-            return set_error(CUTILS_ERR_JSON,
-                             "JSON parse failed near: %.32s", errp);
+        /* The buffer need not be NUL-terminated (an HTTP body is not), so
+         * the excerpt is bounded by what is left of it; "%.32s" alone read
+         * past the end. */
+        if (end && end >= buf && end < stop)
+            return set_error(CUTILS_ERR_JSON, "JSON parse failed near: %.*s",
+                             (int)((size_t)(stop - end) < 32
+                                   ? (size_t)(stop - end) : 32), end);
         return set_error(CUTILS_ERR_JSON, "JSON parse failed");
     }
+
+    /* Only whitespace may follow the value (1.6.0). cJSON stops at the end
+     * of the first value and reported success for '{"a":1} junk' or
+     * '{"a":1}{"b":2}', so a body was accepted although part of it was
+     * never read. */
+    const char *p = end ? end : stop;
+    while (p < stop && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+        p++;
+    if (p < stop)
+        return set_error(CUTILS_ERR_JSON,
+                         "unexpected data after the JSON value, at byte %zu: %.*s",
+                         (size_t)(p - buf),
+                         (int)((size_t)(stop - p) < 32 ? (size_t)(stop - p) : 32), p);
+
     if (!cJSON_IsObject(root))
         return set_error(CUTILS_ERR_JSON, "JSON root is not an object");
+
+    dup_scratch_t scratch;
+    scratch.names = scratch.stack_names;
+    scratch.cap   = DUP_STACK_NAMES;
+    dup_where_t where;
+    where.dup   = NULL;
+    where.start = DUP_PATH_MAX - 1;
+    where.cut   = 0;
+    where.buf[DUP_PATH_MAX - 1] = '\0';
+    int rv = check_dup_names(root, &scratch, &where);
+    if (scratch.names != scratch.stack_names) free(scratch.names);
+    if (rv == CUTILS_ERR_JSON && where.dup) {
+        const char *loc = where.buf + where.start;
+        if (*loc == '.') loc++;   /* a member of the root has no leading dot */
+        if (!*loc)
+            return set_error(CUTILS_ERR_JSON,
+                             "duplicate key '%.64s' at the top level", where.dup);
+        return set_error(CUTILS_ERR_JSON, "duplicate key '%.64s' in object '%s%s'",
+                         where.dup, where.cut ? "..." : "", loc);
+    }
+    if (rv != CUTILS_OK) return rv; /* LCOV_EXCL_LINE - allocation failure */
 
     CUTILS_AUTO_JSON_REQ cutils_json_req_t *req = calloc(1, sizeof(*req));
     if (!req) return set_error(CUTILS_ERR_NOMEM, "req alloc failed");

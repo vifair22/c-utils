@@ -79,8 +79,17 @@ typedef struct cutils_json_resp cutils_json_resp_t;
 /* ============================================================ */
 
 /* Parse a JSON object from a buffer. Input buffer is not retained;
- * the request handle owns its own copy of the parsed data.
- * Returns CUTILS_OK on success, CUTILS_ERR_JSON on parse failure. */
+ * the request handle owns its own copy of the parsed data. The buffer
+ * need not be NUL-terminated; exactly len bytes are read.
+ *
+ * Strict since 1.6.0. All len bytes must be the one object: only JSON
+ * whitespace may follow it (a NUL counted in len is data, and refused).
+ * An object at any depth with the same member name twice is refused,
+ * since which one a reader honours is undefined (RFC 8259 4). Names
+ * compare byte-for-byte, as the getters look them up.
+ *
+ * Returns CUTILS_OK on success, CUTILS_ERR_JSON on parse failure,
+ * trailing data, a non-object root or a duplicate name. */
 CUTILS_MUST_USE
 int json_req_parse(const char *buf, size_t len, cutils_json_req_t **out);
 
