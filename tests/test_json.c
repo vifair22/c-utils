@@ -5,6 +5,9 @@
 #include <cmocka.h>
 
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -64,6 +67,64 @@ static void test_parse_malformed(void **state)
     assert_int_equal(rv, CUTILS_ERR_JSON);
     assert_null(req);
     assert_non_null(strstr(cutils_get_error(), "parse"));
+}
+
+/* --- Concurrent parses (1.5.1) ---
+ *
+ * cJSON kept its parse error position in a plain global written by every
+ * parse, so two threads parsing at once raced on it: json_req_parse could
+ * report a position inside another thread's buffer, or none at all after
+ * another thread's successful parse. Each thread here alternates a
+ * malformed parse whose failure point carries its own marker with a
+ * valid one, and checks every error names its own marker. A clobbered
+ * global shows up as a wrong or missing marker; under -fsanitize=thread
+ * the race itself is reported. Workers only count: cmocka's asserts are
+ * not thread-safe, so the main thread asserts on the totals. */
+
+#define PARSE_THREADS 8
+#define PARSE_ROUNDS  2000
+
+static atomic_int g_parse_wrong;
+static atomic_int g_parse_ok;
+
+static void *parse_worker(void *arg)
+{
+    int id = (int)(intptr_t)arg;
+    char bad[64], marker[16];
+    snprintf(marker, sizeof(marker), "BAD_t%02d", id);
+    int blen = snprintf(bad, sizeof(bad), "{\"k\": %s}", marker);
+    static const char good[] = "{\"k\": 1}";
+
+    for (int i = 0; i < PARSE_ROUNDS; i++) {
+        cutils_json_req_t *req = NULL;
+        if (json_req_parse(bad, (size_t)blen, &req) != CUTILS_ERR_JSON ||
+            !strstr(cutils_get_error(), marker))
+            atomic_fetch_add(&g_parse_wrong, 1);
+        json_req_free(req);
+
+        req = NULL;
+        if (json_req_parse(good, sizeof(good) - 1, &req) == CUTILS_OK)
+            atomic_fetch_add(&g_parse_ok, 1);
+        json_req_free(req);
+    }
+    return NULL;
+}
+
+static void test_parse_concurrent_errors_stay_per_thread(void **state)
+{
+    (void)state;
+    atomic_store(&g_parse_wrong, 0);
+    atomic_store(&g_parse_ok, 0);
+
+    pthread_t th[PARSE_THREADS];
+    for (int i = 0; i < PARSE_THREADS; i++)
+        assert_int_equal(pthread_create(&th[i], NULL, parse_worker,
+                                        (void *)(intptr_t)i), 0);
+    for (int i = 0; i < PARSE_THREADS; i++)
+        assert_int_equal(pthread_join(th[i], NULL), 0);
+
+    assert_int_equal(atomic_load(&g_parse_wrong), 0);
+    assert_int_equal(atomic_load(&g_parse_ok), PARSE_THREADS * PARSE_ROUNDS);
 }
 
 static void test_parse_non_object(void **state)
@@ -1256,6 +1317,7 @@ static void test_auto_json_elem_honors_commit(void **state)
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_parse_concurrent_errors_stay_per_thread),
         /* Parse / free */
         cmocka_unit_test_setup(test_parse_simple_object,         setup_clear_error),
         cmocka_unit_test_setup(test_parse_null_buf,              setup_clear_error),
