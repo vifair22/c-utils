@@ -7,11 +7,19 @@ the public-header level (see README "API stability").
 
 ## [1.5.1] - 2026-11-15
 
-Two fixes to what is reported, both found in c-backup's UAT against 1.5.0
-(NIT-4, NIT-5). No API or ABI changes.
+Three fixes found in c-backup's UAT against 1.5.0: a data race in JSON
+parsing, and two to what is reported (NIT-4, NIT-5). No API or ABI
+changes.
 
 ### Fixed
 
+- **Concurrent JSON parses raced, and could crash.** The vendored cJSON
+  kept its parse error position in a plain global written by every parse,
+  so `json_req_parse` on two threads at once raced on it (ThreadSanitizer
+  reports it). A failed parse could then report a position inside
+  another thread's buffer, or dereference a torn pointer and crash. The
+  global is now `_Thread_local`, a marked local change to
+  `lib/cJSON/cJSON.c`.
 - **Config errors printed twice under AppGuard.** Validation prints each
   problem, then keeps the first in the error buffer for callers that print
   nothing themselves; `appguard_init` printed that buffer as well, so an

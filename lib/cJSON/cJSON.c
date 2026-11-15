@@ -89,7 +89,13 @@ typedef struct {
     const unsigned char *json;
     size_t position;
 } error;
-static error global_error = { NULL, 0 };
+/* c-utils local change (1.5.1): thread-local. Upstream keeps this a plain
+ * global written by every parse, so parses on different threads race
+ * (TSan reports it) and cJSON_GetErrorPtr can return a pointer into
+ * another thread's buffer, or NULL after another thread's successful
+ * parse. json_req_parse reads it straight after its own parse, on the
+ * same thread, which this makes correct. Keep it on a cJSON update. */
+static _Thread_local error global_error = { NULL, 0 };
 
 CJSON_PUBLIC(const char *) cJSON_GetErrorPtr(void)
 {
