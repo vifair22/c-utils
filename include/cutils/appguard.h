@@ -135,6 +135,14 @@ typedef struct {
      * by hand wants: a setting that is accepted and ignored is worse
      * than a refusal to start. */
     config_validate_t       config_validate;
+
+    /* Application checks (1.5.0): ranges, enumerations, anything the
+     * types do not say. Called during config init with the file loaded,
+     * and its problems reported in the same list as the built-in ones.
+     * Ignored when config_validate is CFG_VALIDATE_OFF. See
+     * config_check_fn in config.h. */
+    config_check_fn         config_check;
+    void                   *config_check_ctx;
 } appguard_config_t;
 
 /* Opaque handle */

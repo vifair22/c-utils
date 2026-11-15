@@ -435,6 +435,54 @@ static void test_validate_strict_accepts_clean_file(void **state)
     appguard_shutdown(guard);
 }
 
+/* 1.5.0: the application's check runs inside config init, so its
+ * problems refuse a start before the database is opened, like the
+ * built-in ones. */
+static void guard_check(const cutils_config_t *cfg, config_check_t *chk,
+                        void *ctx)
+{
+    (void)cfg;
+    (*(int *)ctx)++;
+    config_check_int_range(chk, "app.workers", 1, 64);
+}
+
+static void test_validate_app_check(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG,
+        "db:\n"
+        "  path: " TEST_DB "\n"
+        "app:\n"
+        "  workers: 0\n");
+    int calls = 0;
+    appguard_config_t cfg = {
+        .app_name         = "testguard",
+        .config_path      = TEST_CFG,
+        .on_first_run     = CFG_FIRST_RUN_CONTINUE,
+        .file_keys        = validate_keys,
+        .config_validate  = CFG_VALIDATE_STRICT,
+        .config_check     = guard_check,
+        .config_check_ctx = &calls,
+    };
+    assert_null(appguard_init(&cfg));
+    assert_int_equal(calls, 1);
+    assert_int_not_equal(access(TEST_DB, F_OK), 0);
+}
+
+static void test_log_level_parse(void **state)
+{
+    (void)state;
+    log_level_t l = LOG_ERROR;
+    assert_int_equal(log_level_parse("warn", &l), 0);
+    assert_int_equal(l, LOG_WARNING);
+    assert_int_equal(log_level_parse("debug", &l), 0);
+    assert_int_equal(l, LOG_DEBUG);
+    assert_int_equal(log_level_parse("chatty", &l), -1);
+    assert_int_equal(l, LOG_DEBUG);
+    assert_int_equal(log_level_parse(NULL, &l), -1);
+    assert_int_equal(log_level_parse("info", NULL), -1);
+}
+
 static void test_init_log_level_info(void **state)
 {
     (void)state;
@@ -1313,6 +1361,9 @@ int main(void)
         cmocka_unit_test_teardown(test_validate_off_ignores_bad_log_level, teardown),
         cmocka_unit_test_teardown(test_validate_strict_refuses_unknown_key, teardown),
         cmocka_unit_test_teardown(test_validate_strict_accepts_clean_file, teardown),
+        cmocka_unit_test_teardown(test_validate_app_check, teardown),
+
+        cmocka_unit_test_teardown(test_log_level_parse, teardown),
         cmocka_unit_test_teardown(test_init_null_config, teardown),
         cmocka_unit_test_teardown(test_init_no_app_name, teardown),
         cmocka_unit_test_teardown(test_init_basic, teardown),

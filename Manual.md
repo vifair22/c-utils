@@ -596,7 +596,7 @@ static const config_key_t file_keys[] = {
 | `default_value` | Always a string representation: `"9600"`, `"true"`, `""`. Used as the fallback and written into templates/DB seeding. |
 | `description` | Shown as a YAML comment above the key in generated templates. |
 | `store` | `CFG_STORE_FILE` or `CFG_STORE_DB`. |
-| `required` | If `1`, startup fails if the key is empty or missing in the file. Only meaningful for file-backed keys. |
+| `required` | If `1`, startup fails if the key is empty or missing in the file and not set by an environment override (the environment counts since 1.5.0). The default value is then only what the generated template writes; it is never used as a fallback. Only meaningful for file-backed keys. |
 
 Arrays must be terminated with a `{ NULL }` sentinel.
 
@@ -616,7 +616,7 @@ Section association is automatic from the key prefix. The `"sensor"` section hea
 
 ### Key categories
 
-1. **c-utils hard minimums** — `db.path`. File-only, required, immutable via `config_set()`. c-utils registers this internally — the application does not need to define it. It appears in the generated config template automatically with a default of `"app.db"`.
+1. **c-utils hard minimums**: `db.path`. File-only, required, immutable via `config_set()`. c-utils registers this internally, so the application does not need to define it. It appears in the generated config template automatically as `"app.db"`, but because it is required that is a template value, not a fallback: a file that omits `db.path` fails init with `<path>: required config key 'db.path' is missing or empty; it has no default`.
 2. **c-utils optional keys** — Pushover credentials (`pushover.token`, `pushover.user`). These key *names* are defined by c-utils (as constants `PUSH_CONFIG_TOKEN` and `PUSH_CONFIG_USER`), but the application must register them in its own `file_keys` or `db_keys` array to make them available. See [Section 7: Pushover](#7-pushover) for the setup pattern.
 3. **App file keys** — registered via the `file_keys` field in `appguard_config_t`.
 4. **App DB keys** — registered via the `db_keys` field in `appguard_config_t`. These are attached after the database is open and migrated.
@@ -682,11 +682,12 @@ Supported:
 | Construct | Notes |
 |-----------|-------|
 | `section:` at column 0 | Starts a section. Nothing may follow the colon except a comment. |
-| `key: value`, indented | Spaces or tabs; every key of one section must use the same indentation. A space after the colon is required. |
+| `key: value`, indented | Spaces; every key of one section must use the same indentation. A space after the colon is required. |
 | Plain values | Everything after `key: ` up to an inline comment, trailing whitespace trimmed. `http://host:80/` is fine; `a: b` inside a value is not. |
 | Double-quoted values | `"..."`, no escapes. A comment may follow the closing quote; nothing else may. |
 | Comments | Full-line `#`, and inline ` # ...` on unquoted values. |
 | `---` | Ignored. |
+| CRLF line endings, UTF-8 byte order mark | Accepted (1.5.0) and parsed as an LF file without the mark. A rewrite by `config_set` writes LF without it. |
 
 Not supported, and recorded as a problem with its line:
 
@@ -704,6 +705,7 @@ Not supported, and recorded as a problem with its line:
 | Empty or invalid key names | `: x`, `two words: x` |
 | A key set twice | the second occurrence is reported |
 | Lines over 1023 bytes | |
+| Tabs in indentation (1.5.0; YAML forbids them) | `\tkey: v` |
 
 The parser still loads what it can around such a line, exactly as 1.3 did;
 whether a problem stops the application is the application's choice (next
@@ -731,24 +733,45 @@ What is checked:
 - **unknown keys**: a key in the file that no `config_key_t` registers. When a registered key is within two edits, the message suggests it: `unknown key 'security.key_dri' (did you mean 'security.key_dir'?)`. `log.level`, `pushover.token` and `pushover.user` are always known, because c-utils reads them itself;
 - **DB-backed keys in the file**: a key registered with `CFG_STORE_DB` (in `file_keys`, or in `config_init_opts_t.db_keys` / AppGuard's `db_keys`) has no effect in the file, and is reported as such;
 - **typed values**: a `CFG_INT` value must be a decimal integer within `int` range, a `CFG_BOOL` value one of `true`, `false`, `yes`, `no`, `1`, `0`. An empty value means "unset" and is valid. Environment overrides are checked too and reported by variable name, since they have no line;
-- under AppGuard, **`log.level`** must be `debug`, `info`, `warn`, `warning` or `error`.
+- **`log.level`**, when set, must be `debug`, `info`, `warn`, `warning` or `error` (`log_level_parse`). Under 1.4.0 AppGuard checked it after config init, so it went unreported whenever init failed on something else; since 1.5.0 it is in the same list;
+- **required keys** that are missing or empty (1.5.0: in the list rather than reported alone after it);
+- whatever the **application's check function** reports (1.5.0, below).
 
 Every problem is reported in one run, in file order, so fixing a file takes
 one restart rather than one per mistake. A template generated on first run
 always validates.
 
-Values only an application can judge (an enumerated string, a path that must
-exist) are the application's to check after init. `config_key_line(cfg, key)`
-returns the line a key was set on, so those messages can point at it too:
+#### Application checks (1.5.0+)
+
+Types say nothing about meaning: `99999` is a valid integer and a useless
+port. Values only an application can judge go in a check function, passed
+as `config_init_opts_t.check` (with `check_ctx`) or
+`appguard_config_t.config_check` (with `config_check_ctx`). Validation calls
+it after its own checks and before printing, so the application's problems
+appear in the same list, sorted by line, under the same mode. It is not
+called under `CFG_VALIDATE_OFF`.
 
 ```c
-const char *mode = config_get_str(cfg, "backup.mode");
-if (strcmp(mode, "fast") != 0 && strcmp(mode, "safe") != 0) {
-    fprintf(stderr, "%s:%d: backup.mode: '%s' is not fast or safe\n",
-            config_get_path(cfg), config_key_line(cfg, "backup.mode"), mode);
-    return 1;
+static void check(const cutils_config_t *cfg, config_check_t *chk, void *ctx)
+{
+    static const char *const modes[] = { "fast", "safe", NULL };
+    config_check_int_range(chk, "http.port", 1, 65535);
+    config_check_one_of(chk, "backup.mode", modes);
+    if (!path_ok(config_get_str(cfg, "backup.dir")))
+        config_check_fail(chk, "backup.dir", "'%s' does not exist",
+                          config_get_str(cfg, "backup.dir"));
 }
 ```
+
+| Function | Reports |
+|----------|---------|
+| `config_check_fail(chk, key, fmt, ...)` | Anything, located like a built-in problem: `<path>:<line>: <key>: <msg>` when the file sets the key, `environment <VAR> (<key>): <msg>` when an override does, `<key>: <msg>` at its default. |
+| `config_check_int_range(chk, key, min, max)` | `'<v>' is not between <min> and <max>`. A non-integer is left to the type check, which has reported it already. |
+| `config_check_one_of(chk, key, list)` | `'<v>' is not one of a, b, c`. An empty value passes. |
+
+The check runs on the calling thread inside config init. Every file-backed
+key reads normally; database-backed keys are not attached yet.
+`config_key_line(cfg, key)` remains for checks made after init.
 
 Standalone, without AppGuard:
 
@@ -913,6 +936,10 @@ For standalone use without AppGuard, call `config_attach_db(cfg, db, db_keys)` m
 | Error | `LOG_ERROR` | 40 | stderr |
 
 Messages below the configured minimum level are discarded.
+
+`log_level_parse(name, &level)` (1.5.0) turns an operator's spelling into a
+level: `debug`, `info`, `warn` or `warning`, `error`. It is the list AppGuard
+reads `log.level` with and config validation checks it against.
 
 ### Usage
 

@@ -5,6 +5,48 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.5.0] - 2026-11-15
+
+Closes the gaps c-backup's UAT found in 1.4.0's config validation (B081
+reopened). One addition, opt-in: an application check hook. No signature
+changes; an application that sets nothing new sees only the fixes below.
+
+### Added
+
+- **Application checks: `config_check_fn`, `config_init_opts_t.check`,
+  `appguard_config_t.config_check`**, with `config_check_fail()`,
+  `config_check_int_range()` and `config_check_one_of()`. Types say
+  nothing about meaning: `port: 99999` is a valid integer. An application
+  could only check after init returned, and only if it succeeded, so one
+  run reported the file's problems or the application's, never both. The
+  hook runs inside validation and its problems join the same list, sorted
+  by line and located like built-in ones (file line, environment
+  variable, or default).
+- **`log_level_parse()`** - the level names AppGuard and validation both
+  use, so they cannot disagree.
+
+### Fixed
+
+- **`log.level` dropped from the problem list.** AppGuard checked it after
+  config init, so with any other problem in the file init failed first and
+  the bad level was never mentioned. It is now checked in the validation
+  pass.
+- **Required keys reported alone, without the file.** A missing
+  required key is now one more problem in the list, as
+  `<path>: required config key 'db.path' is missing or empty; it has no
+  default`, and an environment override satisfies it as it does every
+  read.
+- **CRLF line endings and a UTF-8 byte order mark** are accepted. A blank
+  CRLF line was `"\r"`, not blank, and was reported as `'' is not a section
+  header` with the CR invisible; a BOM glued itself to the first section
+  name. A rewrite by `config_set` writes LF without the mark.
+
+### Changed
+
+- **Tabs in indentation are a validation problem**, as YAML says, reported
+  once per line. 1.4.0 counted a tab as one column. Under
+  `CFG_VALIDATE_OFF` the line still loads as before.
+
 ## [1.4.0] - 2026-11-15
 
 Lets an application refuse a config file it cannot honour, and count

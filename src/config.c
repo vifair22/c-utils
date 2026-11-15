@@ -1,6 +1,7 @@
 #include "cutils/config.h"
 #include "cutils/db.h"
 #include "cutils/error.h"
+#include "cutils/log.h"
 #include "cutils/mem.h"
 #include "cutils/push.h"
 #include "config_yaml.h"
@@ -315,6 +316,8 @@ static const char *const cutils_implicit_keys[] = {
 
 typedef struct {
     int   line;   /* file line, or 0 for a problem with no line */
+    int   seq;    /* order found, the tie-break for equal lines */
+    int   file;   /* lineless but about the file (a missing key): name it */
     char *msg;
 } cfg_problem_t;
 
@@ -323,6 +326,22 @@ typedef struct {
     int            n;
     int            cap;
 } cfg_problems_t;
+
+struct config_check {
+    const cutils_config_t *cfg;
+    cfg_problems_t        *probs;
+    int                    rc;
+};
+
+/* Missing or empty in the file and not supplied by the environment. The
+ * environment satisfies a required key everywhere else it is read, so it
+ * does here too; before 1.5.0 only the file counted. */
+static int required_key_missing(const cutils_config_t *cfg, int i)
+{
+    if (cfg->env_values[i] && cfg->env_values[i][0]) return 0;
+    const char *val = yaml_get(cfg->doc, cfg->keys[i].key);
+    return !val || val[0] == '\0';
+}
 
 static void problems_free(cfg_problems_t *p)
 {
@@ -350,6 +369,7 @@ static int problem_add(cfg_problems_t *p, int line, const char *fmt, ...)
     char *m = strdup(buf);
     if (!m) return set_error(CUTILS_ERR_NOMEM, "config problem alloc"); /* LCOV_EXCL_LINE */
     p->v[p->n].line = line;
+    p->v[p->n].file = 0;
     p->v[p->n].msg  = m;
     p->n++;
     return CUTILS_OK;
@@ -359,7 +379,9 @@ static int problem_cmp(const void *a, const void *b)
 {
     const cfg_problem_t *pa = a;
     const cfg_problem_t *pb = b;
-    return (pa->line > pb->line) - (pa->line < pb->line);
+    if (pa->line != pb->line)
+        return (pa->line > pb->line) - (pa->line < pb->line);
+    return (pa->seq > pb->seq) - (pa->seq < pb->seq);
 }
 
 /* Levenshtein distance, capped: keys longer than the buffers never match,
@@ -437,6 +459,7 @@ static int key_in(const config_key_t *keys, const char *key,
 static int collect_problems(const cutils_config_t *cfg,
                             const config_key_t *file_keys,
                             const config_key_t *db_keys,
+                            config_check_fn check, void *check_ctx,
                             cfg_problems_t *out)
 {
     int rc = CUTILS_OK;
@@ -480,6 +503,32 @@ static int collect_problems(const cutils_config_t *cfg,
             rc = problem_add(out, e->line, "unknown key '%s'", dotkey);
     }
 
+    /* log.level is read by AppGuard, not by the application, so no
+     * registered type says what it may hold. AppGuard used to check it
+     * after init, which meant it was dropped from the list whenever
+     * anything else in the file was wrong. */
+    if (rc == CUTILS_OK) {
+        const char *lv = yaml_get(doc, "log.level");
+        log_level_t ignored;
+        if (lv && lv[0] && log_level_parse(lv, &ignored) != 0)
+            rc = problem_add(out, yaml_get_line(doc, "log.level"),
+                             "log.level: '%s' is not one of debug, info, "
+                             "warn, error", lv);
+    }
+
+    /* A required key that is missing. Reported here so it joins the list;
+     * config_init_opts still checks after validation for OFF mode. */
+    for (int i = 0; rc == CUTILS_OK && i < cfg->nkeys; i++) {
+        if (cfg->keys[i].store != CFG_STORE_FILE || !cfg->keys[i].required)
+            continue;
+        if (!required_key_missing(cfg, i)) continue;
+        int line = yaml_get_line(doc, cfg->keys[i].key);
+        rc = problem_add(out, line,
+                         "required config key '%s' is missing or empty; "
+                         "it has no default", cfg->keys[i].key);
+        if (rc == CUTILS_OK) out->v[out->n - 1].file = 1;
+    }
+
     /* Environment overrides win over the file, so a bad one is as silent
      * as a bad file value. They have no line; name the variable. */
     for (int i = 0; rc == CUTILS_OK && i < cfg->nkeys; i++) {
@@ -493,9 +542,74 @@ static int collect_problems(const cutils_config_t *cfg,
                          cfg->env_values[i], why);
     }
 
+    if (rc == CUTILS_OK && check) {
+        config_check_t chk = { .cfg = cfg, .probs = out, .rc = CUTILS_OK };
+        check(cfg, &chk, check_ctx);
+        rc = chk.rc;
+    }
+
+    /* Stable for equal lines: problems with no line keep the order they
+     * were found in rather than whatever qsort leaves. */
+    for (int i = 0; i < out->n; i++) out->v[i].seq = i;
     if (out->n > 1)
         qsort(out->v, (size_t)out->n, sizeof(*out->v), problem_cmp);
     return rc;
+}
+
+/* --- Application check API (1.5.0) --- */
+
+void config_check_fail(config_check_t *chk, const char *key,
+                       const char *fmt, ...)
+{
+    if (!chk || !key || !fmt || chk->rc != CUTILS_OK) return;
+    char msg[400];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    const cutils_config_t *cfg = chk->cfg;
+    int idx = find_key_idx(cfg, key);
+    if (idx >= 0 && cfg->env_values[idx]) {
+        CUTILS_AUTOFREE char *envname = make_env_name(cfg->env_prefix, key);
+        chk->rc = problem_add(chk->probs, 0, "environment %s (%s): %s",
+                              envname ? envname : "?", key, msg);
+        return;
+    }
+    chk->rc = problem_add(chk->probs, yaml_get_line(cfg->doc, key),
+                          "%s: %s", key, msg);
+}
+
+void config_check_int_range(config_check_t *chk, const char *key,
+                            long min, long max)
+{
+    if (!chk || !key) return;
+    const char *v = config_get_str(chk->cfg, key);
+    if (!v || !v[0]) return;
+    char *end;
+    errno = 0;
+    long n = strtol(v, &end, 10);
+    if (end == v || *end != '\0' || errno == ERANGE) return;
+    if (n < min || n > max)
+        config_check_fail(chk, key, "'%s' is not between %ld and %ld",
+                          v, min, max);
+}
+
+void config_check_one_of(config_check_t *chk, const char *key,
+                         const char *const *allowed)
+{
+    if (!chk || !key || !allowed) return;
+    const char *v = config_get_str(chk->cfg, key);
+    if (!v || !v[0]) return;
+    char list[300] = "";
+    size_t used = 0;
+    for (int i = 0; allowed[i]; i++) {
+        if (strcmp(v, allowed[i]) == 0) return;
+        int w = snprintf(list + used, sizeof(list) - used, "%s%s",
+                         i ? ", " : "", allowed[i]);
+        if (w > 0 && (size_t)w < sizeof(list) - used) used += (size_t)w;
+    }
+    config_check_fail(chk, key, "'%s' is not one of %s", v, list);
 }
 
 static int validate_config(const cutils_config_t *cfg,
@@ -505,7 +619,8 @@ static int validate_config(const cutils_config_t *cfg,
     if (!opts || opts->validate == CFG_VALIDATE_OFF) return CUTILS_OK;
 
     cfg_problems_t probs = { 0 };
-    int rc = collect_problems(cfg, file_keys, opts->db_keys, &probs);
+    int rc = collect_problems(cfg, file_keys, opts->db_keys,
+                              opts->check, opts->check_ctx, &probs);
     if (rc != CUTILS_OK) {
         problems_free(&probs); /* LCOV_EXCL_LINE */
         return rc;             /* LCOV_EXCL_LINE */
@@ -517,6 +632,9 @@ static int validate_config(const cutils_config_t *cfg,
         if (probs.v[i].line > 0)
             fprintf(stderr, "%s:%d: %s: %s\n", cfg->config_path,
                     probs.v[i].line, kind, probs.v[i].msg);
+        else if (probs.v[i].file)
+            fprintf(stderr, "%s: %s: %s\n", cfg->config_path, kind,
+                    probs.v[i].msg);
         else
             fprintf(stderr, "%s: %s\n", kind, probs.v[i].msg);
     }
@@ -529,6 +647,9 @@ static int validate_config(const cutils_config_t *cfg,
         if (probs.v[0].line > 0)
             rc = set_error(CUTILS_ERR_CONFIG, "%s:%d: %s%s", cfg->config_path,
                            probs.v[0].line, probs.v[0].msg, more);
+        else if (probs.v[0].file)
+            rc = set_error(CUTILS_ERR_CONFIG, "%s: %s%s", cfg->config_path,
+                           probs.v[0].msg, more);
         else
             rc = set_error(CUTILS_ERR_CONFIG, "%s%s", probs.v[0].msg, more);
     }
@@ -710,10 +831,10 @@ int config_init_opts(cutils_config_t **out,
         if (cfg->keys[i].store != CFG_STORE_FILE) continue;
         if (!cfg->keys[i].required) continue;
 
-        const char *val = yaml_get(cfg->doc, cfg->keys[i].key);
-        if (!val || val[0] == '\0')
+        if (required_key_missing(cfg, i))
             return set_error(CUTILS_ERR_CONFIG,
-                "required config key '%s' is missing or empty", cfg->keys[i].key);
+                "%s: required config key '%s' is missing or empty; it has "
+                "no default", cfg->config_path, cfg->keys[i].key);
     }
 
     /* Transfer ownership to caller; cleanup sees NULL and skips. */

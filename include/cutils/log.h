@@ -65,6 +65,12 @@ void log_set_level(log_level_t level);
 /* Get the current log level. */
 log_level_t log_get_level(void);
 
+/* A level name as an operator writes it, to a level (1.5.0): debug, info,
+ * warn or warning, error. Returns 0 and sets *out, or -1 (and leaves *out
+ * alone) for anything else, NULL included. The one list AppGuard and
+ * config validation both read, so they cannot disagree about it. */
+int log_level_parse(const char *s, log_level_t *out);
+
 /* Enable or disable systemd-native console output. When enabled, the
  * console writer:
  *   - drops the timestamp (journald stamps each line on receive)
