@@ -771,9 +771,194 @@ static void test_generate_template_hash_in_default(void **state)
     yaml_free(doc);
 }
 
+/* --- Subset issues (1.4.0) ---
+ *
+ * The parser used to skip every line below without a trace. It still
+ * produces the same entries, but each is now recorded with its line. */
+
+/* Parse `content`, expect exactly one issue on `line` mentioning `needle`. */
+static yaml_doc_t *expect_issue(const char *content, int line, const char *needle)
+{
+    write_file(TEST_YAML, content);
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    if (doc->nissues != 1)
+        fail_msg("expected 1 issue, got %d (first: %s)", doc->nissues,
+                 doc->nissues ? doc->issues[0].msg : "-");
+    assert_int_equal(doc->issues[0].line, line);
+    if (!strstr(doc->issues[0].msg, needle))
+        fail_msg("issue '%s' lacks '%s'", doc->issues[0].msg, needle);
+    return doc;
+}
+
+static void test_issue_none_for_supported_subset(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML,
+        "---\n"
+        "# comment\n"
+        "\n"
+        "db:\n"
+        "  path: test.db   # inline\n"
+        "  url: http://host:80/p\n"
+        "  quoted: \"a # b\"  # c\n"
+        "  empty:\n"
+        "  hash: a#b\n"
+        "tabbed:\n"
+        "\tkey: v\n");
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    assert_int_equal(doc->nissues, 0);
+    assert_int_equal(yaml_get_line(doc, "db.url"), 6);
+    assert_int_equal(yaml_get_line(doc, "tabbed.key"), 11);
+    assert_int_equal(yaml_get_line(doc, "db.missing"), 0);
+    yaml_free(doc);
+}
+
+static void test_issue_flow_top_level(void **state)
+{
+    (void)state;
+    yaml_free(expect_issue("log: [unclosed\n", 1, "flow collections"));
+    yaml_free(expect_issue("log: {a: 1}\n", 1, "flow collections"));
+}
+
+static void test_issue_top_level_scalar(void **state)
+{
+    (void)state;
+    yaml_doc_t *doc = expect_issue("db:\n  path: x\nverbose: true\n", 3,
+                                   "at the top level is not supported");
+    /* Entries as before: the bad line contributes nothing. */
+    assert_int_equal(doc->nentries, 1);
+    yaml_free(doc);
+}
+
+static void test_issue_top_level_bare_word(void **state)
+{
+    (void)state;
+    yaml_free(expect_issue("bare_word\n", 1, "is not a section header"));
+    yaml_free(expect_issue("a:b\n", 1, "is not a section header"));
+}
+
+static void test_issue_indented_outside_section(void **state)
+{
+    (void)state;
+    yaml_free(expect_issue("  orphan: 1\ndb:\n  path: x\n", 1,
+                           "outside any section"));
+}
+
+static void test_issue_nested_mapping(void **state)
+{
+    (void)state;
+    yaml_doc_t *doc = expect_issue("db:\n  path: x\n  sub:\n    deep: 1\n", 4,
+                                   "nested mappings are not supported");
+    /* 1.3 took the nested line as a key of the section; it still does. */
+    assert_string_equal(yaml_get(doc, "db.deep"), "1");
+    yaml_free(doc);
+}
+
+static void test_issue_inconsistent_indent(void **state)
+{
+    (void)state;
+    yaml_free(expect_issue("db:\n    path: x\n  other: y\n", 3,
+                           "indentation does not match"));
+}
+
+static void test_issue_key_without_colon(void **state)
+{
+    (void)state;
+    yaml_free(expect_issue("db:\n  path: x\n  no_colon\n", 3,
+                           "expected 'key: value'"));
+}
+
+static void test_issue_missing_space_after_colon(void **state)
+{
+    (void)state;
+    yaml_free(expect_issue("db:\n  path:x\n", 2, "missing space after ':'"));
+}
+
+static void test_issue_bad_key_names(void **state)
+{
+    (void)state;
+    yaml_free(expect_issue("db:\n  : x\n", 2, "empty key"));
+    yaml_free(expect_issue("db:\n  two words: x\n", 2, "invalid key name"));
+}
+
+static void test_issue_quotes(void **state)
+{
+    (void)state;
+    yaml_free(expect_issue("db:\n  path: \"open\n", 2, "unterminated"));
+    yaml_free(expect_issue("db:\n  path: \"a\" b\n", 2, "after the closing quote"));
+    yaml_free(expect_issue("db:\n  path: 'single'\n", 2, "single-quoted"));
+}
+
+static void test_issue_value_indicators(void **state)
+{
+    (void)state;
+    yaml_free(expect_issue("db:\n  list: [a, b]\n", 2, "flow collections"));
+    yaml_free(expect_issue("db:\n  map: {a: b}\n", 2, "flow collections"));
+    yaml_free(expect_issue("db:\n  ref: *anchor\n", 2, "anchors, aliases"));
+    yaml_free(expect_issue("db:\n  text: |\n", 2, "block scalars"));
+    yaml_free(expect_issue("db:\n  v: a: b\n", 2, "': ' inside an unquoted value"));
+}
+
+static void test_issue_duplicate_key(void **state)
+{
+    (void)state;
+    yaml_free(expect_issue("db:\n  path: a\n  x: 1\n  path: b\n", 4,
+                           "duplicate key 'db.path' (also on line 2)"));
+}
+
+static void test_issue_overlong_line(void **state)
+{
+    (void)state;
+    char big[1400];
+    size_t n = (size_t)snprintf(big, sizeof(big), "db:\n  path: ");
+    memset(big + n, 'x', 1200);
+    memcpy(big + n + 1200, "\n", 2);
+    write_file(TEST_YAML, big);
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    assert_true(doc->nissues >= 1);
+    assert_int_equal(doc->issues[0].line, 2);
+    assert_non_null(strstr(doc->issues[0].msg, "longer than"));
+    yaml_free(doc);
+}
+
+/* Issues are reported in file order whatever found them. */
+static void test_issue_order(void **state)
+{
+    (void)state;
+    write_file(TEST_YAML,
+        "db:\n"
+        "  path: a\n"
+        "  path: b\n"
+        "junk\n");
+    yaml_doc_t *doc = yaml_parse_file(TEST_YAML);
+    assert_non_null(doc);
+    assert_int_equal(doc->nissues, 2);
+    assert_int_equal(doc->issues[0].line, 3);
+    assert_int_equal(doc->issues[1].line, 4);
+    yaml_free(doc);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_teardown(test_issue_none_for_supported_subset, teardown),
+        cmocka_unit_test_teardown(test_issue_flow_top_level, teardown),
+        cmocka_unit_test_teardown(test_issue_top_level_scalar, teardown),
+        cmocka_unit_test_teardown(test_issue_top_level_bare_word, teardown),
+        cmocka_unit_test_teardown(test_issue_indented_outside_section, teardown),
+        cmocka_unit_test_teardown(test_issue_nested_mapping, teardown),
+        cmocka_unit_test_teardown(test_issue_inconsistent_indent, teardown),
+        cmocka_unit_test_teardown(test_issue_key_without_colon, teardown),
+        cmocka_unit_test_teardown(test_issue_missing_space_after_colon, teardown),
+        cmocka_unit_test_teardown(test_issue_bad_key_names, teardown),
+        cmocka_unit_test_teardown(test_issue_quotes, teardown),
+        cmocka_unit_test_teardown(test_issue_value_indicators, teardown),
+        cmocka_unit_test_teardown(test_issue_duplicate_key, teardown),
+        cmocka_unit_test_teardown(test_issue_overlong_line, teardown),
+        cmocka_unit_test_teardown(test_issue_order, teardown),
         cmocka_unit_test_teardown(test_parse_basic, teardown),
         cmocka_unit_test_teardown(test_parse_comments_and_blanks, teardown),
         cmocka_unit_test_teardown(test_parse_missing_file, teardown),

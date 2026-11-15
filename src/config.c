@@ -2,10 +2,14 @@
 #include "cutils/db.h"
 #include "cutils/error.h"
 #include "cutils/mem.h"
+#include "cutils/push.h"
 #include "config_yaml.h"
 
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -290,6 +294,248 @@ static int find_key_idx(const cutils_config_t *cfg, const char *key)
     return hit ? hit->idx : -1;
 }
 
+/* --- Validation (1.4.0) ---
+ *
+ * A setting that is accepted and not honoured is the worst kind of
+ * config bug: the operator sees no error and the program does something
+ * else. The parser used to skip lines it did not understand, a typo'd key
+ * was just another unread entry, and config_get_int fell back to the
+ * default for "eight". Each of those loaded without a word.
+ *
+ * validate_config collects every such problem with its line, so one run
+ * reports them all rather than one per restart. What happens next is the
+ * application's choice (config_validate_t): ignore, warn, or refuse. */
+
+/* Keys c-utils reads by name whether or not the application registers
+ * them (AppGuard reads log.level, the push worker its credentials), so a
+ * file that sets one is not setting an unknown key. */
+static const char *const cutils_implicit_keys[] = {
+    "log.level", PUSH_CONFIG_TOKEN, PUSH_CONFIG_USER, NULL
+};
+
+typedef struct {
+    int   line;   /* file line, or 0 for a problem with no line */
+    char *msg;
+} cfg_problem_t;
+
+typedef struct {
+    cfg_problem_t *v;
+    int            n;
+    int            cap;
+} cfg_problems_t;
+
+static void problems_free(cfg_problems_t *p)
+{
+    for (int i = 0; i < p->n; i++) free(p->v[i].msg);
+    free(p->v);
+    p->v = NULL;
+    p->n = p->cap = 0;
+}
+
+__attribute__((format(printf, 3, 4)))
+static int problem_add(cfg_problems_t *p, int line, const char *fmt, ...)
+{
+    if (p->n >= p->cap) {
+        int newcap = p->cap ? p->cap * 2 : 8;
+        cfg_problem_t *tmp = realloc(p->v, (size_t)newcap * sizeof(*tmp));
+        if (!tmp) return set_error(CUTILS_ERR_NOMEM, "config problem alloc"); /* LCOV_EXCL_LINE */
+        p->v = tmp;
+        p->cap = newcap;
+    }
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    char *m = strdup(buf);
+    if (!m) return set_error(CUTILS_ERR_NOMEM, "config problem alloc"); /* LCOV_EXCL_LINE */
+    p->v[p->n].line = line;
+    p->v[p->n].msg  = m;
+    p->n++;
+    return CUTILS_OK;
+}
+
+static int problem_cmp(const void *a, const void *b)
+{
+    const cfg_problem_t *pa = a;
+    const cfg_problem_t *pb = b;
+    return (pa->line > pb->line) - (pa->line < pb->line);
+}
+
+/* Levenshtein distance, capped: keys longer than the buffers never match,
+ * which only costs a suggestion. */
+static int edit_distance(const char *a, const char *b)
+{
+    size_t la = strlen(a), lb = strlen(b);
+    if (la >= 64 || lb >= 64) return INT_MAX;
+    int prev[64], cur[64];
+    for (size_t j = 0; j <= lb; j++) prev[j] = (int)j;
+    for (size_t i = 1; i <= la; i++) {
+        cur[0] = (int)i;
+        for (size_t j = 1; j <= lb; j++) {
+            int sub = prev[j - 1] + (a[i - 1] != b[j - 1]);
+            int del = prev[j] + 1;
+            int ins = cur[j - 1] + 1;
+            int m = sub < del ? sub : del;
+            cur[j] = m < ins ? m : ins;
+        }
+        memcpy(prev, cur, (lb + 1) * sizeof(int));
+    }
+    return prev[lb];
+}
+
+/* The registered file key closest to `key`, if it is close enough to be a
+ * plausible typo (two edits); NULL otherwise. */
+static const char *suggest_key(const cutils_config_t *cfg, const char *key)
+{
+    const char *best = NULL;
+    int best_d = 3;
+    for (int i = 0; i < cfg->nkeys; i++) {
+        if (cfg->keys[i].store != CFG_STORE_FILE) continue;
+        int d = edit_distance(key, cfg->keys[i].key);
+        if (d < best_d) {
+            best_d = d;
+            best = cfg->keys[i].key;
+        }
+    }
+    return best;
+}
+
+/* Why `v` is not a valid value of type `t`, or NULL when it is. An empty
+ * value means "unset" and falls back to the default, so it is valid. */
+static const char *type_problem(config_type_t t, const char *v)
+{
+    if (!v || !v[0]) return NULL;
+    if (t == CFG_INT) {
+        char *end;
+        errno = 0;
+        long n = strtol(v, &end, 10);
+        if (end == v || *end != '\0') return "is not an integer";
+        if (errno == ERANGE || n > INT_MAX || n < INT_MIN)
+            return "is out of range for an integer";
+    } else if (t == CFG_BOOL) {
+        static const char *const ok[] = {
+            "true", "false", "yes", "no", "1", "0", NULL
+        };
+        for (int i = 0; ok[i]; i++)
+            if (strcmp(v, ok[i]) == 0) return NULL;
+        return "is not a boolean (true, false, yes, no, 1 or 0)";
+    }
+    return NULL;
+}
+
+static int key_in(const config_key_t *keys, const char *key,
+                  config_store_t store)
+{
+    if (!keys) return 0;
+    for (int i = 0; keys[i].key != NULL; i++)
+        if (keys[i].store == store && strcmp(keys[i].key, key) == 0)
+            return 1;
+    return 0;
+}
+
+static int collect_problems(const cutils_config_t *cfg,
+                            const config_key_t *file_keys,
+                            const config_key_t *db_keys,
+                            cfg_problems_t *out)
+{
+    int rc = CUTILS_OK;
+    const yaml_doc_t *doc = cfg->doc;
+
+    for (int i = 0; rc == CUTILS_OK && i < doc->nissues; i++)
+        rc = problem_add(out, doc->issues[i].line, "%s", doc->issues[i].msg);
+
+    for (int i = 0; rc == CUTILS_OK && i < doc->nentries; i++) {
+        const yaml_entry_t *e = &doc->entries[i];
+        char dotkey[400];
+        snprintf(dotkey, sizeof(dotkey), "%s.%s", e->section, e->key);
+
+        int idx = find_key_idx(cfg, dotkey);
+        if (idx >= 0) {
+            const char *why = type_problem(cfg->keys[idx].type, e->value);
+            if (why)
+                rc = problem_add(out, e->line, "%s: '%s' %s",
+                                 dotkey, e->value, why);
+            continue;
+        }
+
+        int implicit = 0;
+        for (int k = 0; cutils_implicit_keys[k]; k++)
+            if (strcmp(cutils_implicit_keys[k], dotkey) == 0) implicit = 1;
+        if (implicit) continue;
+
+        if (key_in(db_keys, dotkey, CFG_STORE_DB) ||
+            key_in(file_keys, dotkey, CFG_STORE_DB)) {
+            rc = problem_add(out, e->line,
+                "%s is kept in the database, not this file; the value "
+                "here has no effect", dotkey);
+            continue;
+        }
+
+        const char *hint = suggest_key(cfg, dotkey);
+        if (hint)
+            rc = problem_add(out, e->line, "unknown key '%s' (did you mean '%s'?)",
+                             dotkey, hint);
+        else
+            rc = problem_add(out, e->line, "unknown key '%s'", dotkey);
+    }
+
+    /* Environment overrides win over the file, so a bad one is as silent
+     * as a bad file value. They have no line; name the variable. */
+    for (int i = 0; rc == CUTILS_OK && i < cfg->nkeys; i++) {
+        if (!cfg->env_values[i]) continue;
+        const char *why = type_problem(cfg->keys[i].type, cfg->env_values[i]);
+        if (!why) continue;
+        CUTILS_AUTOFREE char *envname = make_env_name(cfg->env_prefix,
+                                                      cfg->keys[i].key);
+        rc = problem_add(out, 0, "environment %s (%s): '%s' %s",
+                         envname ? envname : "?", cfg->keys[i].key,
+                         cfg->env_values[i], why);
+    }
+
+    if (out->n > 1)
+        qsort(out->v, (size_t)out->n, sizeof(*out->v), problem_cmp);
+    return rc;
+}
+
+static int validate_config(const cutils_config_t *cfg,
+                           const config_key_t *file_keys,
+                           const config_init_opts_t *opts)
+{
+    if (!opts || opts->validate == CFG_VALIDATE_OFF) return CUTILS_OK;
+
+    cfg_problems_t probs = { 0 };
+    int rc = collect_problems(cfg, file_keys, opts->db_keys, &probs);
+    if (rc != CUTILS_OK) {
+        problems_free(&probs); /* LCOV_EXCL_LINE */
+        return rc;             /* LCOV_EXCL_LINE */
+    }
+
+    int strict = opts->validate == CFG_VALIDATE_STRICT;
+    const char *kind = strict ? "error" : "warning";
+    for (int i = 0; i < probs.n; i++) {
+        if (probs.v[i].line > 0)
+            fprintf(stderr, "%s:%d: %s: %s\n", cfg->config_path,
+                    probs.v[i].line, kind, probs.v[i].msg);
+        else
+            fprintf(stderr, "%s: %s\n", kind, probs.v[i].msg);
+    }
+
+    if (strict && probs.n > 0) {
+        char more[64] = "";
+        if (probs.n > 1)
+            snprintf(more, sizeof(more), " (and %d more, printed above)",
+                     probs.n - 1);
+        if (probs.v[0].line > 0)
+            rc = set_error(CUTILS_ERR_CONFIG, "%s:%d: %s%s", cfg->config_path,
+                           probs.v[0].line, probs.v[0].msg, more);
+        else
+            rc = set_error(CUTILS_ERR_CONFIG, "%s%s", probs.v[0].msg, more);
+    }
+    problems_free(&probs);
+    return rc;
+}
+
 /* --- Init --- */
 
 int config_init(cutils_config_t **out,
@@ -298,6 +544,18 @@ int config_init(cutils_config_t **out,
                 config_first_run_t first_run,
                 const config_key_t *file_keys,
                 const config_section_t *sections)
+{
+    return config_init_opts(out, app_name, config_path, first_run,
+                            file_keys, sections, NULL);
+}
+
+int config_init_opts(cutils_config_t **out,
+                     const char *app_name,
+                     const char *config_path,
+                     config_first_run_t first_run,
+                     const config_key_t *file_keys,
+                     const config_section_t *sections,
+                     const config_init_opts_t *opts)
 {
     /* Every `return` below is covered by CUTILS_AUTO_CONFIG on `cfg`.
      * cppcheck does not model the cleanup attribute — suppress its
@@ -437,6 +695,16 @@ int config_init(cutils_config_t **out,
         return set_error(CUTILS_ERR_IO, "failed to parse config file '%s'",
                          cfg->config_path);
 
+    /* The index is needed by validation as well as by reads.
+     * config_attach_db runs another rebuild after appending its db keys. */
+    int rc = sorted_keys_rebuild(cfg);
+    if (rc != CUTILS_OK) return rc;
+
+    /* Before the required-key check: a key that is "missing" because its
+     * line was malformed or misspelled is better reported as that. */
+    rc = validate_config(cfg, file_keys, opts);
+    if (rc != CUTILS_OK) return rc;
+
     /* Validate required keys */
     for (int i = 0; i < cfg->nkeys; i++) {
         if (cfg->keys[i].store != CFG_STORE_FILE) continue;
@@ -447,12 +715,6 @@ int config_init(cutils_config_t **out,
             return set_error(CUTILS_ERR_CONFIG,
                 "required config key '%s' is missing or empty", cfg->keys[i].key);
     }
-
-    /* Build the sorted-by-key index now that registration is done.
-     * Reads through find_key_idx land in O(log n). config_attach_db
-     * runs another rebuild after appending its db keys. */
-    int rc = sorted_keys_rebuild(cfg);
-    if (rc != CUTILS_OK) return rc;
 
     /* Transfer ownership to caller; cleanup sees NULL and skips. */
     *out = CUTILS_MOVE(cfg);
@@ -500,6 +762,13 @@ void config_free(cutils_config_t *cfg)
 const char *config_get_path(const cutils_config_t *cfg)
 {
     return cfg ? cfg->config_path : NULL;
+}
+
+int config_key_line(const cutils_config_t *cfg, const char *key)
+{
+    if (!cfg || !key) return 0;
+    CUTILS_LOCK_GUARD(cfg->mutex);
+    return cfg->doc ? yaml_get_line(cfg->doc, key) : 0;
 }
 
 /* --- DB config integration --- */

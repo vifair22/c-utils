@@ -61,6 +61,33 @@ typedef struct {
 CUTILS_MUST_USE
 int push_send_opts(const push_opts_t *opts);
 
+/* Delivery counters (1.4.0).
+ *
+ * The worker gives up on a message when Pushover rejects it (4xx: bad
+ * token or user, malformed request) or when its TTL runs out before a
+ * send succeeds. Until 1.4.0 that was one log line; these let the
+ * application count it, e.g. as a Prometheus counter, and alert on it.
+ *
+ * Counted per Pushover request, so a message split into N parts counts N.
+ * The counters start at 0 in push_init and only grow until the next one.
+ * Lock-free (atomics); safe from any thread while push is running. */
+typedef struct {
+    unsigned long long sent;     /* accepted by Pushover (2xx) */
+    unsigned long long failed;   /* given up on: rejected (4xx) or expired */
+    unsigned long long expired;  /* the part of `failed` that hit its TTL */
+    unsigned long long retried;  /* transient failures rescheduled (network, 5xx) */
+    long long          pending;  /* queued, not yet sent or given up on; -1 if
+                                  * the count query failed */
+} push_stats_t;
+
+/* Fill *out. pending is a COUNT over the push table on the push DB handle
+ * and is 0 when push is disabled or shut down. Do not call concurrently
+ * with push_shutdown / appguard_shutdown: the handle is closed there.
+ * Returns CUTILS_OK, CUTILS_ERR_INVALID for a NULL out, or the DB error
+ * (the counters are still filled and pending is -1). */
+CUTILS_MUST_USE
+int push_get_stats(push_stats_t *out);
+
 /* Config keys that c-utils registers for Pushover.
  * The consuming app decides store (file or DB) via cutils_optional_store. */
 #define PUSH_CONFIG_TOKEN "pushover.token"

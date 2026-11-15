@@ -11,6 +11,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <curl/curl.h>
 
 #include "cutils/push.h"
@@ -27,6 +31,10 @@ extern char *cutils_push_build_postfields(CURL *curl,
                                           const char *title, const char *message,
                                           const char *timestamp, const char *ttl,
                                           int html, int priority);
+
+/* Same arrangement: points the worker at a local listener (NULL restores
+ * the Pushover endpoint). */
+extern void cutils_push_set_url(const char *url);
 
 #define TEST_DB  "/tmp/cutils_test_push.db"
 #define TEST_CFG "/tmp/cutils_test_push.yaml"
@@ -642,6 +650,14 @@ static void test_ttl_expired_row_marked_failed(void **state)
     assert_string_equal(r->rows[0][0], "1");
     db_result_free(r);
 
+    /* An expiry is a failure an application can count (1.4.0). */
+    push_stats_t st;
+    assert_int_equal(push_get_stats(&st), CUTILS_OK);
+    assert_int_equal(st.failed, 1);
+    assert_int_equal(st.expired, 1);
+    assert_int_equal(st.sent, 0);
+    assert_int_equal(st.pending, 0);
+
     log_stream_unregister(h);
     push_shutdown();
     free_fixture(&fix);
@@ -768,6 +784,191 @@ static void test_build_postfields_no_truncation_oversize(void **state)
     curl_global_cleanup();
 }
 
+/* --- Delivery counters (1.4.0) ---
+ *
+ * A message Pushover rejected was visible only as a log line, so an
+ * application had nothing to alert on. These drive the worker against a
+ * local HTTP listener answering with a chosen status and check that each
+ * outcome lands in the right counter. */
+
+typedef struct {
+    int         listen_fd;
+    int         port;
+    _Atomic int status;      /* HTTP status the next request gets */
+    _Atomic int requests;
+    pthread_t   thread;
+} fake_pushover_t;
+
+static void *fake_pushover_main(void *arg)
+{
+    fake_pushover_t *fp = arg;
+    for (;;) {
+        int c = accept(fp->listen_fd, NULL, NULL);
+        if (c < 0) return NULL;   /* listener shut down */
+
+        /* Read headers, then Content-Length bytes of body, so curl has
+         * finished sending before it sees the reply. */
+        char buf[8192];
+        size_t got = 0;
+        const char *hdr_end = NULL;
+        while (got < sizeof(buf) - 1) {
+            ssize_t n = recv(c, buf + got, sizeof(buf) - 1 - got, 0);
+            if (n <= 0) break;
+            got += (size_t)n;
+            buf[got] = '\0';
+            hdr_end = strstr(buf, "\r\n\r\n");
+            if (!hdr_end) continue;
+            const char *cl = strstr(buf, "Content-Length: ");
+            size_t want = cl ? (size_t)strtoul(cl + 16, NULL, 10) : 0;
+            if (got - (size_t)(hdr_end + 4 - buf) >= want) break;
+        }
+
+        int status = atomic_load(&fp->status);
+        const char *body = status == 200 ? "{\"status\":1}"
+                                         : "{\"status\":0,\"errors\":[\"token is invalid\"]}";
+        char resp[256];
+        int len = snprintf(resp, sizeof(resp),
+                           "HTTP/1.1 %d X\r\nContent-Type: application/json\r\n"
+                           "Content-Length: %zu\r\nConnection: close\r\n\r\n%s",
+                           status, strlen(body), body);
+        ssize_t w = send(c, resp, (size_t)len, 0);
+        (void)w;
+        atomic_fetch_add(&fp->requests, 1);
+        close(c);
+    }
+}
+
+static void fake_pushover_start(fake_pushover_t *fp, int status)
+{
+    fp->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert_true(fp->listen_fd >= 0);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    assert_int_equal(bind(fp->listen_fd, (struct sockaddr *)&sa, sizeof(sa)), 0);
+    assert_int_equal(listen(fp->listen_fd, 8), 0);
+    socklen_t slen = sizeof(sa);
+    assert_int_equal(getsockname(fp->listen_fd, (struct sockaddr *)&sa, &slen), 0);
+    fp->port = ntohs(sa.sin_port);
+    atomic_store(&fp->status, status);
+    atomic_store(&fp->requests, 0);
+    assert_int_equal(pthread_create(&fp->thread, NULL, fake_pushover_main, fp), 0);
+}
+
+static void fake_pushover_stop(fake_pushover_t *fp)
+{
+    shutdown(fp->listen_fd, SHUT_RDWR);
+    close(fp->listen_fd);
+    pthread_join(fp->thread, NULL);
+}
+
+/* Poll push_get_stats until pred holds or 10s pass. */
+static int wait_stats(push_stats_t *st, int (*pred)(const push_stats_t *))
+{
+    for (int i = 0; i < 200; i++) {
+        if (push_get_stats(st) == CUTILS_OK && pred(st)) return 1;
+        struct timespec ts = { 0, 50 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+static int one_sent(const push_stats_t *st)    { return st->sent == 1 && st->pending == 0; }
+static int one_failed(const push_stats_t *st)  { return st->failed == 1 && st->pending == 0; }
+static int one_retried(const push_stats_t *st) { return st->retried == 1; }
+
+static void test_push_stats_count_outcomes(void **state)
+{
+    (void)state;
+    fake_pushover_t fp;
+    fake_pushover_start(&fp, 200);
+    char url[64];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%d/1/messages.json", fp.port);
+    cutils_push_set_url(url);
+
+    push_fixture_t fix = make_fixture(1);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+
+    push_stats_t st;
+    assert_int_equal(push_get_stats(&st), CUTILS_OK);
+    assert_int_equal(st.sent, 0);
+    assert_int_equal(st.failed, 0);
+
+    /* Accepted: counted as sent, gone from the queue. */
+    assert_int_equal(push_send("ok title", "ok body"), CUTILS_OK);
+    assert_true(wait_stats(&st, one_sent));
+    assert_int_equal(st.failed, 0);
+
+    /* Rejected (4xx): given up on at once, counted as failed. Before
+     * 1.4.0 this was the log line and nothing else. */
+    atomic_store(&fp.status, 400);
+    assert_int_equal(push_send("bad title", "bad body"), CUTILS_OK);
+    assert_true(wait_stats(&st, one_failed));
+    assert_int_equal(st.sent, 1);
+    assert_int_equal(st.expired, 0);
+
+    /* Server error (5xx): retried later, still pending. */
+    atomic_store(&fp.status, 503);
+    assert_int_equal(push_send("later title", "later body"), CUTILS_OK);
+    assert_true(wait_stats(&st, one_retried));
+    assert_int_equal(st.pending, 1);
+    assert_int_equal(st.failed, 1);
+    assert_int_equal(st.sent, 1);
+
+    push_shutdown();
+    cutils_push_set_url(NULL);
+    fake_pushover_stop(&fp);
+    assert_true(atomic_load(&fp.requests) >= 3);
+
+    /* Shut down: counters survive for a final read, nothing is pending. */
+    assert_int_equal(push_get_stats(&st), CUTILS_OK);
+    assert_int_equal(st.sent, 1);
+    assert_int_equal(st.pending, 0);
+
+    free_fixture(&fix);
+}
+
+static void test_push_stats_null_and_disabled(void **state)
+{
+    (void)state;
+    assert_int_equal(push_get_stats(NULL), CUTILS_ERR_INVALID);
+
+    /* No credentials: push is disabled and every counter reads zero. */
+    push_fixture_t fix = make_fixture(0);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+    push_stats_t st;
+    memset(&st, 0xff, sizeof(st));
+    assert_int_equal(push_get_stats(&st), CUTILS_OK);
+    assert_int_equal(st.sent, 0);
+    assert_int_equal(st.failed, 0);
+    assert_int_equal(st.expired, 0);
+    assert_int_equal(st.retried, 0);
+    assert_int_equal(st.pending, 0);
+    push_shutdown();
+    free_fixture(&fix);
+}
+
+/* A count query that fails reports pending as -1 and returns the error,
+ * with the counters still filled. */
+static void test_push_stats_query_failure(void **state)
+{
+    (void)state;
+    push_fixture_t fix = make_fixture(1);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+    push_shutdown();
+    /* push_shutdown cleared the handle; re-init with the table gone. */
+    assert_int_equal(db_execute_non_query(fix.db, "DROP TABLE push", NULL, NULL),
+                     CUTILS_OK);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+    push_stats_t st;
+    assert_int_not_equal(push_get_stats(&st), CUTILS_OK);
+    assert_int_equal(st.pending, -1);
+    push_shutdown();
+    free_fixture(&fix);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -790,6 +991,9 @@ int main(void)
         cmocka_unit_test_teardown(test_ttl_expired_row_marked_failed, teardown),
         cmocka_unit_test_teardown(test_shutdown_responsive_with_future_retry, teardown),
         cmocka_unit_test_teardown(test_build_postfields_no_truncation_oversize, teardown),
+        cmocka_unit_test_teardown(test_push_stats_count_outcomes, teardown),
+        cmocka_unit_test_teardown(test_push_stats_null_and_disabled, teardown),
+        cmocka_unit_test_teardown(test_push_stats_query_failure, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -662,6 +662,106 @@ The same functions work for both file-backed and DB-backed keys — the caller d
 
 `config_get_bool` recognizes `"true"`, `"1"`, `"yes"` (returns 1) and `"false"`, `"0"`, `"no"` (returns 0). Returns `default_val` for anything else.
 
+### The YAML subset
+
+The file parser is hand-rolled and reads a deliberately small subset of
+YAML: one level of sections, each holding scalar keys.
+
+```yaml
+---                         # optional document start marker, ignored
+# A comment line
+section:                    # a section header: name and colon at column 0
+  key: value                # keys indented under a section
+  other: value with spaces  # inline comment, stripped (space before '#')
+  quoted: "a # b"           # double quotes keep '#'; they are removed on read
+  empty:                    # empty value: the key reads as its default
+```
+
+Supported:
+
+| Construct | Notes |
+|-----------|-------|
+| `section:` at column 0 | Starts a section. Nothing may follow the colon except a comment. |
+| `key: value`, indented | Spaces or tabs; every key of one section must use the same indentation. A space after the colon is required. |
+| Plain values | Everything after `key: ` up to an inline comment, trailing whitespace trimmed. `http://host:80/` is fine; `a: b` inside a value is not. |
+| Double-quoted values | `"..."`, no escapes. A comment may follow the closing quote; nothing else may. |
+| Comments | Full-line `#`, and inline ` # ...` on unquoted values. |
+| `---` | Ignored. |
+
+Not supported, and recorded as a problem with its line:
+
+| Construct | Example |
+|-----------|---------|
+| Flow collections | `log: [a, b]`, `key: {a: 1}` |
+| Nested mappings | a key indented deeper than its section's other keys |
+| Top-level scalars | `verbose: true` at column 0 |
+| Lines that are not `name:` or `key: value` | a bare word; `a:b` |
+| Indentation that changes within a section | |
+| Single quotes, unterminated double quotes, text after a closing quote | `'x'`, `"x`, `"x" y` |
+| Anchors, aliases, tags, block scalars | values starting `&`, `*`, `!`, `\|`, `>` |
+| `: ` inside an unquoted value | `key: a: b` (quote it) |
+| Indented lines before any section | |
+| Empty or invalid key names | `: x`, `two words: x` |
+| A key set twice | the second occurrence is reported |
+| Lines over 1023 bytes | |
+
+The parser still loads what it can around such a line, exactly as 1.3 did;
+whether a problem stops the application is the application's choice (next
+section). Section and key names are bounded to 128 bytes each.
+
+### Validation (1.4.0+)
+
+Until 1.4.0 every one of these loaded silently, so a misspelt key, an
+integer written as a word, or `log: [debug]` produced a running program that
+did something other than what the file said. A setting that is accepted and
+not honoured is the hardest kind of configuration bug to see.
+
+The application chooses what happens through `config_validate_t`, either in
+`appguard_config_t.config_validate` or in `config_init_opts_t.validate`:
+
+| Mode | Behavior |
+|------|----------|
+| `CFG_VALIDATE_OFF` (0, default) | As 1.3: problems are ignored. |
+| `CFG_VALIDATE_WARN` | Each problem is printed to stderr as `<path>:<line>: warning: <what>`, and init continues. |
+| `CFG_VALIDATE_STRICT` | Each problem is printed as `<path>:<line>: error: <what>`, and init fails with `CUTILS_ERR_CONFIG`. `cutils_get_error()` holds the first problem and how many more there were. Under AppGuard, `appguard_init` returns `NULL` before the database is opened. |
+
+What is checked:
+
+- every line outside the subset above;
+- **unknown keys**: a key in the file that no `config_key_t` registers. When a registered key is within two edits, the message suggests it: `unknown key 'security.key_dri' (did you mean 'security.key_dir'?)`. `log.level`, `pushover.token` and `pushover.user` are always known, because c-utils reads them itself;
+- **DB-backed keys in the file**: a key registered with `CFG_STORE_DB` (in `file_keys`, or in `config_init_opts_t.db_keys` / AppGuard's `db_keys`) has no effect in the file, and is reported as such;
+- **typed values**: a `CFG_INT` value must be a decimal integer within `int` range, a `CFG_BOOL` value one of `true`, `false`, `yes`, `no`, `1`, `0`. An empty value means "unset" and is valid. Environment overrides are checked too and reported by variable name, since they have no line;
+- under AppGuard, **`log.level`** must be `debug`, `info`, `warn`, `warning` or `error`.
+
+Every problem is reported in one run, in file order, so fixing a file takes
+one restart rather than one per mistake. A template generated on first run
+always validates.
+
+Values only an application can judge (an enumerated string, a path that must
+exist) are the application's to check after init. `config_key_line(cfg, key)`
+returns the line a key was set on, so those messages can point at it too:
+
+```c
+const char *mode = config_get_str(cfg, "backup.mode");
+if (strcmp(mode, "fast") != 0 && strcmp(mode, "safe") != 0) {
+    fprintf(stderr, "%s:%d: backup.mode: '%s' is not fast or safe\n",
+            config_get_path(cfg), config_key_line(cfg, "backup.mode"), mode);
+    return 1;
+}
+```
+
+Standalone, without AppGuard:
+
+```c
+config_init_opts_t opts = { .validate = CFG_VALIDATE_STRICT };
+int rc = config_init_opts(&cfg, "my-app", NULL, CFG_FIRST_RUN_CONTINUE,
+                          file_keys, sections, &opts);
+if (rc == CUTILS_ERR_CONFIG)
+    fprintf(stderr, "config: %s\n", cutils_get_error());
+```
+
+`config_init(...)` is `config_init_opts(..., NULL)`.
+
 ### Template generation (first run)
 
 When the config file does not exist, `config_init` (called by `appguard_init`) generates a YAML template containing all file-backed keys with their defaults and descriptions as comments:
@@ -990,6 +1090,36 @@ Permanent failures (4xx responses — bad token, malformed request) mark the mes
 
 The give-up clock is the per-message TTL (default 24h, overridable via `push_opts_t.ttl`). When `now > timestamp + ttl`, the worker marks the row `failed = 1` without a send attempt — stale alerts are worse than not delivering them. For an outage that exceeds the TTL, the message is dropped at the worker's next drain pass.
 
+### Delivery counters (1.4.0+)
+
+A message the worker gives up on (rejected with a 4xx, or past its TTL) used
+to leave one log line. `push_get_stats` gives the application numbers it can
+export and alert on:
+
+```c
+push_stats_t st;
+if (push_get_stats(&st) == CUTILS_OK)
+    printf("sent %llu failed %llu pending %lld\n", st.sent, st.failed, st.pending);
+```
+
+| Field | Meaning |
+|-------|---------|
+| `sent` | Requests Pushover accepted (2xx) |
+| `failed` | Requests given up on: rejected (4xx) or expired |
+| `expired` | The part of `failed` whose TTL ran out before a send succeeded |
+| `retried` | Transient failures (network, 5xx) rescheduled for a later attempt |
+| `pending` | Rows still queued: a `COUNT` over the `push` table. `0` when push is disabled or shut down, `-1` if the query failed |
+
+Counters are per Pushover request, so a message split into N parts counts N.
+They are lock-free atomics, start at 0 in `push_init`, and only grow until
+the next `push_init`, which is the shape a Prometheus counter wants. Reading
+`pending` uses the push DB handle, so do not call `push_get_stats`
+concurrently with `push_shutdown` / `appguard_shutdown`.
+
+A rejection is also logged with the HTTP status and the start of Pushover's
+response body, which says why (`push permanently failed (HTTP 400,
+{"user":"invalid",...}): <title>`).
+
 ### Disabled contract
 
 `push_send` and `push_send_opts` are silent no-ops (return `CUTILS_OK`, no DB row inserted) when any of these are true:
@@ -1107,15 +1237,16 @@ appguard_config_t cfg = {
 | `sections` | `const config_section_t *` | No | `NULL` | Section display names for template generation. NULL-terminated array. |
 | `enable_pushover` | `int` | No | `0` | Start push worker if credentials are configured. |
 | `log_retention_days` | `int` | No | `0` | Auto-delete log entries older than this. 0 = keep all. |
-| `log_level` | `log_level_t` | No | `LOG_INFO` | Minimum log level. Can be overridden by `log.level` in config. |
+| `log_level` | `log_level_t` | No | `LOG_INFO` | Minimum log level. Can be overridden by `log.level` in config: `debug`, `info`, `warn` (or `warning`), `error`. |
 | `migrations` | `const db_migration_t *` | No | `NULL` | Compiled-in app migrations. NULL-terminated array. |
 | `migrations_dir` | `const char *` | No | `NULL` | Directory containing `.sql` migration files. |
+| `config_validate` | `config_validate_t` | No | `CFG_VALIDATE_OFF` | What to do with config file problems: ignore, warn, or refuse to start (1.4.0+). See [Validation](#validation-140). |
 
 ### Initialization order
 
 `appguard_init()` performs the following steps in order. If any step fails, it cleans up everything initialized so far and returns `NULL`.
 
-1. **Config file** — parse the YAML file, or generate a template if it does not exist.
+1. **Config file**: parse the YAML file, or generate a template if it does not exist. With `config_validate` set, report problems and, under `CFG_VALIDATE_STRICT`, stop here. `log.level` is resolved and checked at this step too.
 2. **Validate required file keys** — all keys with `required = 1` must be non-empty.
 3. **Open database** — connects to the path specified by the `db.path` config key (registered automatically by c-utils with a default of `"app.db"`).
 4. **Library migrations** — creates c-utils internal tables (`config`, `logs`, `push`).
