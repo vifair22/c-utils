@@ -2,8 +2,10 @@
 #include <stddef.h>
 #include <setjmp.h>
 #include <cmocka.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +22,23 @@
 #include "cutils/push.h"
 
 #define TEST_CFG "/tmp/cutils_test_appguard.yaml"
+
+/*
+ * chmod, intercepted. The library is linked statically, so its calls resolve
+ * here. It passes through unless a test sets an errno to fail with, which is
+ * how a read-only bind mount is simulated without privileges. Calls on the
+ * config path are counted, to prove a file already at the right mode is left
+ * alone.
+ */
+static int g_chmod_fail_errno = 0;
+static int g_chmod_config_calls = 0;
+int chmod(const char *path, mode_t mode)
+{
+    if (strcmp(path, "/tmp/cutils_test_appguard.yaml") == 0)
+        g_chmod_config_calls++;
+    if (g_chmod_fail_errno) { errno = g_chmod_fail_errno; return -1; }
+    return fchmodat(AT_FDCWD, path, mode, 0);
+}
 #define TEST_DB  "/tmp/cutils_test_appguard.db"
 
 static int teardown(void **state)
@@ -763,11 +782,11 @@ static void test_sigterm_clean_exit(void **state)
 
 /* --- Application-driven shutdown (1.3.0) --- */
 
-static volatile int g_signalled = 0;
+static atomic_int g_signalled = 0;
 static void note_signal(int sig, void *ctx)
 {
     (void)sig;
-    *(volatile int *)ctx = 1;
+    atomic_store((atomic_int *)ctx, 1);
 }
 
 /* Fork a child that inits AppGuard with on_signal set and, once told, runs
@@ -784,14 +803,14 @@ static pid_t spawn_hooked_child(int ignore_first)
             .on_first_run = CFG_FIRST_RUN_CONTINUE,
             .log_level = LOG_ERROR,
             .on_signal = note_signal,
-            .on_signal_ctx = (void *)&g_signalled,
+            .on_signal_ctx = &g_signalled,
         };
         appguard_t *guard = appguard_init(&cfg);
         if (!guard) _exit(2);
         for (;;) {
             struct timespec t = { 0, 10 * 1000 * 1000 };
             nanosleep(&t, NULL);
-            if (g_signalled && !ignore_first) {
+            if (atomic_load(&g_signalled) && !ignore_first) {
                 /* The app's own teardown, then AppGuard's. */
                 appguard_shutdown(guard);
                 _exit(7);
@@ -1019,6 +1038,69 @@ static void test_config_mode_enforces(void **state)
     appguard_shutdown(guard);
 }
 
+/* A config already at the mode is not chmod'ed: on a read-only mount
+ * that chmod failed and the daemon exited, though nothing needed fixing. */
+static void test_config_mode_already_right_is_left_alone(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG, "db:\n  path: " TEST_DB "\n");   /* 0600 */
+    g_chmod_config_calls = 0;
+    g_chmod_fail_errno = EROFS;   /* any chmod would fail, as on a ro mount */
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+        .config_mode = 0600,
+    };
+    appguard_t *guard = appguard_init(&cfg);
+    g_chmod_fail_errno = 0;
+    assert_non_null(guard);
+    assert_int_equal(g_chmod_config_calls, 0);
+    appguard_shutdown(guard);
+}
+
+/* Wrong mode on a filesystem that will not change it: warn and start,
+ * because refusing cannot fix it. */
+static void test_config_mode_unfixable_warns_and_starts(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG, "db:\n  path: " TEST_DB "\n");
+    assert_int_equal(chmod(TEST_CFG, 0644), 0);
+    g_chmod_fail_errno = EROFS;
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+        .config_mode = 0600,
+    };
+    appguard_t *guard = appguard_init(&cfg);
+    g_chmod_fail_errno = 0;
+    assert_non_null(guard);
+    assert_int_equal((int)file_mode(TEST_CFG), 0644);
+    appguard_shutdown(guard);
+}
+
+/* Any other failure to enforce the mode still refuses to start. */
+static void test_config_mode_other_failure_is_fatal(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG, "db:\n  path: " TEST_DB "\n");
+    assert_int_equal(chmod(TEST_CFG, 0644), 0);
+    g_chmod_fail_errno = EIO;
+    appguard_config_t cfg = {
+        .app_name = "testguard",
+        .config_path = TEST_CFG,
+        .on_first_run = CFG_FIRST_RUN_CONTINUE,
+        .log_level = LOG_ERROR,
+        .config_mode = 0600,
+    };
+    appguard_t *guard = appguard_init(&cfg);
+    g_chmod_fail_errno = 0;
+    assert_null(guard);
+}
+
 /* Both modes set together — the typical daemon configuration.
  * Verifies they compose correctly and don't interfere with each
  * other (e.g., the config chmod happens before the umask is
@@ -1150,6 +1232,9 @@ int main(void)
         cmocka_unit_test_teardown(test_db_mode_idempotent_on_existing, teardown),
         cmocka_unit_test_teardown(test_db_mode_no_umask_bleed, teardown),
         cmocka_unit_test_teardown(test_config_mode_enforces, teardown),
+        cmocka_unit_test_teardown(test_config_mode_already_right_is_left_alone, teardown),
+        cmocka_unit_test_teardown(test_config_mode_unfixable_warns_and_starts, teardown),
+        cmocka_unit_test_teardown(test_config_mode_other_failure_is_fatal, teardown),
         cmocka_unit_test_teardown(test_db_and_config_mode_combined, teardown),
         cmocka_unit_test_teardown(test_db_mode_migration_failure_restores_umask, teardown),
         cmocka_unit_test_teardown(test_config_get_path_accessor, teardown),

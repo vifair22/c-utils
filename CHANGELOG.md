@@ -5,6 +5,22 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.3.1] - 2026-11-15
+
+### Fixed
+
+- **A read-only config file no longer stops the application.** With
+  `config_mode` set, AppGuard chmod'ed the config on every start. A config
+  bind-mounted read-only into a container, the usual way to supply one,
+  failed that chmod with EROFS, and `appguard_init` returned NULL: the
+  daemon exited and its supervisor restarted it forever, though the file
+  was already at the required mode. Found in c-backup's UAT on Unraid.
+  - A file already at `config_mode` is left alone.
+  - A file at the wrong mode whose filesystem refuses the change (EROFS,
+    EPERM) gets a warning on stderr naming both modes, and init continues:
+    refusing to start cannot fix it.
+  - Any other chmod failure is still fatal.
+
 ## [1.3.0] - 2026-11-15
 
 Lets a daemon own its shutdown. One new optional `appguard_config_t`
