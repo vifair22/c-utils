@@ -265,20 +265,40 @@ appguard_t *appguard_init(const appguard_config_t *cfg)
 
     /* Lock down the config file if requested. config_init has
      * already produced the file (parsed or generated), so the path
-     * is real and chmod is well-defined. Hard failure: the caller
-     * asserted a mode contract by setting config_mode != 0, and we
-     * don't silently downgrade. */
+     * is real.
+     *
+     * A file already at the mode is left alone (1.3.1). It used to be
+     * chmod'ed regardless, and a config bind-mounted read-only into a
+     * container - the normal way to supply one - failed that chmod
+     * with EROFS and the daemon exited and restarted forever, although
+     * the file was 0600 all along.
+     *
+     * A file at the wrong mode is fixed. If the filesystem will not let
+     * us (EROFS: a read-only mount; EPERM: a file owned by someone
+     * else), refusing to start cannot fix it either, so it is a loud
+     * warning rather than an exit. Any other failure is still fatal. */
     if (cfg->config_mode != 0) {
         const char *path = config_get_path(guard->config);
-        if (!path || chmod(path, cfg->config_mode) != 0) {
-            /* LCOV_EXCL_START — config_get_path returns non-NULL when
-             * config_init succeeded, and chmod on a just-parsed file
-             * we read from shouldn't fail. */
-            fprintf(stderr, "appguard: chmod config (%s) to 0%o failed: %s\n",
-                    path ? path : "(null)", (unsigned)cfg->config_mode,
-                    strerror(errno));
+        struct stat cst;
+        if (!path || stat(path, &cst) != 0) {
+            /* LCOV_EXCL_START - config_init just read this file. */
+            fprintf(stderr, "appguard: cannot stat config (%s): %s\n",
+                    path ? path : "(null)", strerror(errno));
             return NULL;
             /* LCOV_EXCL_STOP */
+        }
+        if ((cst.st_mode & 07777) != cfg->config_mode &&
+            chmod(path, cfg->config_mode) != 0) {
+            if (errno == EROFS || errno == EPERM) {
+                fprintf(stderr, "appguard: warning: config %s is mode 0%o, not 0%o, "
+                        "and cannot be changed here (%s); fix it where the file "
+                        "lives\n", path, (unsigned)(cst.st_mode & 07777),
+                        (unsigned)cfg->config_mode, strerror(errno));
+            } else {
+                fprintf(stderr, "appguard: chmod config (%s) to 0%o failed: %s\n",
+                        path, (unsigned)cfg->config_mode, strerror(errno));
+                return NULL;
+            }
         }
     }
 
