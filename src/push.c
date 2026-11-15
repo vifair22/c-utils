@@ -301,21 +301,36 @@ static send_result_t send_one(const char *token, const char *user,
                               const char *title, const char *message,
                               const char *timestamp, const char *ttl,
                               int html, int priority,
-                              long *http_out, resp_snip_t *resp)
+                              char *cause, size_t cause_sz)
 {
-    *http_out = 0;
+    /* cause says why a send failed, for the log line of either kind of
+     * failure. Only the permanent line used to say, so a retried send
+     * logged no reason at all, and a retry that never succeeds was
+     * undiagnosable from the log (1.5.1). */
+    cause[0] = '\0';
     CUTILS_AUTO_CURL CURL *curl = curl_easy_init();
-    if (!curl) return SEND_TRANSIENT_FAIL;
+    if (!curl) {
+        snprintf(cause, cause_sz, "curl_easy_init failed");
+        return SEND_TRANSIENT_FAIL;
+    }
+
+    resp_snip_t resp = { .len = 0 };
+    resp.buf[0] = '\0';
+    char errbuf[CURL_ERROR_SIZE];
+    errbuf[0] = '\0';
 
     curl_easy_setopt(curl, CURLOPT_URL, atomic_load(&push_url));
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discard_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, resp);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
 
     CUTILS_AUTOFREE char *postfields = cutils_push_build_postfields(
         curl, token, user, title, message, timestamp, ttl, html, priority);
-    if (!postfields)
-        return SEND_TRANSIENT_FAIL; /* OOM — retryable. */
+    if (!postfields) {
+        snprintf(cause, cause_sz, "out of memory building the request");
+        return SEND_TRANSIENT_FAIL; /* OOM - retryable. */
+    }
 
     /* libcurl borrows the buffer for the duration of curl_easy_perform
      * (CURLOPT_POSTFIELDS does not copy). The AUTOFREE on postfields
@@ -325,13 +340,20 @@ static send_result_t send_one(const char *token, const char *user,
     CURLcode res = curl_easy_perform(curl);
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    *http_out = http_code;
 
     if (res == CURLE_OK && http_code >= 200 && http_code < 300)
         return SEND_OK;
 
-    if (res != CURLE_OK)
-        return SEND_TRANSIENT_FAIL; /* Network/DNS/timeout — retryable. */
+    if (res != CURLE_OK) {
+        /* The error buffer names the host, port and syscall where it
+         * can; the generic string is the fallback when it is empty. */
+        snprintf(cause, cause_sz, "curl: %s",
+                 errbuf[0] ? errbuf : curl_easy_strerror(res));
+        return SEND_TRANSIENT_FAIL; /* Network/DNS/timeout - retryable. */
+    }
+
+    snprintf(cause, cause_sz, "HTTP %ld%s%s",
+             http_code, resp.len ? ", " : "", resp.buf);
 
     if (http_code >= 400 && http_code < 500)
         return SEND_PERMANENT_FAIL; /* Bad token, malformed request, etc. */
@@ -464,12 +486,10 @@ static void *push_worker_thread(void *arg)
                 continue;
             }
 
-            long http_code = 0;
-            resp_snip_t resp = { .len = 0 };
-            resp.buf[0] = '\0';
+            char cause[320];
             send_result_t sr = send_one(token, user, title, message,
                                         timestamp, ttl, html, priority,
-                                        &http_code, &resp);
+                                        cause, sizeof(cause));
 
             if (sr == SEND_OK) {
                 const char *del_params[] = { rowid, NULL };
@@ -486,8 +506,7 @@ static void *push_worker_thread(void *arg)
                     "UPDATE push SET failed = 1 WHERE rowid = ?",
                     fail_params, NULL));
                 atomic_fetch_add(&push_n_failed, 1);
-                log_error("push permanently failed (HTTP %ld%s%s): %s",
-                          http_code, resp.len ? ", " : "", resp.buf, title);
+                log_error("push permanently failed (%s): %s", cause, title);
             } else {
                 int next_attempts = attempts + 1;
                 int delay         = push_backoff_seconds(next_attempts);
@@ -502,8 +521,8 @@ static void *push_worker_thread(void *arg)
                     "UPDATE push SET attempts = ?, next_retry_at = ? "
                     "WHERE rowid = ?", upd_params, NULL));
                 atomic_fetch_add(&push_n_retried, 1);
-                log_warn("push transient failure (attempt %d, retry in %ds): %s",
-                         next_attempts, delay, title);
+                log_warn("push transient failure (%s; attempt %d, retry in %ds): %s",
+                         cause, next_attempts, delay, title);
                 /* Don't break — the retried row drops out of the
                  * SELECT predicate and the drain advances to the
                  * next due row. */
