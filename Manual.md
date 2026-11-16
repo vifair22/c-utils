@@ -340,6 +340,7 @@ What the cache guarantees:
 
 - **No held locks.** Each statement is `sqlite3_reset` after every call, so a cached statement holds no read transaction and does not block WAL checkpoints or `VACUUM`.
 - **Same parameter semantics.** A reused statement keeps its previous bindings: the cache never calls `sqlite3_clear_bindings`. Instead each call rebinds what it passes and binds NULL only to the trailing parameters the previous call set and this one did not. An omitted parameter still reads as NULL, exactly as with a fresh statement.
+- **Plan-dependent parameters.** With sqlite built with STAT4 (Debian and Arch builds are) and `ANALYZE` run, a statement whose plan depends on a bound value is re-prepared by sqlite when that value changes. The cache cannot avoid that, but it never adds a re-prepare: measured on a JOIN, 10 calls re-prepared 10 times with a changing value, once with a repeated value, and 10 times with `sqlite3_clear_bindings` before the same repeated value. That is why the cache never clears bindings.
 - **Schema changes are handled.** sqlite re-prepares a statement on its next step when the schema changed, so `ALTER TABLE` and friends need no action; `SELECT *` picks up new columns. If sqlite still reports `SQLITE_SCHEMA`, the entry is dropped and the call re-prepared once.
 - **Failures drop the entry.** Any prepare, bind or step error removes that statement from the cache, so the next call starts from a fresh one.
 - **Thread safety.** The cache lives under the handle mutex; there is no extra lock.
