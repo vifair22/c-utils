@@ -5,6 +5,23 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.7.1] - 2026-11-16
+
+One fix to the 1.7.0 typed binds, found by c-backup while adopting them.
+
+### Fixed
+
+- **`DB_BLOB` with a NULL pointer read out of bounds.** 1.7.0 replaced
+  a NULL pointer with a 1-byte `""` but kept the given length, so
+  `DB_BLOB(NULL, 32)` made sqlite copy 32 bytes from it, and the bound
+  value was garbage rather than NULL.
+  - A NULL pointer now binds SQL NULL whatever the length, the rule
+    `DB_TEXT(NULL)` already followed. `DB_BLOB(have ? hash : NULL, 32)`
+    binds the hash or NULL.
+  - **Behaviour change:** `DB_BLOB(NULL, 0)` now binds NULL too; in
+    1.7.0 it bound an empty blob. For an empty blob, pass any non-NULL
+    pointer with length 0.
+
 ## [1.7.0] - 2026-11-16
 
 A prepared-statement cache in the db layer, typed parameter binding and
