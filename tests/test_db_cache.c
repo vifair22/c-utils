@@ -508,7 +508,7 @@ static void test_typed_text_and_edge_values(void **state)
         DB_TEXT("hello"),
         { .type = DB_P_TEXT, .ptr = "hello world", .len = 5 },
         DB_TEXT(NULL),
-        { .type = DB_P_BLOB, .ptr = NULL, .len = 0 },
+        DB_BLOB("", 0),
     };
     CUTILS_AUTO_DBRES db_result_t *r = NULL;
     assert_int_equal(db_execute_typed(db,
@@ -519,6 +519,41 @@ static void test_typed_text_and_edge_values(void **state)
     assert_string_equal(r->rows[0][2], "1");
     assert_string_equal(r->rows[0][3], "blob");
     assert_string_equal(r->rows[0][4], "0");
+}
+
+/* 1.7.1: a NULL blob pointer binds SQL NULL whatever the length. In
+ * 1.7.0, DB_BLOB(NULL, 32) read 32 bytes from a 1-byte literal; under
+ * ASAN that is a global-buffer-overflow, so this test also guards the
+ * read. */
+static void test_typed_null_blob_ptr_binds_null(void **state)
+{
+    cutils_db_t *db = *state;
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE o (name TEXT, h BLOB)"),
+                     CUTILS_OK);
+    uint8_t hash[32];
+    memset(hash, 0xab, sizeof(hash));
+
+    for (int have = 0; have < 2; have++) {
+        db_param_t p[] = {
+            DB_TEXT(have ? "with" : "without"),
+            DB_BLOB(have ? hash : NULL, sizeof(hash)),
+        };
+        assert_int_equal(db_execute_non_query_typed(db,
+            "INSERT INTO o VALUES (?, ?)", p, 2, NULL), CUTILS_OK);
+    }
+    db_param_t zero[] = { DB_TEXT("zero"), DB_BLOB(NULL, 0) };
+    assert_int_equal(db_execute_non_query_typed(db,
+        "INSERT INTO o VALUES (?, ?)", zero, 2, NULL), CUTILS_OK);
+
+    CUTILS_AUTO_DBRES db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT name, typeof(h), length(h) FROM o ORDER BY rowid", NULL, &r),
+        CUTILS_OK);
+    assert_int_equal(r->nrows, 3);
+    assert_string_equal(r->rows[0][1], "null");
+    assert_string_equal(r->rows[1][1], "blob");
+    assert_string_equal(r->rows[1][2], "32");
+    assert_string_equal(r->rows[2][1], "null");
 }
 
 static void test_typed_count_rules(void **state)
@@ -659,6 +694,7 @@ int main(void)
         T(test_threads_share_cache),
         T(test_typed_blob_roundtrip),
         T(test_typed_text_and_edge_values),
+        T(test_typed_null_blob_ptr_binds_null),
         T(test_typed_count_rules),
         T(test_typed_bad_type),
         T(test_result_is_null),
