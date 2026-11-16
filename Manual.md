@@ -304,6 +304,62 @@ Executes one or more semicolon-separated SQL statements with no parameter bindin
 
 Do not use `db_exec_raw` with user-supplied input — there is no parameter binding, so it is not safe against SQL injection. Use `db_execute` or `db_execute_non_query` with `?` parameters for any query that includes external data.
 
+#### Typed parameters (1.7.0+)
+
+The string-array calls bind every value as TEXT and treat the first `NULL` as the end of the array, so they can bind neither raw bytes nor SQL NULL. `db_execute_typed` and `db_execute_non_query_typed` take a counted array of `db_param_t` instead:
+
+```c
+uint8_t hash[32];
+db_param_t p[] = {
+    DB_BLOB(hash, sizeof(hash)),
+    DB_INT64(st.st_size),
+    DB_NULLP,
+};
+int rc = db_execute_non_query_typed(db,
+    "INSERT INTO blobs (hash, size, note) VALUES (?, ?, ?)",
+    p, 3, NULL);
+```
+
+| Constructor | Binds | Notes |
+|---|---|---|
+| `DB_TEXT(s)` | TEXT | `s == NULL` binds SQL NULL. Set `.len` for a counted string with no NUL. |
+| `DB_BLOB(p, n)` | BLOB of `n` bytes | Embedded zero bytes are kept. `p == NULL, n == 0` is an empty blob, not NULL. |
+| `DB_INT64(v)` | INTEGER | Full 64-bit range. |
+| `DB_DOUBLE(v)` | REAL | |
+| `DB_NULLP` | NULL | |
+
+Every value is copied at bind time, so the buffers only need to live for the call. More parameters than the SQL has placeholders is `CUTILS_ERR_DB`; fewer leaves the rest NULL. A `NULL` array means no parameters, whatever `nparams` says.
+
+Results are still strings. Select a BLOB column as `lower(hex(col))` to get it back as text.
+
+#### Prepared-statement cache (1.7.0+)
+
+Parsing and planning a statement is most of the cost of a short INSERT or point SELECT. `db_execute`, `db_execute_non_query` and their `_typed` forms therefore keep prepared statements per handle, in a bounded LRU keyed by the exact SQL text. A repeat call with the same text skips the parse and plan. On the `db_per_file_8` benchmark (8 point statements per iteration, see `bench/README.md`) that is 15.5 us down to 5.1 us per iteration.
+
+What the cache guarantees:
+
+- **No held locks.** Each statement is `sqlite3_reset` after every call, so a cached statement holds no read transaction and does not block WAL checkpoints or `VACUUM`.
+- **Same parameter semantics.** A reused statement keeps its previous bindings: the cache never calls `sqlite3_clear_bindings`. Instead each call rebinds what it passes and binds NULL only to the trailing parameters the previous call set and this one did not. An omitted parameter still reads as NULL, exactly as with a fresh statement.
+- **Plan-dependent parameters.** With sqlite built with STAT4 (Debian and Arch builds are) and `ANALYZE` run, a statement whose plan depends on a bound value is re-prepared by sqlite when that value changes. The cache cannot avoid that, but it never adds a re-prepare: measured on a JOIN, 10 calls re-prepared 10 times with a changing value, once with a repeated value, and 10 times with `sqlite3_clear_bindings` before the same repeated value. That is why the cache never clears bindings.
+- **Schema changes are handled.** sqlite re-prepares a statement on its next step when the schema changed, so `ALTER TABLE` and friends need no action; `SELECT *` picks up new columns. If sqlite still reports `SQLITE_SCHEMA`, the entry is dropped and the call re-prepared once.
+- **Failures drop the entry.** Any prepare, bind or step error removes that statement from the cache, so the next call starts from a fresh one.
+- **Thread safety.** The cache lives under the handle mutex; there is no extra lock.
+- **Cleanup.** `db_close` finalizes every cached statement.
+
+Sizing and opt-out:
+
+```c
+db_stmt_cache_set_size(db, 64);   /* default CUTILS_DB_STMT_CACHE_DEFAULT (32) */
+db_stmt_cache_set_size(db, 0);    /* caching off for this handle */
+
+db_execute_once(db, sql, params, &result);          /* private statement */
+db_execute_non_query_once(db, sql, params, NULL);
+```
+
+Use the `_once` calls for SQL that runs once (setup, admin queries) or whose text varies from call to call (an `IN (...)` list built to the input length). Otherwise it pushes hot statements out of the cache. The key is the exact text, so `"SELECT 1"` and `"SELECT  1"` are two entries. `db_stmt_cache_stats` reports hits, misses, evictions, bypasses, entries and capacity.
+
+`db_exec_raw`, the streaming iterator and the migration runner do not use the cache. The iterator reads its column count and names before the first step, and a cached statement that sqlite re-prepares during that step could change shape under it.
+
 ### Result set structure
 
 ```c
@@ -323,6 +379,8 @@ for (int c = 0; c < result->ncols; c++)
 ```
 
 An empty result set (`nrows == 0`) is still a valid, non-NULL pointer that must be freed.
+
+SQL NULL cells read as `""` in `rows`, the same as an empty string. From 1.7.0, `db_result_is_null(result, row, col)` tells them apart. It returns 0 for an out-of-range cell. The NULL flags live in a private allocation around the struct, so `db_result_is_null` works only on results returned by `db_execute` and `db_execute_typed` (and their `_once` forms), never on a hand-built `db_result_t`.
 
 ### Streaming queries (1.1.0+)
 

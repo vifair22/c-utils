@@ -5,6 +5,66 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.7.0] - 2026-11-16
+
+A prepared-statement cache in the db layer, typed parameter binding and
+NULL detection in results, all for c-backup. Purely additive at the API
+level; the cache is on by default.
+
+### Added
+
+- **Prepared-statement cache.** `db_execute`, `db_execute_non_query`
+  and the new `_typed` calls keep prepared statements per handle in a
+  bounded LRU keyed by the exact SQL text, under the existing handle
+  mutex. A repeat call skips the parse and plan.
+  - Statements are reused through `sqlite3_reset`, so no read
+    transaction is held between calls.
+  - `sqlite3_clear_bindings` is never called. An omitted trailing
+    parameter still reads as NULL.
+  - A schema change is handled: sqlite re-prepares, and a residual
+    `SQLITE_SCHEMA` re-prepares once.
+  - Any error drops the entry, and `db_close` finalizes everything.
+  - `db_stmt_cache_set_size` sets the size (default 32, max 4096,
+    0 turns it off). `db_stmt_cache_stats` reports the counters.
+- **`db_execute_once`, `db_execute_non_query_once`**: the same calls
+  without the cache, for one-off or variable-text SQL.
+- **Typed parameters**: `db_param_t` with `DB_TEXT`, `DB_BLOB`,
+  `DB_INT64`, `DB_DOUBLE` and `DB_NULLP`, passed as a counted array to
+  `db_execute_typed` and `db_execute_non_query_typed`.
+  - BLOBs keep embedded zero bytes.
+  - SQL NULL can be bound.
+  - The count replaces the "NULL ends the array" terminator.
+- **`db_result_is_null(result, row, col)`** tells an SQL NULL cell from
+  an empty string. Both read as `""` in `rows`.
+
+### Changed
+
+- `db_execute` reads the column count after the first step instead of
+  after prepare, so a cached `SELECT *` follows an `ALTER TABLE`.
+- Results are allocated inside a private wrapper that carries the NULL
+  flags. The public `db_result_t` layout is unchanged.
+  `db_result_free` and `db_result_is_null` accept only results
+  returned by the library, which was already the only supported use.
+
+### Performance
+
+Release build, from `make bench`:
+
+| Benchmark | 1.6.0 | 1.7.0 |
+|---|---|---|
+| `db_per_file_8_once` (8 point statements, no cache) | n/a | 15.5 us |
+| `db_per_file_8_cached` (same SQL, cached) | n/a | 5.1 us |
+| `db_typed_blob_lookup` (32-byte BLOB key) | n/a | 0.53 us |
+| `db_execute_1000_rows` | 158 us | 157 us |
+| `db_iter_1000_rows` | 95 us | 92 us |
+
+The cache saves about 10 us per 8-statement unit of work here, roughly
+1 s per 100k files on a simple schema. Statements that cost more to
+plan save more. One exception: with STAT4 and `ANALYZE`, sqlite itself
+re-prepares a statement whose plan depends on a bound value whenever
+that value changes. The cache cannot avoid that, and never adds a
+re-prepare of its own.
+
 ## [1.6.0] - 2026-11-15
 
 `json_req_parse` is strict about what it accepts. No signature changes,
