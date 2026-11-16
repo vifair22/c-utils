@@ -142,7 +142,8 @@ typedef enum {
 
 typedef struct {
     db_param_type_t type;
-    const void     *ptr;  /* TEXT: string (NULL binds SQL NULL); BLOB: bytes */
+    const void     *ptr;  /* TEXT: string; BLOB: bytes. NULL binds SQL NULL
+                           * for either, whatever len says */
     size_t          len;  /* BLOB: byte count; TEXT: byte count, or 0 for
                            * NUL-terminated */
     int64_t         i64;

@@ -323,7 +323,7 @@ int rc = db_execute_non_query_typed(db,
 | Constructor | Binds | Notes |
 |---|---|---|
 | `DB_TEXT(s)` | TEXT | `s == NULL` binds SQL NULL. Set `.len` for a counted string with no NUL. |
-| `DB_BLOB(p, n)` | BLOB of `n` bytes | Embedded zero bytes are kept. `p == NULL, n == 0` is an empty blob, not NULL. |
+| `DB_BLOB(p, n)` | BLOB of `n` bytes | Embedded zero bytes are kept. `p == NULL` binds SQL NULL whatever `n` is (1.7.1+), so `DB_BLOB(have ? hash : NULL, 32)` binds the hash or NULL. For an empty blob pass any non-NULL pointer with `n == 0`. |
 | `DB_INT64(v)` | INTEGER | Full 64-bit range. |
 | `DB_DOUBLE(v)` | REAL | |
 | `DB_NULLP` | NULL | |
