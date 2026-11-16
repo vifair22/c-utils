@@ -317,12 +317,14 @@ static int bind_one_typed(sqlite3_stmt *stmt, int idx, const db_param_t *p)
         return sqlite3_bind_text(stmt, idx, (const char *)p->ptr,
                                  p->len ? (int)p->len : -1, SQLITE_TRANSIENT);
     case DB_P_BLOB:
+        /* A NULL pointer binds SQL NULL whatever len says, the same rule
+         * as DB_TEXT, so DB_BLOB(have ? hash : NULL, 32) means "hash or
+         * NULL". 1.7.0 swapped in a 1-byte "" and kept len, so a NULL
+         * pointer with len 32 read 31 bytes past it. */
+        if (!p->ptr) return sqlite3_bind_null(stmt, idx);
         if (p->len > (size_t)INT32_MAX) return SQLITE_TOOBIG;
-        /* A NULL pointer with zero length is an empty blob, not SQL
-         * NULL: sqlite would bind NULL for a NULL pointer, so hand it
-         * a valid address instead. */
-        return sqlite3_bind_blob(stmt, idx, p->ptr ? p->ptr : (const void *)"",
-                                 (int)p->len, SQLITE_TRANSIENT);
+        return sqlite3_bind_blob(stmt, idx, p->ptr, (int)p->len,
+                                 SQLITE_TRANSIENT);
     case DB_P_INT64:
         return sqlite3_bind_int64(stmt, idx, (sqlite3_int64)p->i64);
     case DB_P_DOUBLE:
