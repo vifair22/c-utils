@@ -97,6 +97,14 @@ CUTILS_MUST_USE
 int db_execute(cutils_db_t *db, const char *sql, const char **params,
                db_result_t **result);
 
+/* Same as db_execute, but prepares a private statement that is
+ * finalized on return instead of going through the statement cache.
+ * Use for SQL that runs once (setup, ad-hoc admin queries, SQL built at
+ * run time) so it does not push hot statements out of the cache. */
+CUTILS_MUST_USE
+int db_execute_once(cutils_db_t *db, const char *sql, const char **params,
+                    db_result_t **result);
+
 /* Execute an INSERT/UPDATE/DELETE query. Returns CUTILS_OK on success.
  * If affected is non-NULL, stores the number of rows affected.
  * params is a NULL-terminated array of string bind values, or NULL. */
@@ -104,10 +112,111 @@ CUTILS_MUST_USE
 int db_execute_non_query(cutils_db_t *db, const char *sql, const char **params,
                          int *affected);
 
+/* db_execute_non_query without the statement cache; see db_execute_once. */
+CUTILS_MUST_USE
+int db_execute_non_query_once(cutils_db_t *db, const char *sql,
+                              const char **params, int *affected);
+
+/* --- Typed parameters ---
+ *
+ * The string-array API binds every value as TEXT and stops at the first
+ * NULL, so it can bind neither raw bytes nor SQL NULL. The typed calls
+ * take a counted array instead; a NULL pointer with nparams 0 means no
+ * parameters. Values are copied at bind time, so the buffers they point
+ * at only need to live for the call. Passing more params than the SQL
+ * has placeholders is an error; passing fewer leaves the rest NULL.
+ *
+ *   uint8_t hash[32];
+ *   db_param_t p[] = { DB_BLOB(hash, sizeof(hash)), DB_INT64(size) };
+ *   db_execute_non_query_typed(db, "INSERT INTO f(hash, size) VALUES (?, ?)",
+ *                              p, 2, NULL);
+ *
+ * Results are still text: select a BLOB column as lower(hex(col)). */
+typedef enum {
+    DB_P_NULL,
+    DB_P_TEXT,
+    DB_P_BLOB,
+    DB_P_INT64,
+    DB_P_DOUBLE,
+} db_param_type_t;
+
+typedef struct {
+    db_param_type_t type;
+    const void     *ptr;  /* TEXT: string (NULL binds SQL NULL); BLOB: bytes */
+    size_t          len;  /* BLOB: byte count; TEXT: byte count, or 0 for
+                           * NUL-terminated */
+    int64_t         i64;
+    double          dbl;
+} db_param_t;
+
+#define DB_TEXT(s)    ((db_param_t){ .type = DB_P_TEXT, .ptr = (s) })
+#define DB_BLOB(p, n) ((db_param_t){ .type = DB_P_BLOB, .ptr = (p), .len = (n) })
+#define DB_INT64(v)   ((db_param_t){ .type = DB_P_INT64, .i64 = (v) })
+#define DB_DOUBLE(v)  ((db_param_t){ .type = DB_P_DOUBLE, .dbl = (v) })
+#define DB_NULLP      ((db_param_t){ .type = DB_P_NULL })
+
+/* db_execute with typed parameters. Uses the statement cache. */
+CUTILS_MUST_USE
+int db_execute_typed(cutils_db_t *db, const char *sql,
+                     const db_param_t *params, size_t nparams,
+                     db_result_t **result);
+
+/* db_execute_non_query with typed parameters. Uses the statement cache. */
+CUTILS_MUST_USE
+int db_execute_non_query_typed(cutils_db_t *db, const char *sql,
+                               const db_param_t *params, size_t nparams,
+                               int *affected);
+
+/* --- Prepared-statement cache ---
+ *
+ * db_execute, db_execute_non_query and their _typed forms keep prepared
+ * statements per handle, keyed by the exact SQL text, in a bounded LRU
+ * (CUTILS_DB_STMT_CACHE_DEFAULT entries unless changed). A repeat call
+ * skips the parse and plan. Statements are reset after every call, so a
+ * cached statement holds no read transaction and does not block WAL
+ * checkpoints, and they are finalized by db_close. A schema change is
+ * handled: sqlite re-prepares the statement on its next step.
+ *
+ * Key by text means "SELECT 1" and "SELECT  1" are two entries. Build
+ * SQL once and reuse the string; SQL assembled at run time with varying
+ * text (an IN list of varying length, for example) should go through
+ * the _once calls instead, or it will churn the cache.
+ *
+ * db_exec_raw, the iterator and the migration runner do not use the
+ * cache. */
+#define CUTILS_DB_STMT_CACHE_DEFAULT 32
+#define CUTILS_DB_STMT_CACHE_MAX     4096
+
+typedef struct {
+    uint64_t hits;        /* calls served by a cached statement */
+    uint64_t misses;      /* calls that prepared a statement */
+    uint64_t evictions;   /* entries dropped to make room */
+    uint64_t bypasses;    /* calls that could not use the cache (entry
+                           * busy in a nested call, or every entry busy) */
+    uint64_t reprepares;  /* SQLITE_SCHEMA retries after sqlite's own */
+    int      entries;     /* statements currently cached */
+    int      capacity;    /* current size limit */
+} db_stmt_cache_stats_t;
+
+/* Set the cache capacity, 0 to disable caching on this handle. Shrinking
+ * finalizes the least recently used statements. Returns CUTILS_OK, or
+ * CUTILS_ERR_INVALID for a size outside 0..CUTILS_DB_STMT_CACHE_MAX. */
+CUTILS_MUST_USE
+int db_stmt_cache_set_size(cutils_db_t *db, int size);
+
+/* Snapshot the cache counters. */
+void db_stmt_cache_stats(cutils_db_t *db, db_stmt_cache_stats_t *out);
+
 /* Execute raw SQL (multiple statements, no params, no result).
  * Used internally by the migration runner. Returns CUTILS_OK on success. */
 CUTILS_MUST_USE
 int db_exec_raw(cutils_db_t *db, const char *sql);
+
+/* Nonzero if the cell at (row, col) of a result from db_execute or
+ * db_execute_typed is SQL NULL. Such cells read as "" in rows[][], the
+ * same as an empty string, so this is the only way to tell them apart.
+ * Returns 0 for an out-of-range cell or a NULL result. */
+int db_result_is_null(const db_result_t *result, int row, int col);
 
 /* Free a query result set. Safe to call with NULL. */
 void db_result_free(db_result_t *result);

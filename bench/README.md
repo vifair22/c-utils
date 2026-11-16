@@ -38,6 +38,9 @@ Each run produces:
 | `config_get_str` | `config_get_str` worst-case | 300-key registry, look up the last key | Linear scan over the key array |
 | `db_execute_1000_rows` | `db_execute` materialization | 1000 pre-loaded rows, 3 string columns each | sqlite step loop + 3000 per-cell `strdup`s + result-struct build |
 | `db_iter_1000_rows` | `db_iter_*` streaming | Same fixture as `db_execute_1000_rows` | Iterator hands out sqlite's internal column pointers — no per-cell strdup, no row array; head-to-head against the materializing path |
+| `db_per_file_8_cached` | Statement cache hit path | 4 indexed tables in one open transaction; per iteration 8 distinct point SELECTs and upserts, the per-file catalog work of a backup tool | bind + step on cached statements (1.7.0) |
+| `db_per_file_8_once` | Same work via the `_once` calls | Same fixture | Parse + plan on every call; the gap to `db_per_file_8_cached` is what the cache saves |
+| `db_typed_blob_lookup` | `db_execute_typed` with a 32-byte BLOB key | 256 blob rows | Typed bind + cached point lookup |
 | `log_write_db_off` | `log_write` filter short-circuit | `log_init(db=NULL, level=LOG_ERROR)`, then call `log_info` | The atomic-load + level-compare early return — the dominant cost of below-threshold log calls in a daemon |
 | `log_write_db_on` | `log_write` full producer path | `log_init(db=open, level=LOG_INFO)`, then call `log_info` | `vsnprintf` + console format + async enqueue (DB writer drains concurrently, not measured here) |
 | `json_parse_walk` | `json_req_parse` + getters | ~250-byte JSON, then read 6 fields by dot-path | cJSON parse + the request handle's dot-path traversal |
