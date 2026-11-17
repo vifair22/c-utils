@@ -257,6 +257,97 @@ static void test_push_send_long_message_split(void **state)
     free_fixture(&fix);
 }
 
+/* --- Application write lock (1.8.0, CUTILS-2) ---
+ *
+ * The app runs its transactions under its own lock with a raw BEGIN. A
+ * push_send from inside that transaction must join it (the alert commits
+ * or rolls back with the work it describes), and a multi-part alert must
+ * not fail: before 1.8.0 its own BEGIN hit "cannot start a transaction
+ * within a transaction". */
+
+static pthread_mutex_t  app_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local int app_held;
+
+static int app_lock(void *ctx)
+{
+    (void)ctx;
+    if (app_held) return DB_WRITE_LOCK_HELD;
+    pthread_mutex_lock(&app_mu);
+    app_held = 1;
+    return DB_WRITE_LOCK_ACQUIRED;
+}
+
+static void app_unlock(void *ctx)
+{
+    (void)ctx;
+    app_held = 0;
+    pthread_mutex_unlock(&app_mu);
+}
+
+static int split_rows(cutils_db_t *db)
+{
+    db_result_t *result = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*) FROM push WHERE title LIKE 'In Tx%'",
+        NULL, &result), CUTILS_OK);
+    int n = atoi(result->rows[0][0]);
+    db_result_free(result);
+    return n;
+}
+
+static void test_push_split_inside_app_tx(void **state)
+{
+    (void)state;
+    push_fixture_t fix = make_fixture(1);
+    assert_int_equal(db_set_write_lock(fix.db, app_lock, app_unlock, NULL),
+                     CUTILS_OK);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+
+    char long_msg[2200];
+    memset(long_msg, 'B', sizeof(long_msg) - 1);
+    long_msg[sizeof(long_msg) - 1] = '\0';
+    for (int i = 500; i < 2100; i += 500)
+        long_msg[i] = '\n';
+
+    /* Rolled back with the app's transaction. */
+    assert_int_equal(app_lock(NULL), DB_WRITE_LOCK_ACQUIRED);
+    assert_int_equal(db_exec_raw(fix.db, "BEGIN"), CUTILS_OK);
+    assert_int_equal(push_send("In Tx", long_msg), CUTILS_OK);
+    assert_int_equal(push_send("In Tx short", "one part"), CUTILS_OK);
+    assert_true(split_rows(fix.db) >= 3);
+    assert_int_equal(db_exec_raw(fix.db, "ROLLBACK"), CUTILS_OK);
+    app_unlock(NULL);
+    assert_int_equal(split_rows(fix.db), 0);
+
+    /* Committed with it. */
+    assert_int_equal(app_lock(NULL), DB_WRITE_LOCK_ACQUIRED);
+    assert_int_equal(db_exec_raw(fix.db, "BEGIN"), CUTILS_OK);
+    assert_int_equal(push_send("In Tx", long_msg), CUTILS_OK);
+    assert_int_equal(db_exec_raw(fix.db, "COMMIT"), CUTILS_OK);
+    app_unlock(NULL);
+    assert_true(split_rows(fix.db) >= 2);
+
+    push_shutdown();
+    free_fixture(&fix);
+}
+
+/* A refusing write lock fails push_send instead of writing around it. */
+static int refuse_lock(void *ctx) { (void)ctx; return -1; }
+static void noop_unlock(void *ctx) { (void)ctx; }
+
+static void test_push_send_refused_lock(void **state)
+{
+    (void)state;
+    push_fixture_t fix = make_fixture(1);
+    assert_int_equal(push_init(fix.db, fix.cfg), CUTILS_OK);
+    assert_int_equal(db_set_write_lock(fix.db, refuse_lock, noop_unlock, NULL),
+                     CUTILS_OK);
+    assert_int_equal(push_send("Refused", "body"), CUTILS_ERR_DB);
+    assert_int_equal(db_set_write_lock(fix.db, NULL, NULL, NULL), CUTILS_OK);
+    push_shutdown();
+    free_fixture(&fix);
+}
+
 static void test_push_send_opts_partial_creds(void **state)
 {
     (void)state;
@@ -1095,6 +1186,8 @@ int main(void)
         cmocka_unit_test_teardown(test_push_send_enqueue, teardown),
         cmocka_unit_test_teardown(test_push_send_opts_override, teardown),
         cmocka_unit_test_teardown(test_push_send_long_message_split, teardown),
+        cmocka_unit_test_teardown(test_push_split_inside_app_tx, teardown),
+        cmocka_unit_test_teardown(test_push_send_refused_lock, teardown),
         cmocka_unit_test_teardown(test_push_send_opts_partial_creds, teardown),
         cmocka_unit_test_teardown(test_push_send_html_flag, teardown),
         cmocka_unit_test_teardown(test_push_send_priority, teardown),

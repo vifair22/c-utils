@@ -4,6 +4,7 @@
 #include <cmocka.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -19,6 +20,7 @@
 #include "cutils/config.h"
 #include "cutils/db.h"
 #include "cutils/error.h"
+#include "cutils/log.h"
 #include "cutils/push.h"
 
 #define TEST_CFG "/tmp/cutils_test_appguard.yaml"
@@ -1223,6 +1225,76 @@ static void test_signal_exit_leaves_db_to_live_threads(void **state)
     }
 }
 
+/* With an application write lock installed (1.8.0), the forced exit must
+ * not wait on it: here an app thread takes the lock and never lets go, the
+ * log writer is queued behind it, and SIGTERM must still end the process. */
+static pthread_mutex_t wedge_mu = PTHREAD_MUTEX_INITIALIZER;
+static int wedge_lock(void *ctx)
+{
+    (void)ctx;
+    pthread_mutex_lock(&wedge_mu);
+    return DB_WRITE_LOCK_ACQUIRED;
+}
+static void wedge_unlock(void *ctx)
+{
+    (void)ctx;
+    pthread_mutex_unlock(&wedge_mu);
+}
+static void *wedge_holder(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&wedge_mu);
+    for (;;) pause();
+    return NULL;
+}
+
+static void test_signal_exit_skips_drain_with_write_lock(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG, "db:\n  path: " TEST_DB "\n");
+    pid_t pid = fork();
+    if (pid == 0) {
+        appguard_config_t cfg = {
+            .app_name = "testguard",
+            .config_path = TEST_CFG,
+            .on_first_run = CFG_FIRST_RUN_CONTINUE,
+            .log_level = LOG_INFO,
+        };
+        appguard_t *guard = appguard_init(&cfg);
+        if (!guard) _exit(2);
+        if (db_set_write_lock(appguard_db(guard), wedge_lock, wedge_unlock,
+                              NULL) != CUTILS_OK)
+            _exit(4);
+        pthread_t t;
+        if (pthread_create(&t, NULL, wedge_holder, NULL) != 0) _exit(5);
+        struct timespec t50 = { 0, 50 * 1000 * 1000 };
+        nanosleep(&t50, NULL);
+        log_info("queued behind the wedged lock");
+        for (;;) pause();
+    }
+    assert_true(pid > 0);
+    struct timespec gap = { 0, 400 * 1000 * 1000 };
+    nanosleep(&gap, NULL);
+    assert_int_equal(kill(pid, SIGTERM), 0);
+
+    int status = -1;
+    pid_t got = 0;
+    for (int i = 0; i < 1000 && got == 0; i++) {
+        got = waitpid(pid, &status, WNOHANG);
+        if (got == 0) {
+            struct timespec t = { 0, 10 * 1000 * 1000 };
+            nanosleep(&t, NULL);
+        }
+    }
+    if (got == 0) {
+        kill(pid, SIGKILL);
+        (void)waitpid(pid, &status, 0);
+        fail_msg("child did not exit within 10 s of SIGTERM");
+    }
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 0);
+}
+
 /* --- File-permission enforcement (1.2.0) --- */
 
 static mode_t file_mode(const char *path)
@@ -1621,6 +1693,7 @@ int main(void)
         cmocka_unit_test_teardown(test_on_signal_lets_the_app_shut_down, teardown),
         cmocka_unit_test_teardown(test_second_signal_forces_exit, teardown),
         cmocka_unit_test_teardown(test_signal_exit_leaves_db_to_live_threads, teardown),
+        cmocka_unit_test_teardown(test_signal_exit_skips_drain_with_write_lock, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
