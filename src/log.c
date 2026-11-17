@@ -195,11 +195,8 @@ static void fire_streams(const char *timestamp, const char *level_s,
 
 /* --- DB writer thread --- */
 
-static void write_entry_to_db(const log_entry_t *entry)
+static void write_entry_to_db(cutils_db_t *db, const log_entry_t *entry)
 {
-    cutils_db_t *db = atomic_load(&log_db);
-    if (!db) return;
-
     const char *params[] = {
         entry->timestamp, entry->level, entry->func, entry->message, NULL
     };
@@ -222,6 +219,11 @@ static void do_cleanup(void)
     struct tm tm;
     localtime_r(&threshold, &tm);
     strftime(cutoff, sizeof(cutoff), "%Y-%m-%d %H:%M:%S", &tm);
+
+    /* One write scope (1.8.0) for the delete and its note, so neither
+     * lands inside an application transaction. */
+    CUTILS_AUTO_DB_WRITE db_write_guard_t w = { 0 };
+    if (db_write_begin(db, &w) != CUTILS_OK) return;
 
     const char *params[] = { cutoff, NULL };
     int affected = 0;
@@ -267,13 +269,22 @@ static void *log_writer_thread(void *arg)
             stopping       = log_stop;
         }
 
-        /* Write batch to DB */
-        while (batch) {
-            log_entry_t *entry = batch;
-            batch = entry->next;
-            write_entry_to_db(entry);
-            free(entry->message);
-            free(entry);
+        /* Write the batch inside one write scope (1.8.0): the app's
+         * write lock, if installed, then the handle mutex. Without it
+         * an INSERT made while another thread has a raw BEGIN open on
+         * this connection would join that transaction. If the app's
+         * lock refuses, the batch is dropped like any failed insert. */
+        if (batch) {
+            cutils_db_t *db = atomic_load(&log_db);
+            CUTILS_AUTO_DB_WRITE db_write_guard_t w = { 0 };
+            int ok = db && db_write_begin(db, &w) == CUTILS_OK;
+            while (batch) {
+                log_entry_t *entry = batch;
+                batch = entry->next;
+                if (ok) write_entry_to_db(db, entry);
+                free(entry->message);
+                free(entry);
+            }
         }
 
         /* Periodic cleanup (once per day) */

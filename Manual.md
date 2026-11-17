@@ -479,6 +479,55 @@ if (rc != CUTILS_OK) {
 db_commit(db);
 ```
 
+`db_begin` / `db_commit` do **not** hold the connection mutex between statements, so on a connection shared by several threads, another thread's statement can run in the middle and land inside this transaction. Prefer the scoped `CUTILS_AUTO_DB_TX` (Section 12), which holds the mutex from `BEGIN` to the end; or, if the application serializes its transactions with a lock of its own, hand that lock to the handle (next section).
+
+### Application write lock (1.8.0+)
+
+SQLite tracks one transaction per *connection*, not per thread. An application that runs `BEGIN ... COMMIT` through `db_exec_raw` or `db_begin` and serializes those transactions with its own lock leaves the handle mutex free between statements. c-utils' own writers (the log writer thread, `push_send`, the push worker) cannot see that lock. Before 1.8.0, a log line written in that window became part of the application's transaction and committed or rolled back with it, and a multi-part push alert failed with "cannot start a transaction within a transaction".
+
+`db_set_write_lock` hands the application's lock to the handle:
+
+```c
+static _Thread_local int held;
+
+static int app_lock(void *ctx)
+{
+    if (held) return DB_WRITE_LOCK_HELD;     /* this thread already has it */
+    pthread_mutex_lock(ctx);
+    held = 1;
+    return DB_WRITE_LOCK_ACQUIRED;
+}
+
+static void app_unlock(void *ctx)
+{
+    held = 0;
+    pthread_mutex_unlock(ctx);
+}
+
+/* right after db_open / appguard_init, before any transaction */
+db_set_write_lock(db, app_lock, app_unlock, &app_write_mutex);
+```
+
+From then on every c-utils **write scope** takes the application's lock first, then the handle mutex, and holds both to the end of the scope:
+
+| Write scope | Notes |
+|---|---|
+| Log writer thread | One scope per drained batch, and one for retention cleanup. If the lock refuses, the batch is dropped like any failed insert. |
+| `push_send` / `push_send_opts` | The enqueue. A multi-part alert goes in under a `SAVEPOINT`, so it is atomic and also works inside a transaction the caller already has open. |
+| Push worker | Each read of the queue and each update or delete. The network send runs outside any scope. |
+| `cutils_db_tx_begin`, `cutils_db_tx_begin_immediate` | From `BEGIN` to commit or rollback. |
+| `db_write_begin` / `db_write_end` | For application code; `CUTILS_AUTO_DB_WRITE` releases on scope exit. |
+
+Contract for the lock function:
+
+- **`DB_WRITE_LOCK_ACQUIRED`** when it blocked until the calling thread holds the lock. The unlock function is called once at the end of the scope.
+- **`DB_WRITE_LOCK_HELD`** when the calling thread already holds it. The function must return this without blocking, and unlock is not called. The write then joins the caller's own open transaction, if any: a `push_send` made inside a transaction commits or rolls back with the work it reports.
+- **Negative** to refuse. The scope fails with `CUTILS_ERR_DB`.
+
+Lock order is always the application's lock, then the handle mutex. Do not write through c-utils from inside a `db_iter` scope while another thread may hold the application lock: the iterator holds the handle mutex, so the two threads would wait on each other. Without a lock installed, the write scopes take only the handle mutex, exactly as before 1.8.0.
+
+**Effect on signal-driven exit.** With a lock installed, AppGuard's signal watcher does not drain the log writer and push worker before `exit(0)`. Draining would mean taking the application's lock, and an application thread that has wedged while holding it would hang the exit. Queued log lines have already reached the console, and queued push rows are durable and go out on the next start.
+
 ### Savepoints
 
 Savepoints provide nested rollback within a transaction.
@@ -1420,6 +1469,8 @@ By default the watcher handles the first `SIGINT` or `SIGTERM` itself: it drains
 
 The watcher does **not** close the database (1.7.2). Application threads are still running when it exits and may be inside a `db_*` call; closing the handle under them destroyed its mutex and freed it mid-query, a use-after-free. Leaving it open loses nothing: committed transactions are durable, an open one is rolled back, and SQLite recovers the WAL on the next open, exactly as after a crash.
 
+With an application write lock installed (1.8.0) it also skips draining the log writer and push worker, since that would wait on the application's lock; see Application write lock in Section 3.
+
 **Application-driven shutdown (1.3.0).** Set `on_signal` in `appguard_config_t`. The first `SIGINT` or `SIGTERM` then calls `on_signal(sig, on_signal_ctx)` on the watcher thread instead, and AppGuard keeps running. The application winds down in its own order and calls `appguard_shutdown()`, which stops the watcher and the subsystems as usual. A **second** `SIGINT` or `SIGTERM` takes the default path and exits, so an operator can still stop a process whose shutdown has wedged.
 
 ```c
@@ -1514,13 +1565,13 @@ A handful of cross-thread flags use `_Atomic` rather than a mutex because the re
 - **Direct callers must order init+shutdown carefully.** `db_open` first, then `log_init(db, ...)` and `push_init(db, cfg)`. At shutdown: stop the workers (`push_shutdown`, `log_shutdown`) before `db_close`. The DB is the bottom of the stack.
 - **Iterator scopes must end before `db_close`.** A `cutils_db_iter_t` holds the connection mutex from `db_iter_begin` to `db_iter_end`. See the Streaming queries section under Database.
 - **Stream-callback userdata must outlive in-flight `log_*` calls.** `log_stream_unregister` can return while a concurrent `fire_streams` snapshot still holds a pointer to the just-unregistered slot. Apps that unregister at runtime must keep `userdata` alive until any in-flight `log_*` calls on other threads have returned.
-- **Default signal-driven shutdown is one-way.** When the watcher takes the SIGINT/SIGTERM path (no `on_signal`, or a second signal), it drains the worker queues, runs `atexit` handlers, and `exit(0)`s, so the consuming app's `main()` does not return. Other threads are still running while `atexit` handlers execute, so a handler must not free anything those threads use. The DB handle is left open for the same reason (1.7.2). Resources that need explicit cleanup (e.g. unlinking a pidfile) should be registered via `atexit`.
+- **Default signal-driven shutdown is one-way.** When the watcher takes the SIGINT/SIGTERM path (no `on_signal`, or a second signal), it drains the worker queues, runs `atexit` handlers, and `exit(0)`s, so the consuming app's `main()` does not return. With an application write lock installed (1.8.0) it skips the drain. Other threads are still running while `atexit` handlers execute, so a handler must not free anything those threads use. The DB handle is left open for the same reason (1.7.2). Resources that need explicit cleanup (e.g. unlinking a pidfile) should be registered via `atexit`.
 
 ### Thread-safety quick reference
 
 | Operation | Thread-safe? | Notes |
 |---|---|---|
-| `db_*` functions | Yes | Recursive mutex on the connection. |
+| `db_*` functions | Yes | Recursive mutex on the connection. Transactions are per connection: see Application write lock (Section 3) for raw `BEGIN` from several threads. |
 | `db_iter_*` | Yes, but **single-iterator-per-thread** | Iterator holds the connection mutex for its full lifetime. Don't try to open two iterators in parallel on the same connection. |
 | `log_*` macros | Yes | Atomic gates + mutex-protected queue. |
 | `push_send`, `push_send_opts` | Yes | DB-backed enqueue + cond-var wake-up. |

@@ -5,6 +5,43 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.8.0] - 2026-11-17
+
+An application write lock on the db handle, for c-backup's write audit
+(CUTILS-2). Additive; without a lock installed nothing changes.
+
+### Added
+
+- **`db_set_write_lock(db, lock, unlock, ctx)`** hands the application's
+  own transaction lock to the handle. SQLite keeps one transaction per
+  connection, so an app running raw `BEGIN ... COMMIT` under its own
+  lock left a window in which c-utils' writers ran inside its
+  transaction.
+  - Every c-utils write scope now takes the app lock, then the handle
+    mutex: the log writer (per batch, and retention cleanup),
+    `push_send`, the push worker's reads and updates, and the scoped
+    `cutils_db_tx_begin*`.
+  - `lock` returns `DB_WRITE_LOCK_ACQUIRED`, `DB_WRITE_LOCK_HELD` (this
+    thread already holds it; the write joins its transaction and unlock
+    is not called), or a negative value to refuse (`CUTILS_ERR_DB`).
+- **`db_write_begin` / `db_write_end`** (`CUTILS_AUTO_DB_WRITE`) and
+  **`db_has_write_lock`**, for application code.
+
+### Changed
+
+- `cutils_db_tx_t` gains a `wg` field. Callers that zero-initialise it
+  (`= { 0 }`) need only a rebuild.
+- With a write lock installed, AppGuard's signal-driven exit no longer
+  drains the log and push workers, so an app thread wedged while
+  holding the lock cannot hang the exit. Queued push rows are durable
+  and go out on the next start.
+
+### Fixed
+
+- **A multi-part `push_send` inside an open transaction failed** with
+  "cannot start a transaction within a transaction". The parts now go
+  in under a savepoint.
+
 ## [1.7.2] - 2026-11-17
 
 One AppGuard fix, found by c-backup's TSan sweep.
