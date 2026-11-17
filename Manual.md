@@ -164,7 +164,7 @@ int main(int argc, char **argv)
 
 **What happens on first run:** AppGuard generates `config.yaml` with all file-backed keys (including `db.path`, which c-utils registers automatically), prints a message, and returns `NULL`. The user edits the config and restarts.
 
-**What happens on SIGINT/SIGTERM:** by default AppGuard's signal watcher drains the log writer and push worker, closes the DB and calls `exit(0)`; the main loop does not get control back. An application that needs to run its own shutdown sets `on_signal` (1.3.0) and is told instead. See [Signal handling](#signal-handling) in Section 9.
+**What happens on SIGINT/SIGTERM:** by default AppGuard's signal watcher drains the log writer and push worker and calls `exit(0)`, leaving the DB open (1.7.2); the main loop does not get control back. An application that needs to run its own shutdown sets `on_signal` (1.3.0) and is told instead. See [Signal handling](#signal-handling) in Section 9.
 
 ---
 
@@ -1416,7 +1416,9 @@ The new process starts from scratch — `main()` runs again, `appguard_init()` r
 
 AppGuard blocks `SIGINT` (Ctrl-C), `SIGTERM` (kill, systemd stop) and `SIGUSR1` in every thread at the start of `appguard_init()`, and a dedicated watcher thread receives them with `sigwait`. Because the signals are blocked process-wide, **a handler the application installs with `signal()` or `sigaction()` never runs**: the watcher takes the signal first. Earlier versions of this manual recommended exactly that override, and it silently did nothing.
 
-By default the watcher handles the first `SIGINT` or `SIGTERM` itself: it drains the log writer and the push worker, closes the database, and calls `exit(0)`. The application's main loop does not get control back. That suits a tool. It does not suit a daemon with worker threads in flight, because the database is closed underneath them and the application's own teardown (stop accepting requests, cancel jobs, remove a socket or pidfile) never runs.
+By default the watcher handles the first `SIGINT` or `SIGTERM` itself: it drains the log writer and the push worker and calls `exit(0)`. The application's main loop does not get control back. That suits a tool. It does not suit a daemon with worker threads in flight, because they are stopped mid-operation and the application's own teardown (stop accepting requests, cancel jobs, remove a socket or pidfile) never runs.
+
+The watcher does **not** close the database (1.7.2). Application threads are still running when it exits and may be inside a `db_*` call; closing the handle under them destroyed its mutex and freed it mid-query, a use-after-free. Leaving it open loses nothing: committed transactions are durable, an open one is rolled back, and SQLite recovers the WAL on the next open, exactly as after a crash.
 
 **Application-driven shutdown (1.3.0).** Set `on_signal` in `appguard_config_t`. The first `SIGINT` or `SIGTERM` then calls `on_signal(sig, on_signal_ctx)` on the watcher thread instead, and AppGuard keeps running. The application winds down in its own order and calls `appguard_shutdown()`, which stops the watcher and the subsystems as usual. A **second** `SIGINT` or `SIGTERM` takes the default path and exits, so an operator can still stop a process whose shutdown has wedged.
 
@@ -1480,7 +1482,7 @@ c-utils manages three internal background threads. The consuming application doe
 |---|---|---|---|---|
 | **Log writer** | Drains the log entry queue to SQLite. Periodically (once per day) deletes log rows older than `log_retention_days`. | `log_init()` (when called with a non-NULL `db`) | `log_shutdown()` | `log_mutex` + `log_cond` for queue; goes through `db_execute_non_query()` (so the DB mutex too) for inserts. |
 | **Push worker** | Polls the `push` table for ready-to-send notifications, delivers them via libcurl, applies backoff on transient failures, marks `failed=1` on permanent failures. | `push_init()` (when creds are configured AND `appguard_config_t.enable_pushover` is set) | `push_shutdown()` | `push_mutex` + `push_cond` to throttle; reads/writes the `push` table via `db_execute*` (DB mutex). |
-| **Signal watcher** | Receives SIGINT / SIGTERM / SIGUSR1 via `sigwait`, the dedicated synchronous handler that replaces the pre-1.0.1 async signal handler. On SIGINT/SIGTERM it tears down subsystems and `exit(0)`s, unless `on_signal` is set, in which case the first one calls it and only a second forces the exit. On SIGUSR1 (sent by `appguard_shutdown`) it exits the watcher cleanly. | `appguard_init()` (always, as the last init step) | `appguard_shutdown()` sends SIGUSR1 then joins. | None during steady state; on signal-driven shutdown it takes the same locks as `appguard_shutdown`. |
+| **Signal watcher** | Receives SIGINT / SIGTERM / SIGUSR1 via `sigwait`, the dedicated synchronous handler that replaces the pre-1.0.1 async signal handler. On SIGINT/SIGTERM it stops the log and push workers and `exit(0)`s, leaving the DB open, unless `on_signal` is set, in which case the first one calls it and only a second forces the exit. On SIGUSR1 (sent by `appguard_shutdown`) it exits the watcher cleanly. | `appguard_init()` (always, as the last init step) | `appguard_shutdown()` sends SIGUSR1 then joins. | None during steady state; on signal-driven shutdown it takes the same locks as `appguard_shutdown`. |
 
 All three threads are started by `appguard_init()` in the order above and stopped by `appguard_shutdown()` in reverse. Each *_init() / *_shutdown() pair is also exposed individually, so applications not using AppGuard can manage them directly.
 
@@ -1512,7 +1514,7 @@ A handful of cross-thread flags use `_Atomic` rather than a mutex because the re
 - **Direct callers must order init+shutdown carefully.** `db_open` first, then `log_init(db, ...)` and `push_init(db, cfg)`. At shutdown: stop the workers (`push_shutdown`, `log_shutdown`) before `db_close`. The DB is the bottom of the stack.
 - **Iterator scopes must end before `db_close`.** A `cutils_db_iter_t` holds the connection mutex from `db_iter_begin` to `db_iter_end`. See the Streaming queries section under Database.
 - **Stream-callback userdata must outlive in-flight `log_*` calls.** `log_stream_unregister` can return while a concurrent `fire_streams` snapshot still holds a pointer to the just-unregistered slot. Apps that unregister at runtime must keep `userdata` alive until any in-flight `log_*` calls on other threads have returned.
-- **Default signal-driven shutdown is one-way.** When the watcher takes the SIGINT/SIGTERM path (no `on_signal`, or a second signal), it drains the worker queues, runs `atexit` handlers, and `exit(0)`s, so the consuming app's `main()` does not return. Resources that need explicit cleanup (e.g. unlinking a pidfile) should be registered via `atexit`.
+- **Default signal-driven shutdown is one-way.** When the watcher takes the SIGINT/SIGTERM path (no `on_signal`, or a second signal), it drains the worker queues, runs `atexit` handlers, and `exit(0)`s, so the consuming app's `main()` does not return. Other threads are still running while `atexit` handlers execute, so a handler must not free anything those threads use. The DB handle is left open for the same reason (1.7.2). Resources that need explicit cleanup (e.g. unlinking a pidfile) should be registered via `atexit`.
 
 ### Thread-safety quick reference
 

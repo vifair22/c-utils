@@ -100,11 +100,13 @@ typedef struct {
     /* --- Application-driven shutdown (1.3.0) ---
      *
      * By default the first SIGINT or SIGTERM is handled entirely inside
-     * AppGuard: the signal watcher drains push, log and DB, then calls
+     * AppGuard: the signal watcher drains push and log, then calls
      * exit(0). The application never hears about it, which is fine for a
-     * tool and wrong for a daemon with worker threads in flight: the DB is
-     * closed underneath them, and the app's own teardown (stop accepting
-     * requests, cancel jobs, remove a socket) never runs.
+     * tool and wrong for a daemon with worker threads in flight: they are
+     * stopped mid-operation, and the app's own teardown (stop accepting
+     * requests, cancel jobs, remove a socket) never runs. Since 1.7.2 the
+     * watcher leaves the DB open rather than closing it under those
+     * threads; committed transactions are already durable.
      *
      * When on_signal is set, the first SIGINT or SIGTERM instead calls
      * on_signal(sig, on_signal_ctx) from the watcher thread and AppGuard

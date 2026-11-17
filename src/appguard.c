@@ -71,19 +71,23 @@ static void appguard_signal_set(sigset_t *out)
     sigaddset(out, SIGUSR1);
 }
 
-/* Tear down the three background subsystems (push, log, db) in
- * reverse-of-init order, gated on the per-subsystem started flags.
- * Shared between the signal watcher and appguard_shutdown so the two
- * paths can't drift on which subsystems to touch or in what order.
- *
- * Does NOT touch guard->config or free(guard) — those operations
- * differ between callers (the signal watcher exits the process and
- * lets the kernel reclaim; appguard_shutdown frees explicitly). */
-static void shutdown_subsystems(appguard_t *guard)
+/* Stop the two worker subsystems (push, log) in reverse-of-init order,
+ * gated on the per-subsystem started flags. Both drain their queues and
+ * leave late callers on other threads a safe no-op, so the signal
+ * watcher can run this while application threads are still live. */
+static void stop_workers(appguard_t *guard)
 {
     if (guard->push_started) push_shutdown();
     if (guard->log_started)  log_shutdown();
-    if (guard->db)           db_close(guard->db);
+}
+
+/* Full teardown for appguard_shutdown: the workers, then the DB at the
+ * bottom of the stack. Does NOT touch guard->config or free(guard);
+ * appguard_shutdown does that itself. */
+static void shutdown_subsystems(appguard_t *guard)
+{
+    stop_workers(guard);
+    if (guard->db) db_close(guard->db);
 }
 
 static void *signal_watcher(void *arg)
@@ -120,12 +124,20 @@ static void *signal_watcher(void *arg)
      * call appguard_shutdown — it would try to join us and self-
      * deadlock. We also skip free() of the guard/config; the kernel
      * reclaims memory on _exit, and an in-flight main-thread reader
-     * might still be touching them. We do still drain the subsystem
-     * queues so users' last log lines and notifications get through. */
+     * might still be touching them. We do still drain the worker
+     * queues so users' last log lines and notifications get through.
+     *
+     * The DB is deliberately left open (1.7.2). Application threads are
+     * still running here and may be inside a db_* call; db_close would
+     * destroy the handle mutex and free the handle under them, a
+     * use-after-free that TSan and ASAN both report. Nothing is lost by
+     * skipping it: every committed transaction is already durable, and
+     * SQLite recovers the WAL on the next open, so process exit is the
+     * same as a crash it is built to survive. */
     const char *name = (sig == SIGINT) ? "SIGINT" : "SIGTERM";
     fprintf(stderr, "\nReceived %s, shutting down...\n", name);
 
-    shutdown_subsystems(guard);
+    stop_workers(guard);
 
     /* exit(0) rather than _exit(0): we want any atexit handlers the
      * consuming app registered to fire (resource cleanup, telemetry
