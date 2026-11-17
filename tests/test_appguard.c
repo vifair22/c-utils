@@ -40,6 +40,7 @@ int chmod(const char *path, mode_t mode)
     return fchmodat(AT_FDCWD, path, mode, 0);
 }
 #define TEST_DB  "/tmp/cutils_test_appguard.db"
+#define TEST_ERR "/tmp/cutils_test_appguard.stderr"
 
 static int teardown(void **state)
 {
@@ -48,6 +49,7 @@ static int teardown(void **state)
     unlink(TEST_DB);
     unlink(TEST_DB "-wal");
     unlink(TEST_DB "-shm");
+    unlink(TEST_ERR);
     return 0;
 }
 
@@ -1143,6 +1145,84 @@ static void test_second_signal_forces_exit(void **state)
     assert_int_equal(WEXITSTATUS(status), 0);
 }
 
+/* The signal-driven exit must not close the DB under a thread that is still
+ * using it. The child's main thread runs queries flat out when SIGTERM lands;
+ * before 1.7.2 the watcher's db_close destroyed the handle mutex and freed the
+ * handle mid-query. ASAN reports that as a use-after-free, but the watcher's
+ * exit(0) can win the race to set the exit status, so the child's stderr is
+ * captured and checked for a sanitizer report as well. A plain build can crash
+ * or hang instead. Repeated so the signal reliably lands inside a query. */
+static void test_signal_exit_leaves_db_to_live_threads(void **state)
+{
+    (void)state;
+    write_file(TEST_CFG, "db:\n  path: " TEST_DB "\n");
+    for (int round = 0; round < 5; round++) {
+        int errfd = open(TEST_ERR, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        assert_true(errfd >= 0);
+        pid_t pid = fork();
+        if (pid == 0) {
+            if (dup2(errfd, STDERR_FILENO) < 0) _exit(5);
+            appguard_config_t cfg = {
+                .app_name = "testguard",
+                .config_path = TEST_CFG,
+                .on_first_run = CFG_FIRST_RUN_CONTINUE,
+                .log_level = LOG_ERROR,
+            };
+            appguard_t *guard = appguard_init(&cfg);
+            if (!guard) _exit(2);
+            cutils_db_t *db = appguard_db(guard);
+            if (db_execute_non_query(db,
+                    "CREATE TABLE IF NOT EXISTS spin (v INTEGER)",
+                    NULL, NULL) != CUTILS_OK)
+                _exit(4);
+            for (;;) {
+                const char *p[] = { "1", NULL };
+                if (db_execute_non_query(db,
+                        "INSERT INTO spin (v) VALUES (?)", p, NULL)
+                        != CUTILS_OK)
+                    continue;
+                db_result_t *r = NULL;
+                if (db_execute(db, "SELECT count(*) FROM spin", NULL, &r)
+                        == CUTILS_OK)
+                    db_result_free(r);
+            }
+        }
+        close(errfd);
+        assert_true(pid > 0);
+        struct timespec gap = { 0, 300 * 1000 * 1000 };
+        nanosleep(&gap, NULL);
+        assert_int_equal(kill(pid, SIGTERM), 0);
+
+        /* Bounded wait: a child wedged on a freed mutex must fail the test,
+         * not hang the suite. */
+        int status = -1;
+        pid_t got = 0;
+        for (int i = 0; i < 1000 && got == 0; i++) {
+            got = waitpid(pid, &status, WNOHANG);
+            if (got == 0) {
+                struct timespec t = { 0, 10 * 1000 * 1000 };
+                nanosleep(&t, NULL);
+            }
+        }
+        if (got == 0) {
+            kill(pid, SIGKILL);
+            (void)waitpid(pid, &status, 0);
+            fail_msg("child did not exit within 10 s of SIGTERM");
+        }
+        assert_int_equal(got, pid);
+        assert_true(WIFEXITED(status));
+        assert_int_equal(WEXITSTATUS(status), 0);
+
+        char buf[8192];
+        FILE *f = fopen(TEST_ERR, "r");
+        assert_non_null(f);
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = '\0';
+        assert_null(strstr(buf, "Sanitizer"));
+    }
+}
+
 /* --- File-permission enforcement (1.2.0) --- */
 
 static mode_t file_mode(const char *path)
@@ -1540,6 +1620,7 @@ int main(void)
         cmocka_unit_test_teardown(test_config_get_path_accessor, teardown),
         cmocka_unit_test_teardown(test_on_signal_lets_the_app_shut_down, teardown),
         cmocka_unit_test_teardown(test_second_signal_forces_exit, teardown),
+        cmocka_unit_test_teardown(test_signal_exit_leaves_db_to_live_threads, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
