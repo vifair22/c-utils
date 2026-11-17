@@ -5,6 +5,24 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.7.2] - 2026-11-17
+
+One AppGuard fix, found by c-backup's TSan sweep.
+
+### Fixed
+
+- **AppGuard's signal-driven exit closed the DB under live threads.**
+  On SIGINT/SIGTERM (the default path, or the second signal when
+  `on_signal` is set) the watcher called `db_close` while application
+  threads could still be inside a `db_*` call, destroying the handle
+  mutex and freeing the handle mid-query.
+  - The watcher now stops only the log and push workers and exits
+    with the DB open. Committed transactions are durable and SQLite
+    recovers the WAL on next open, as after a crash.
+  - `appguard_shutdown` still closes the DB.
+  - The exit is still `exit(0)`, so `atexit` handlers run; other
+    threads are alive while they do, now noted in the Manual.
+
 ## [1.7.1] - 2026-11-16
 
 One fix to the 1.7.0 typed binds, found by c-backup while adopting them.
