@@ -73,6 +73,11 @@ struct cutils_db {
     int             cache_cap;
     int             cache_count;
     db_stmt_cache_stats_t stats;
+
+    /* Application write lock (1.8.0). Read and written under mutex. */
+    db_write_lock_fn   wl_lock;
+    db_write_unlock_fn wl_unlock;
+    void              *wl_ctx;
 };
 
 /* A statement checked out for one call: either a cache entry or a
@@ -817,9 +822,86 @@ int db_savepoint_rollback(cutils_db_t *db, const char *name)
     return db_exec_raw(db, sql);
 }
 
+/* --- Application write lock (1.8.0) ---
+ *
+ * The hook is read under the handle mutex into the guard, then the
+ * mutex is dropped before calling it: the app's lock must be taken
+ * before the handle mutex, never while holding it, or a thread inside
+ * the app's transaction (holding the app lock, waiting on the mutex for
+ * its next statement) and a writer here would deadlock. The guard keeps
+ * its own copy of unlock/ctx so a scope releases what it took even if
+ * the hook were changed meanwhile. */
+
+int db_set_write_lock(cutils_db_t *db, db_write_lock_fn lock,
+                      db_write_unlock_fn unlock, void *ctx)
+{
+    if (!db || (!lock) != (!unlock))
+        return set_error(CUTILS_ERR_INVALID,
+                         "db_set_write_lock: lock and unlock must both be set or both NULL");
+    pthread_mutex_lock(&db->mutex);
+    db->wl_lock   = lock;
+    db->wl_unlock = unlock;
+    db->wl_ctx    = lock ? ctx : NULL;
+    pthread_mutex_unlock(&db->mutex);
+    return CUTILS_OK;
+}
+
+int db_has_write_lock(cutils_db_t *db)
+{
+    if (!db) return 0;
+    pthread_mutex_lock(&db->mutex);
+    int has = db->wl_lock != NULL;
+    pthread_mutex_unlock(&db->mutex);
+    return has;
+}
+
+int db_write_begin(cutils_db_t *db, db_write_guard_t *g)
+{
+    if (!g) return set_error(CUTILS_ERR_INVALID, "db_write_begin: null guard");
+    g->db     = db;
+    g->unlock = NULL;
+    g->ctx    = NULL;
+    g->active = 0;
+    if (!db) return set_error(CUTILS_ERR_INVALID, "db_write_begin: null handle");
+
+    pthread_mutex_lock(&db->mutex);
+    db_write_lock_fn   lock   = db->wl_lock;
+    db_write_unlock_fn unlock = db->wl_unlock;
+    void              *ctx    = db->wl_ctx;
+    pthread_mutex_unlock(&db->mutex);
+
+    if (lock) {
+        int lrc = lock(ctx);
+        if (lrc < 0)
+            return set_error(CUTILS_ERR_DB, "db_write_begin: write lock refused (%d)", lrc);
+        if (lrc == DB_WRITE_LOCK_ACQUIRED) {
+            g->unlock = unlock;
+            g->ctx    = ctx;
+        }
+    }
+
+    pthread_mutex_lock(&db->mutex);
+    g->active = 1;
+    return CUTILS_OK;
+}
+
+void db_write_end(db_write_guard_t *g)
+{
+    if (!g || !g->active) return;
+    g->active = 0;
+    pthread_mutex_unlock(&g->db->mutex);
+    if (g->unlock) {
+        db_write_unlock_fn unlock = g->unlock;
+        g->unlock = NULL;
+        unlock(g->ctx);
+    }
+}
+
 /* --- Scoped transaction guard ---
  *
- * The tx scope holds db->mutex from BEGIN through COMMIT or ROLLBACK so
+ * The tx scope is a write scope (db_write_begin): the app's write lock
+ * when one is installed, then db->mutex, held from BEGIN through COMMIT
+ * or ROLLBACK so
  * that no other thread can interleave its queries into the active
  * transaction (SQLite tracks transactions per-connection — without the
  * extended lock hold, a parallel writer's INSERT would land inside this
@@ -838,11 +920,12 @@ static int tx_begin_with_sql(cutils_db_t *db, cutils_db_tx_t *tx,
     /* Acquire the +1 hold that spans the whole tx. db_exec_raw below
      * takes its own +1 internally and releases on return, leaving our
      * hold in place. */
-    pthread_mutex_lock(&db->mutex);
+    int rc = db_write_begin(db, &tx->wg);
+    if (rc != CUTILS_OK) return rc;
 
-    int rc = db_exec_raw(db, sql);
+    rc = db_exec_raw(db, sql);
     if (rc != CUTILS_OK) {
-        pthread_mutex_unlock(&db->mutex);
+        db_write_end(&tx->wg);
         return rc;
     }
 
@@ -871,7 +954,7 @@ int db_tx_commit(cutils_db_tx_t *tx)
         /* Release the hold acquired in tx_begin_with_sql. On commit
          * failure we leave it held so cutils_db_tx_end_p can still
          * issue a rollback under the same exclusive scope. */
-        pthread_mutex_unlock(&tx->db->mutex);
+        db_write_end(&tx->wg);
     }
     return rc;
 }
@@ -886,7 +969,7 @@ void cutils_db_tx_end_p(cutils_db_tx_t *tx)
         /* Always release the hold we took in tx_begin_with_sql, even if
          * rollback failed — leaving the mutex locked would wedge every
          * other thread on this connection. */
-        pthread_mutex_unlock(&tx->db->mutex);
+        db_write_end(&tx->wg);
     }
     tx->active    = 0;
     tx->finalized = 1;

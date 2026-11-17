@@ -240,6 +240,81 @@ CUTILS_MUST_USE int db_begin   (cutils_db_t *db);
 CUTILS_MUST_USE int db_commit  (cutils_db_t *db);
 CUTILS_MUST_USE int db_rollback(cutils_db_t *db);
 
+/* --- Application write lock (1.8.0) ---
+ *
+ * SQLite keeps one transaction per connection, not per thread. An app
+ * that runs BEGIN ... COMMIT through db_exec_raw or db_begin, guarded
+ * by its own lock, leaves the handle mutex free between statements, so
+ * a statement another thread runs in that window lands inside the open
+ * transaction and commits or rolls back with it. c-utils' own writers
+ * (the log writer thread, push_send and the push worker) are such
+ * threads, and they cannot see the app's lock.
+ *
+ * db_set_write_lock hands that lock to the handle. From then on every
+ * c-utils write scope takes it first:
+ *   - the log writer and log retention cleanup,
+ *   - push_send's enqueue and the push worker's reads and updates,
+ *   - cutils_db_tx_begin / cutils_db_tx_begin_immediate,
+ *   - db_write_begin, for an app's own code.
+ *
+ * Contract for lock(ctx):
+ *   - Block until the calling thread holds the lock, then return
+ *     DB_WRITE_LOCK_ACQUIRED. unlock(ctx) is called once at scope end.
+ *   - If the calling thread already holds it, return DB_WRITE_LOCK_HELD
+ *     without blocking. unlock is NOT called. The write then joins the
+ *     caller's open transaction, if it has one, which is what a
+ *     push_send made inside it should do.
+ *   - Return a negative value to refuse. The write fails with
+ *     CUTILS_ERR_DB (the log writer drops the line).
+ *
+ * Lock order is the app's lock, then the handle mutex. Do not write
+ * through c-utils from inside a db_iter scope while another thread may
+ * hold the app lock: the iterator holds the handle mutex, so the two
+ * threads would wait on each other.
+ *
+ * Install it before any thread starts a transaction with it, typically
+ * right after db_open or appguard_init. Without a lock installed the
+ * scopes take only the handle mutex, exactly as before 1.8.0. */
+#define DB_WRITE_LOCK_ACQUIRED 0
+#define DB_WRITE_LOCK_HELD     1
+
+typedef int  (*db_write_lock_fn)(void *ctx);
+typedef void (*db_write_unlock_fn)(void *ctx);
+
+/* Install (or with both NULL, remove) the handle's write lock. Returns
+ * CUTILS_OK, or CUTILS_ERR_INVALID if exactly one of lock and unlock is
+ * NULL. */
+CUTILS_MUST_USE
+int db_set_write_lock(cutils_db_t *db, db_write_lock_fn lock,
+                      db_write_unlock_fn unlock, void *ctx);
+
+/* Nonzero if a write lock is installed on the handle. */
+int db_has_write_lock(cutils_db_t *db);
+
+/* A write scope: the app's write lock (if installed), then the handle
+ * mutex, held until db_write_end. Statements run inside it cannot
+ * interleave with another thread's transaction. Scopes nest on one
+ * thread when the lock reports DB_WRITE_LOCK_HELD.
+ *
+ *   CUTILS_AUTO_DB_WRITE db_write_guard_t w = { 0 };
+ *   if (db_write_begin(db, &w) != CUTILS_OK) return -1;
+ *   ...statements...
+ *   (released on scope exit) */
+typedef struct {
+    cutils_db_t        *db;
+    db_write_unlock_fn  unlock;  /* NULL when there is nothing to release */
+    void               *ctx;
+    int                 active;  /* 1 while the scope is held */
+} db_write_guard_t;
+
+CUTILS_MUST_USE
+int db_write_begin(cutils_db_t *db, db_write_guard_t *g);
+
+/* Release a write scope. Idempotent; a no-op on an inactive guard. */
+void db_write_end(db_write_guard_t *g);
+
+#define CUTILS_AUTO_DB_WRITE __attribute__((cleanup(db_write_end)))
+
 /* --- Scoped transaction guard ---
  *
  * Pairs BEGIN with an automatic ROLLBACK on scope exit unless
@@ -263,11 +338,15 @@ CUTILS_MUST_USE int db_rollback(cutils_db_t *db);
  * (SELECT, SELECT, UPDATE, UPDATE), use cutils_db_tx_begin_immediate —
  * it acquires RESERVED at BEGIN time, so the second caller blocks at
  * BEGIN (respecting busy_timeout) and its SELECT observes the first
- * caller's committed state. */
+ * caller's committed state.
+ *
+ * Since 1.8.0 the scope is a db_write_begin scope: it takes the app's
+ * write lock first when one is installed (see db_set_write_lock). */
 typedef struct {
-    cutils_db_t *db;
-    int          active;     /* 1 if BEGIN succeeded */
-    int          finalized;  /* 1 once commit or rollback has run */
+    cutils_db_t     *db;
+    int              active;     /* 1 if BEGIN succeeded */
+    int              finalized;  /* 1 once commit or rollback has run */
+    db_write_guard_t wg;         /* write scope held from BEGIN to end */
 } cutils_db_tx_t;
 
 /* Begin a scoped deferred transaction. Initializes *tx and issues BEGIN.
