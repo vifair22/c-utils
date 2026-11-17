@@ -137,7 +137,14 @@ static void *signal_watcher(void *arg)
     const char *name = (sig == SIGINT) ? "SIGINT" : "SIGTERM";
     fprintf(stderr, "\nReceived %s, shutting down...\n", name);
 
-    stop_workers(guard);
+    /* With an application write lock installed (1.8.0), draining means
+     * the log writer and push worker taking that lock, and an app thread
+     * wedged while holding it (the case a second signal exists for)
+     * would hang the exit for good. Skip the drain then: queued log
+     * lines have already reached the console, and queued push rows are
+     * durable and go out on the next start. */
+    if (!guard->db || !db_has_write_lock(guard->db))
+        stop_workers(guard);
 
     /* exit(0) rather than _exit(0): we want any atexit handlers the
      * consuming app registered to fire (resource cleanup, telemetry

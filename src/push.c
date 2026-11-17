@@ -137,6 +137,12 @@ static size_t discard_cb(void *ptr, size_t size, size_t nmemb, void *userdata)
  * pre-fix code added is now unnecessary — every chunk uses the same
  * caller-provided timestamp. */
 
+static int split_insert_parts(cutils_db_t *db, const char *title,
+                              const char *message, size_t msglen,
+                              const char *token, const char *user,
+                              const char *ts_str, const char *ttl_str,
+                              const char *html_str, const char *pri_str);
+
 static int split_and_store(const char *title, const char *message,
                            const char *token, const char *user,
                            int ttl, int timestamp, int html, int priority)
@@ -151,6 +157,14 @@ static int split_and_store(const char *title, const char *message,
     snprintf(html_str, sizeof(html_str), "%d", html);
     snprintf(pri_str, sizeof(pri_str), "%d", priority);
 
+    /* Write scope (1.8.0): the app's write lock, if installed, then the
+     * handle mutex. Called on the app's thread; when that thread already
+     * holds the lock, its lock function reports HELD and the rows join
+     * the app's own transaction. */
+    CUTILS_AUTO_DB_WRITE db_write_guard_t w = { 0 };
+    int wrc = db_write_begin(db, &w);
+    if (wrc != CUTILS_OK) return wrc;
+
     if (msglen <= MAX_MSG_CHARS) {
         const char *params[] = {
             ts_str, token, user, ttl_str, message, title,
@@ -162,9 +176,31 @@ static int split_and_store(const char *title, const char *message,
             params, NULL);
     }
 
-    CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
-    int rc = cutils_db_tx_begin(db, &tx);
+    /* The parts go in atomically under a savepoint rather than BEGIN, so
+     * this also works inside a transaction the caller already has open
+     * (1.8.0; BEGIN there failed with "cannot start a transaction within
+     * a transaction"). Outside one, a savepoint is a deferred BEGIN. */
+    int rc = db_savepoint(db, "cutils_push_split");
     if (rc != CUTILS_OK) return rc;
+    rc = split_insert_parts(db, title, message, msglen, token, user,
+                            ts_str, ttl_str, html_str, pri_str);
+    if (rc != CUTILS_OK) {
+        CUTILS_UNUSED(db_savepoint_rollback(db, "cutils_push_split"));
+        CUTILS_UNUSED(db_savepoint_release(db, "cutils_push_split"));
+        return rc;
+    }
+    return db_savepoint_release(db, "cutils_push_split");
+}
+
+/* Insert the parts of an over-long message. Runs inside the caller's
+ * savepoint and write scope. */
+static int split_insert_parts(cutils_db_t *db, const char *title,
+                              const char *message, size_t msglen,
+                              const char *token, const char *user,
+                              const char *ts_str, const char *ttl_str,
+                              const char *html_str, const char *pri_str)
+{
+    int rc;
 
     /* Split on newline boundaries */
     const char *remaining = message;
@@ -217,7 +253,7 @@ static int split_and_store(const char *title, const char *message,
         part++;
     }
 
-    return db_tx_commit(&tx);
+    return CUTILS_OK;
 }
 
 /* --- Single-attempt send ---
@@ -387,8 +423,23 @@ static time_t now_secs(void)
     return time(NULL);
 }
 
+/* Run one non-query inside a write scope (1.8.0) so it cannot land in
+ * an application transaction. Best-effort, like every worker write: a
+ * failure leaves the row to be retried next cycle. */
+static void worker_write(cutils_db_t *db, const char *sql, const char **params)
+{
+    CUTILS_AUTO_DB_WRITE db_write_guard_t w = { 0 };
+    if (db_write_begin(db, &w) != CUTILS_OK) return;
+    CUTILS_UNUSED(db_execute_non_query(db, sql, params, NULL));
+}
+
 static time_t earliest_next_retry(cutils_db_t *db)
 {
+    /* Reads take the write scope too: on a shared connection a SELECT
+     * run inside another thread's open transaction sees its uncommitted
+     * rows, and the worker must not send a row that may roll back. */
+    CUTILS_AUTO_DB_WRITE db_write_guard_t w = { 0 };
+    if (db_write_begin(db, &w) != CUTILS_OK) return 0;
     CUTILS_AUTO_DBRES db_result_t *result = NULL;
     int rc = db_execute(db,
         "SELECT next_retry_at FROM push WHERE failed = 0 "
@@ -447,12 +498,18 @@ static void *push_worker_thread(void *arg)
              * deliver in order. Rows in retry-backoff have
              * next_retry_at > now and are skipped here, so a single
              * flaky row never blocks queued siblings. */
-            int rc = db_execute(push_db,
-                "SELECT rowid, timestamp, token, user, ttl, message, title, "
-                "html, priority, attempts "
-                "FROM push WHERE failed = 0 AND next_retry_at <= ? "
-                "ORDER BY rowid LIMIT 1",
-                sel_params, &result);
+            int rc;
+            {
+                CUTILS_AUTO_DB_WRITE db_write_guard_t w = { 0 };
+                rc = db_write_begin(db, &w);
+                if (rc == CUTILS_OK)
+                    rc = db_execute(db,
+                        "SELECT rowid, timestamp, token, user, ttl, message, title, "
+                        "html, priority, attempts "
+                        "FROM push WHERE failed = 0 AND next_retry_at <= ? "
+                        "ORDER BY rowid LIMIT 1",
+                        sel_params, &result);
+            }
 
             if (rc != CUTILS_OK || !result || result->nrows == 0)
                 break;
@@ -477,9 +534,9 @@ static void *push_worker_thread(void *arg)
             long long row_ttl = strtoll(ttl, NULL, 10);
             if (row_ts > 0 && row_ttl > 0 && (long long)now > row_ts + row_ttl) {
                 const char *fail_params[] = { rowid, NULL };
-                CUTILS_UNUSED(db_execute_non_query(push_db,
+                worker_write(db,
                     "UPDATE push SET failed = 1 WHERE rowid = ?",
-                    fail_params, NULL));
+                    fail_params);
                 atomic_fetch_add(&push_n_failed, 1);
                 atomic_fetch_add(&push_n_expired, 1);
                 log_warn("push expired before delivery (ttl reached): %s", title);
@@ -495,16 +552,16 @@ static void *push_worker_thread(void *arg)
                 const char *del_params[] = { rowid, NULL };
                 /* Best-effort: if the delete fails, the row will be re-delivered
                  * next cycle. Not catastrophic — Pushover collapses dupes. */
-                CUTILS_UNUSED(db_execute_non_query(push_db,
-                    "DELETE FROM push WHERE rowid = ?", del_params, NULL));
+                worker_write(db,
+                    "DELETE FROM push WHERE rowid = ?", del_params);
                 atomic_fetch_add(&push_n_sent, 1);
                 log_debug("push sent: %s", title);
             } else if (sr == SEND_PERMANENT_FAIL) {
                 const char *fail_params[] = { rowid, NULL };
                 /* Best-effort: if marking fails, the row retries next cycle. */
-                CUTILS_UNUSED(db_execute_non_query(push_db,
+                worker_write(db,
                     "UPDATE push SET failed = 1 WHERE rowid = ?",
-                    fail_params, NULL));
+                    fail_params);
                 atomic_fetch_add(&push_n_failed, 1);
                 log_error("push permanently failed (%s): %s", cause, title);
             } else {
@@ -517,9 +574,9 @@ static void *push_worker_thread(void *arg)
                 const char *upd_params[] = {
                     attempts_str, retry_at_str, rowid, NULL
                 };
-                CUTILS_UNUSED(db_execute_non_query(push_db,
+                worker_write(db,
                     "UPDATE push SET attempts = ?, next_retry_at = ? "
-                    "WHERE rowid = ?", upd_params, NULL));
+                    "WHERE rowid = ?", upd_params);
                 atomic_fetch_add(&push_n_retried, 1);
                 log_warn("push transient failure (%s; attempt %d, retry in %ds): %s",
                          cause, next_attempts, delay, title);
