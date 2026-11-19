@@ -1,4 +1,5 @@
 #include "cutils/db.h"
+#include "db_internal.h"
 #include "cutils/error.h"
 #include "cutils/mem.h"
 
@@ -129,6 +130,18 @@ static int record_migration(cutils_db_t *db, const char *tracked_name,
         params, NULL);
 }
 
+/* Undo a failed migration's savepoint. SQLite may already have rolled
+ * back the whole transaction when the statement failed (temp-store
+ * failure, SQLITE_FULL, SQLITE_IOERR, RAISE(ROLLBACK)); the savepoint
+ * went with it, and ROLLBACK TO would only fail with "no such
+ * savepoint". The caller restores its own error afterwards, so a
+ * failure here has nothing to add. */
+static void rollback_savepoint(cutils_db_t *db, const char *sp_name)
+{
+    if (db_in_transaction(db))
+        CUTILS_UNUSED(db_savepoint_rollback(db, sp_name));
+}
+
 /* Apply a single migration within a savepoint */
 static int apply_migration(cutils_db_t *db, const char *tracked_name,
                            const char *sql, const char *checksum)
@@ -145,17 +158,25 @@ static int apply_migration(cutils_db_t *db, const char *tracked_name,
 
     rc = db_exec_raw(db, sql);
     if (rc != CUTILS_OK) {
-        /* Recovery path — outer batch already errored, rollback failure here
-         * has nothing to add. */
-        CUTILS_UNUSED(db_savepoint_rollback(db, sp_name));
-        return set_error(CUTILS_ERR_MIGRATE, "migration %s failed: %s",
-                         tracked_name, cutils_get_error());
+        /* Capture the statement's own error before any recovery runs:
+         * the code first, since any later call on the handle replaces
+         * it, then the message, which a failing rollback would replace
+         * (1.8.1, c-backup B244). */
+        int  code = db_last_errcode(db);
+        char cause[CUTILS_ERR_BUFSZ];
+        snprintf(cause, sizeof(cause), "%s", cutils_get_error());
+        rollback_savepoint(db, sp_name);
+        return set_error(CUTILS_ERR_MIGRATE,
+                         "migration %s failed (sqlite error %d): %s",
+                         tracked_name, code, cause);
     }
 
     rc = record_migration(db, tracked_name, checksum);
     if (rc != CUTILS_OK) {
-        CUTILS_UNUSED(db_savepoint_rollback(db, sp_name));
-        return rc;
+        char cause[CUTILS_ERR_BUFSZ];
+        snprintf(cause, sizeof(cause), "%s", cutils_get_error());
+        rollback_savepoint(db, sp_name);
+        return set_error(rc, "%s", cause);
     }
 
     return db_savepoint_release(db, sp_name);

@@ -1,4 +1,5 @@
 #include "cutils/db.h"
+#include "db_internal.h"
 #include "cutils/error.h"
 #include "cutils/mem.h"
 
@@ -748,6 +749,18 @@ int db_exec_raw(cutils_db_t *db, const char *sql)
     return CUTILS_OK;
 }
 
+int db_in_transaction(cutils_db_t *db)
+{
+    CUTILS_LOCK_GUARD(&db->mutex);
+    return sqlite3_get_autocommit(db->conn) == 0;
+}
+
+int db_last_errcode(cutils_db_t *db)
+{
+    CUTILS_LOCK_GUARD(&db->mutex);
+    return sqlite3_extended_errcode(db->conn);
+}
+
 int db_result_is_null(const db_result_t *result, int row, int col)
 {
     if (!result || row < 0 || row >= result->nrows ||
@@ -963,9 +976,20 @@ void cutils_db_tx_end_p(cutils_db_tx_t *tx)
 {
     if (!tx) return;
     if (tx->active && !tx->finalized) {
-        /* Rollback can fail (e.g. DB closed underneath us); not much we
-         * can do in a cleanup handler. Silently attempt and move on. */
-        CUTILS_UNUSED(db_rollback(tx->db));
+        /* A cleanup handler must not replace the error that sent the
+         * caller down this path (1.8.1). SQLite may already have rolled
+         * the transaction back itself (temp-store failure, SQLITE_FULL,
+         * SQLITE_IOERR, RAISE(ROLLBACK)); ROLLBACK then fails with "no
+         * transaction is active", which used to overwrite the caller's
+         * real error. So roll back only while a transaction is open, and
+         * put the caller's message back afterwards either way. A
+         * rollback failure itself has nowhere to go from a cleanup. */
+        if (db_in_transaction(tx->db)) {
+            char saved[CUTILS_ERR_BUFSZ];
+            snprintf(saved, sizeof(saved), "%s", cutils_get_error());
+            if (db_rollback(tx->db) != CUTILS_OK)
+                CUTILS_UNUSED(set_error(CUTILS_ERR_DB, "%s", saved));
+        }
         /* Always release the hold we took in tx_begin_with_sql, even if
          * rollback failed — leaving the mutex locked would wedge every
          * other thread on this connection. */
