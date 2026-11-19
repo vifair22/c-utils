@@ -5,6 +5,25 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.8.1] - 2026-11-18
+
+One fix to migration error reporting, for c-backup (B244).
+
+### Fixed
+
+- **A migration that failed after SQLite rolled the transaction back
+  reported the wrong error.** Temp-store failures, `SQLITE_FULL`,
+  `SQLITE_IOERR` and `RAISE(ROLLBACK)` make SQLite end the transaction
+  itself. The runner's `ROLLBACK TO` and the scoped tx cleanup's
+  `ROLLBACK` then failed, and "cannot rollback - no transaction is
+  active" replaced the statement's own error.
+  - Both rollbacks now run only while a transaction is still open.
+  - A failed migration reports
+    `migration <name> failed (sqlite error <code>): <message>`, with
+    SQLite's extended result code.
+  - `CUTILS_AUTO_DB_TX` cleanup keeps the caller's error message for
+    every caller, not only migrations.
+
 ## [1.8.0] - 2026-11-17
 
 An application write lock on the db handle, for c-backup's write audit
