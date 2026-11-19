@@ -5,6 +5,24 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.8.2] - 2026-11-19
+
+Migration error context for c-backup (B288), and a Makefile fix.
+
+### Fixed
+
+- **Batch-level migration failures had no context.** A COMMIT failing
+  with `SQLITE_FULL` reported only `exec: database or disk is full`.
+  The tracking table setup, BEGIN, checksum lookup, recording and
+  COMMIT now report `<step> (sqlite error <code>): <message>` and
+  return `CUTILS_ERR_MIGRATE` (previously the bare `CUTILS_ERR_DB`).
+  - A COMMIT failure names the last migration applied in the batch.
+  - Checksum lookup and recording failures name their migration.
+- **`make` failed with "can't create build/vendor/cJSON.o"** when
+  `build/` existed without its subdirectories; the same applied to
+  `build-test/` and `build-bench/`. Each rule now creates the
+  directory it writes into.
+
 ## [1.8.1] - 2026-11-18
 
 One fix to migration error reporting, for c-backup (B244).
