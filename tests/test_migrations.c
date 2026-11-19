@@ -301,6 +301,129 @@ static void test_failed_migration_reports_statement_error(void **state)
     db_close(db);
 }
 
+/* --- Context on errors outside a single migration (1.8.2, c-backup B288) ---
+ *
+ * The forced failure on FS1 printed "compiled migrations failed: exec:
+ * database or disk is full" with no migration name: SQLITE_FULL surfaced at
+ * the batch COMMIT, which returned the bare error. Each batch-level step now
+ * says which step failed, the SQLite code, and the migration involved. */
+
+/* A deferred foreign key passes every statement and fails at COMMIT, the
+ * same point SQLITE_FULL surfaced on FS1. */
+#define DEFERRED_FK_SQL \
+    "CREATE TABLE parent (id INTEGER PRIMARY KEY);" \
+    "CREATE TABLE child (pid INTEGER REFERENCES parent(id) " \
+    "  DEFERRABLE INITIALLY DEFERRED);" \
+    "INSERT INTO child VALUES (42);"
+
+static void test_commit_failure_names_last_migration_compiled(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db, "PRAGMA foreign_keys=ON;"), CUTILS_OK);
+
+    static const db_migration_t migs[] = {
+        { "001_good", "CREATE TABLE good (id INTEGER PRIMARY KEY);" },
+        { "002_orphan", DEFERRED_FK_SQL },
+        { NULL, NULL }
+    };
+    assert_int_equal(db_run_compiled_migrations(db, migs), CUTILS_ERR_MIGRATE);
+    const char *err = cutils_get_error();
+    assert_non_null(strstr(err, "commit failed"));
+    assert_non_null(strstr(err, "002_orphan"));
+    assert_non_null(strstr(err, "sqlite error 787")); /* CONSTRAINT_FOREIGNKEY */
+    assert_non_null(strstr(err, "FOREIGN KEY constraint failed"));
+    assert_int_equal(table_exists(db, "good"), 0);
+    db_close(db);
+}
+
+static void test_commit_failure_names_last_migration_file(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db, "PRAGMA foreign_keys=ON;"), CUTILS_OK);
+
+    write_migration("001_orphan.sql", DEFERRED_FK_SQL);
+    write_migration("002_good.sql", "CREATE TABLE good (id INTEGER PRIMARY KEY);");
+    assert_int_equal(db_run_app_migrations(db, TEST_MIG_DIR), CUTILS_ERR_MIGRATE);
+    const char *err = cutils_get_error();
+    assert_non_null(strstr(err, "commit failed"));
+    assert_non_null(strstr(err, "002_good.sql")); /* last applied */
+    assert_non_null(strstr(err, "sqlite error 787"));
+    assert_int_equal(table_exists(db, "good"), 0);
+    db_close(db);
+}
+
+static void test_tracking_table_failure_has_context(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db, "PRAGMA query_only=ON;"), CUTILS_OK);
+    static const db_migration_t migs[] = {
+        { "001_good", "CREATE TABLE good (id INTEGER PRIMARY KEY);" },
+        { NULL, NULL }
+    };
+    assert_int_equal(db_run_compiled_migrations(db, migs), CUTILS_ERR_MIGRATE);
+    assert_non_null(strstr(cutils_get_error(), "tracking table"));
+    assert_non_null(strstr(cutils_get_error(), "sqlite error 8")); /* READONLY */
+
+    write_migration("001_good.sql", "CREATE TABLE good (id INTEGER PRIMARY KEY);");
+    assert_int_equal(db_run_app_migrations(db, TEST_MIG_DIR), CUTILS_ERR_MIGRATE);
+    assert_non_null(strstr(cutils_get_error(), "tracking table"));
+    db_close(db);
+}
+
+static void test_checksum_lookup_failure_names_migration(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    /* A tracking table without the checksum column: the lookup fails. */
+    assert_int_equal(db_exec_raw(db,
+        "CREATE TABLE system_migrations (id INTEGER PRIMARY KEY, filename TEXT);"),
+        CUTILS_OK);
+    static const db_migration_t migs[] = {
+        { "001_good", "CREATE TABLE good (id INTEGER PRIMARY KEY);" },
+        { NULL, NULL }
+    };
+    assert_int_equal(db_run_compiled_migrations(db, migs), CUTILS_ERR_MIGRATE);
+    const char *err = cutils_get_error();
+    assert_non_null(strstr(err, "001_good"));
+    assert_non_null(strstr(err, "checksum lookup failed"));
+    assert_non_null(strstr(err, "no such column"));
+
+    write_migration("001_good.sql", "CREATE TABLE good (id INTEGER PRIMARY KEY);");
+    assert_int_equal(db_run_app_migrations(db, TEST_MIG_DIR), CUTILS_ERR_MIGRATE);
+    assert_non_null(strstr(cutils_get_error(), "001_good.sql"));
+    assert_non_null(strstr(cutils_get_error(), "checksum lookup failed"));
+    db_close(db);
+}
+
+static void test_record_failure_names_migration(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db,
+        "CREATE TRIGGER no_record BEFORE INSERT ON system_migrations BEGIN "
+        "  SELECT RAISE(ABORT, 'recording refused'); END;"), CUTILS_OK);
+    static const db_migration_t migs[] = {
+        { "001_good", "CREATE TABLE good (id INTEGER PRIMARY KEY);" },
+        { NULL, NULL }
+    };
+    assert_int_equal(db_run_compiled_migrations(db, migs), CUTILS_ERR_MIGRATE);
+    const char *err = cutils_get_error();
+    assert_non_null(strstr(err, "001_good"));
+    assert_non_null(strstr(err, "recording failed"));
+    assert_non_null(strstr(err, "recording refused"));
+    assert_int_equal(table_exists(db, "good"), 0);
+    db_close(db);
+}
+
 static void test_null_dir_is_noop(void **state)
 {
     (void)state;
@@ -490,6 +613,11 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_auto_rollback_reports_original_error_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_auto_rollback_reports_original_error_compiled, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failed_migration_reports_statement_error, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_commit_failure_names_last_migration_compiled, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_commit_failure_names_last_migration_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tracking_table_failure_has_context, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_checksum_lookup_failure_names_migration, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_record_failure_names_migration, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
