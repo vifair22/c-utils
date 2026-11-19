@@ -192,6 +192,115 @@ static void test_failed_migration_rolls_back(void **state)
     db_close(db);
 }
 
+/* --- Failure after SQLite already rolled back (1.8.1, c-backup B244) ---
+ *
+ * Some statement failures make SQLite roll back the whole transaction
+ * itself (temp-store failure, SQLITE_FULL, SQLITE_IOERR). RAISE(ROLLBACK)
+ * in a trigger does the same thing deterministically. Before 1.8.1 the
+ * runner then issued ROLLBACK TO and ROLLBACK against a transaction that
+ * no longer existed, and their errors ("no such savepoint", "cannot
+ * rollback - no transaction is active") replaced the statement's own. */
+
+#define BOOM_SQL \
+    "CREATE TABLE boom (a INTEGER);" \
+    "CREATE TRIGGER boom_tr BEFORE INSERT ON boom BEGIN " \
+    "  SELECT RAISE(ROLLBACK, 'forced rollback in boom'); END;" \
+    "INSERT INTO boom VALUES (1);"
+
+static void assert_original_error(const char *migration)
+{
+    const char *err = cutils_get_error();
+    assert_non_null(strstr(err, migration));
+    assert_non_null(strstr(err, "forced rollback in boom"));
+    assert_non_null(strstr(err, "sqlite error 1811")); /* CONSTRAINT_TRIGGER */
+    assert_null(strstr(err, "no transaction is active"));
+    assert_null(strstr(err, "no such savepoint"));
+}
+
+static int table_exists(cutils_db_t *db, const char *name)
+{
+    const char *p[] = { name, NULL };
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?",
+        p, &r), CUTILS_OK);
+    int n = atoi(r->rows[0][0]);
+    db_result_free(r);
+    return n;
+}
+
+static void test_auto_rollback_reports_original_error_file(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
+
+    write_migration("001_good.sql", "CREATE TABLE good (id INTEGER PRIMARY KEY);");
+    write_migration("002_boom.sql", BOOM_SQL);
+
+    assert_int_equal(db_run_app_migrations(db, TEST_MIG_DIR), CUTILS_ERR_MIGRATE);
+    assert_original_error("002_boom.sql");
+
+    /* Nothing from the batch survived, and the handle is clean: with the
+     * bad file gone the same run applies the rest. */
+    assert_int_equal(table_exists(db, "good"), 0);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/002_boom.sql", TEST_MIG_DIR);
+    unlink(path);
+    assert_int_equal(db_run_app_migrations(db, TEST_MIG_DIR), CUTILS_OK);
+    assert_int_equal(table_exists(db, "good"), 1);
+
+    db_close(db);
+}
+
+static void test_auto_rollback_reports_original_error_compiled(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+
+    static const db_migration_t migs[] = {
+        { "001_good", "CREATE TABLE good (id INTEGER PRIMARY KEY);" },
+        { "002_boom", BOOM_SQL },
+        { NULL, NULL }
+    };
+    assert_int_equal(db_run_compiled_migrations(db, migs), CUTILS_ERR_MIGRATE);
+    assert_original_error("002_boom");
+    assert_int_equal(table_exists(db, "good"), 0);
+
+    static const db_migration_t good_only[] = {
+        { "001_good", "CREATE TABLE good (id INTEGER PRIMARY KEY);" },
+        { NULL, NULL }
+    };
+    assert_int_equal(db_run_compiled_migrations(db, good_only), CUTILS_OK);
+    assert_int_equal(table_exists(db, "good"), 1);
+
+    db_close(db);
+}
+
+/* An ordinary failure, where the transaction is still open, reports the
+ * statement's error too and still rolls the batch back. */
+static void test_failed_migration_reports_statement_error(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
+
+    write_migration("001_good.sql", "CREATE TABLE good (id INTEGER PRIMARY KEY);");
+    write_migration("002_bad.sql", "THIS IS NOT VALID SQL;");
+
+    assert_int_equal(db_run_app_migrations(db, TEST_MIG_DIR), CUTILS_ERR_MIGRATE);
+    const char *err = cutils_get_error();
+    assert_non_null(strstr(err, "002_bad.sql"));
+    assert_non_null(strstr(err, "syntax error"));
+    assert_non_null(strstr(err, "sqlite error 1)"));
+    assert_int_equal(table_exists(db, "good"), 0);
+
+    db_close(db);
+}
+
 static void test_null_dir_is_noop(void **state)
 {
     (void)state;
@@ -378,6 +487,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_compiled_migrations_null_is_noop, setup, teardown),
         cmocka_unit_test_setup_teardown(test_compiled_and_file_migrations_coexist, setup, teardown),
         cmocka_unit_test_setup_teardown(test_empty_sql_file_is_skipped, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_auto_rollback_reports_original_error_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_auto_rollback_reports_original_error_compiled, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_failed_migration_reports_statement_error, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -740,6 +740,60 @@ static void test_iter_next_null_row_out(void **state)
     db_close(db);
 }
 
+/* --- Scoped tx cleanup keeps the caller's error (1.8.1) --- */
+
+/* SQLite rolled the transaction back itself; the cleanup must not issue
+ * ROLLBACK (it would fail with "no transaction is active") or replace the
+ * statement's error with that. */
+static void test_tx_cleanup_after_auto_rollback_keeps_error(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db,
+        "CREATE TABLE t (a INTEGER);"
+        "CREATE TRIGGER t_tr BEFORE INSERT ON t BEGIN "
+        "  SELECT RAISE(ROLLBACK, 'trigger said no'); END;"), CUTILS_OK);
+    {
+        CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+        assert_int_equal(cutils_db_tx_begin(db, &tx), CUTILS_OK);
+        assert_int_not_equal(db_execute_non_query(db,
+            "INSERT INTO t VALUES (1)", NULL, NULL), CUTILS_OK);
+        assert_non_null(strstr(cutils_get_error(), "trigger said no"));
+    }
+    assert_non_null(strstr(cutils_get_error(), "trigger said no"));
+
+    /* The handle is clean: a new transaction works. */
+    CUTILS_AUTO_DB_TX cutils_db_tx_t tx2 = { 0 };
+    assert_int_equal(cutils_db_tx_begin(db, &tx2), CUTILS_OK);
+    assert_int_equal(db_tx_commit(&tx2), CUTILS_OK);
+    db_close(db);
+}
+
+/* The ordinary case still rolls back, and keeps the error too. */
+static void test_tx_cleanup_rolls_back_and_keeps_error(void **state)
+{
+    (void)state;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE t (a INTEGER);"), CUTILS_OK);
+    {
+        CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
+        assert_int_equal(cutils_db_tx_begin(db, &tx), CUTILS_OK);
+        assert_int_equal(db_execute_non_query(db,
+            "INSERT INTO t VALUES (1)", NULL, NULL), CUTILS_OK);
+        assert_int_not_equal(db_execute_non_query(db,
+            "INSERT INTO missing VALUES (1)", NULL, NULL), CUTILS_OK);
+    }
+    assert_non_null(strstr(cutils_get_error(), "no such table"));
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT count(*) FROM t", NULL, &r), CUTILS_OK);
+    assert_string_equal(r->rows[0][0], "0");
+    db_result_free(r);
+    db_close(db);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -770,6 +824,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_iter_next_null_row_out, setup, teardown),
         cmocka_unit_test_setup_teardown(test_db_open_with_mode_new_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_db_open_with_mode_existing_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tx_cleanup_after_auto_rollback_keeps_error, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tx_cleanup_rolls_back_and_keeps_error, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
