@@ -663,6 +663,18 @@ All migrations in a batch (one call to `db_run_app_migrations` or `db_run_compil
 
 A failed migration returns `CUTILS_ERR_MIGRATE` with the statement's own error, naming the migration and SQLite's extended result code: `migration 002_add_index.sql failed (sqlite error 19): exec: UNIQUE constraint failed: ...`. Some failures (a temp-store failure, `SQLITE_FULL`, `SQLITE_IOERR`, `RAISE(ROLLBACK)` in a trigger) make SQLite roll back the whole transaction itself. Since 1.8.1 the runner checks for that before issuing `ROLLBACK TO` and `ROLLBACK`. Before 1.8.1 those rollbacks failed against the vanished transaction, and their error ("cannot rollback - no transaction is active") replaced the real one. The scoped `CUTILS_AUTO_DB_TX` cleanup follows the same rule for every caller.
 
+Failures outside a single migration's SQL carry context too (1.8.2), in the same `(sqlite error <code>): <message>` form:
+
+| Step | Message prefix |
+|---|---|
+| Creating `system_migrations` | `migrations: tracking table setup failed` |
+| Batch `BEGIN` | `migrations: begin failed` |
+| Checksum lookup | `migration <name>: checksum lookup failed` |
+| Recording an applied migration | `migration <name>: recording failed` |
+| Batch `COMMIT` | `migrations commit failed, last applied <name>` |
+
+A batch `COMMIT` is where `SQLITE_FULL` and deferred constraint violations usually surface, so the last migration applied in the batch is named. All of these return `CUTILS_ERR_MIGRATE`; before 1.8.2 they returned the bare db error, typically `exec: database or disk is full`.
+
 ### Checksum enforcement
 
 The SHA256 checksum is computed over the raw SQL text. If the SQL for a migration changes after it has been applied, the runner returns `CUTILS_ERR_MIGRATE` with a descriptive error message. This is intentional: a migration that was already applied to a database should not be silently re-interpreted with different content.

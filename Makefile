@@ -85,18 +85,21 @@ asan: CFLAGS = $(ASAN_CFLAGS)
 asan: BUILD_TYPE = asan
 asan: clean-lib $(BUILD_DIR)/$(LIB)
 
-# Directories
-$(BUILD_DIR):
-	@mkdir -p $(BUILD_DIR)/vendor $(BUILD_DIR)/analyze
-
-$(TEST_DIR):
-	@mkdir -p $(TEST_DIR)/obj $(TEST_DIR)/vendor $(TEST_DIR)/bin
+# Directories. Each object depends (order-only) on the directory it is
+# written to, not just the top of the tree: a build/ left without its
+# vendor/ subdirectory (an older layout, or a mkdir by hand) used to fail
+# with "can't create build/vendor/cJSON.o", because the rule that made
+# vendor/ only ran when build/ itself was missing (1.8.2).
+$(BUILD_DIR) $(BUILD_DIR)/vendor \
+$(TEST_DIR) $(TEST_DIR)/obj $(TEST_DIR)/vendor $(TEST_DIR)/bin \
+$(BENCH_DIR) $(BENCH_DIR)/obj $(BENCH_DIR)/lib $(BENCH_DIR)/vendor $(BENCH_DIR)/bin:
+	@mkdir -p $@
 
 # Compile source files (library build)
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vendor/%.o: lib/cJSON/%.c | $(BUILD_DIR)
+$(BUILD_DIR)/vendor/%.o: lib/cJSON/%.c | $(BUILD_DIR)/vendor
 	$(CC) $(CFLAGS) $(VENDOR_RELAX) $(VENDOR_CJSON_ALLOW) -c $< -o $@
 
 # version.c embeds release_version through VERSION_DEFINE, which make cannot
@@ -121,16 +124,16 @@ TEST_ALL_OBJS    = $(TEST_SRC_OBJS) $(TEST_VENDOR_OBJS)
 TEST_LIB         = $(TEST_DIR)/$(LIB)
 TEST_LIBS        = -L$(TEST_DIR) -lc-utils -lsqlite3 -lcurl -lcrypto -lcmocka -lpthread
 
-$(TEST_DIR)/obj/%.o: src/%.c | $(TEST_DIR)
+$(TEST_DIR)/obj/%.o: src/%.c | $(TEST_DIR)/obj
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(TEST_DIR)/vendor/%.o: lib/cJSON/%.c | $(TEST_DIR)
+$(TEST_DIR)/vendor/%.o: lib/cJSON/%.c | $(TEST_DIR)/vendor
 	$(CC) $(CFLAGS) $(VENDOR_RELAX) $(VENDOR_CJSON_ALLOW) -c $< -o $@
 
 $(TEST_LIB): $(TEST_ALL_OBJS) | $(TEST_DIR)
 	$(AR) rcs $@ $^
 
-$(TEST_DIR)/bin/%: tests/%.c $(TEST_LIB) | $(TEST_DIR)
+$(TEST_DIR)/bin/%: tests/%.c $(TEST_LIB) | $(TEST_DIR)/bin
 	$(CC) $(CFLAGS) -Isrc $< -o $@ $(TEST_LIBS)
 
 test: CFLAGS = $(DEBUG_CFLAGS)
@@ -210,22 +213,19 @@ BENCH_LIB      = $(BENCH_DIR)/$(LIB)
 BENCH_LIBS     = -L$(BENCH_DIR) -lc-utils -lsqlite3 -lcurl -lcrypto -lpthread
 BENCH_BIN      = $(BENCH_DIR)/bin/bench
 
-$(BENCH_DIR):
-	@mkdir -p $(BENCH_DIR)/obj $(BENCH_DIR)/lib $(BENCH_DIR)/vendor $(BENCH_DIR)/bin
-
-$(BENCH_DIR)/obj/%.o: bench/%.c | $(BENCH_DIR)
+$(BENCH_DIR)/obj/%.o: bench/%.c | $(BENCH_DIR)/obj
 	$(CC) $(CFLAGS) -Iinclude -Ibench -c $< -o $@
 
-$(BENCH_DIR)/lib/%.o: src/%.c | $(BENCH_DIR)
+$(BENCH_DIR)/lib/%.o: src/%.c | $(BENCH_DIR)/lib
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BENCH_DIR)/vendor/%.o: lib/cJSON/%.c | $(BENCH_DIR)
+$(BENCH_DIR)/vendor/%.o: lib/cJSON/%.c | $(BENCH_DIR)/vendor
 	$(CC) $(CFLAGS) $(VENDOR_RELAX) $(VENDOR_CJSON_ALLOW) -c $< -o $@
 
 $(BENCH_LIB): $(BENCH_LIB_OBJS) $(BENCH_VENDOR_OBJS) | $(BENCH_DIR)
 	$(AR) rcs $@ $^
 
-$(BENCH_BIN): $(BENCH_OBJS) $(BENCH_LIB) | $(BENCH_DIR)
+$(BENCH_BIN): $(BENCH_OBJS) $(BENCH_LIB) | $(BENCH_DIR)/bin
 	$(CC) $(CFLAGS) -Iinclude -Ibench $(BENCH_OBJS) -o $@ $(BENCH_LIBS)
 
 bench: CFLAGS = $(RELEASE_CFLAGS)
