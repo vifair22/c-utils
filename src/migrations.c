@@ -3,6 +3,7 @@
 #include "cutils/error.h"
 #include "cutils/mem.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +96,42 @@ static const char *TRACKING_TABLE_SQL =
     "    applied_at TEXT NOT NULL DEFAULT (datetime('now'))"
     ");";
 
+/* Fail a migration step with context (1.8.2, c-backup B288). Captures
+ * SQLite's extended code and the message of the call that just failed,
+ * before anything else runs on the handle, and reports
+ * "<context> (sqlite error <code>): <message>". Before this, steps
+ * outside a single migration's SQL (tracking table, BEGIN, checksum
+ * lookup, recording, COMMIT) returned the bare db error, so a COMMIT
+ * failing with SQLITE_FULL read "exec: database or disk is full" with no
+ * hint of where. */
+__attribute__((format(printf, 2, 3)))
+static int migrate_fail(cutils_db_t *db, const char *fmt, ...)
+{
+    int  code = db_last_errcode(db);
+    char cause[CUTILS_ERR_BUFSZ];
+    snprintf(cause, sizeof(cause), "%s", cutils_get_error());
+
+    char ctx[384];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(ctx, sizeof(ctx), fmt, ap);
+    va_end(ap);
+
+    return set_error(CUTILS_ERR_MIGRATE, "%s (sqlite error %d): %s",
+                     ctx, code, cause);
+}
+
+/* Report a failed batch COMMIT, naming the last migration applied in the
+ * batch: on SQLITE_FULL or a deferred constraint, the COMMIT is where
+ * that migration's writes actually fail. */
+static int commit_fail(cutils_db_t *db, const char *last_applied)
+{
+    if (last_applied[0])
+        return migrate_fail(db, "migrations commit failed, last applied %s",
+                            last_applied);
+    return migrate_fail(db, "migrations commit failed (none applied in this batch)");
+}
+
 /* Check if a migration has been applied and verify checksum */
 static int check_migration(cutils_db_t *db, const char *tracked_name,
                            const char *checksum, int *applied)
@@ -106,7 +143,9 @@ static int check_migration(cutils_db_t *db, const char *tracked_name,
     int rc = db_execute(db,
         "SELECT checksum FROM system_migrations WHERE filename = ?",
         params, &result);
-    if (rc != CUTILS_OK) return rc;
+    if (rc != CUTILS_OK)
+        return migrate_fail(db, "migration %s: checksum lookup failed",
+                            tracked_name);
 
     if (result->nrows > 0) {
         const char *stored = result->rows[0][0];
@@ -173,6 +212,7 @@ static int apply_migration(cutils_db_t *db, const char *tracked_name,
 
     rc = record_migration(db, tracked_name, checksum);
     if (rc != CUTILS_OK) {
+        rc = migrate_fail(db, "migration %s: recording failed", tracked_name);
         char cause[CUTILS_ERR_BUFSZ];
         snprintf(cause, sizeof(cause), "%s", cutils_get_error());
         rollback_savepoint(db, sp_name);
@@ -189,11 +229,15 @@ static int run_migration_array(cutils_db_t *db, const db_migration_t *migrations
 {
     /* Ensure tracking table exists */
     int rc = db_exec_raw(db, TRACKING_TABLE_SQL);
-    if (rc != CUTILS_OK) return rc;
+    if (rc != CUTILS_OK)
+        return migrate_fail(db, "migrations: tracking table setup failed");
 
     CUTILS_AUTO_DB_TX cutils_db_tx_t tx = { 0 };
     rc = cutils_db_tx_begin(db, &tx);
-    if (rc != CUTILS_OK) return rc;
+    if (rc != CUTILS_OK)
+        return migrate_fail(db, "migrations: begin failed");
+
+    char last_applied[256] = "";
 
     for (int i = 0; migrations[i].name != NULL; i++) {
         const char *name = migrations[i].name;
@@ -219,9 +263,12 @@ static int run_migration_array(cutils_db_t *db, const db_migration_t *migrations
         fprintf(stderr, "Migration: applying %s\n", tracked);
         rc = apply_migration(db, tracked, sql, checksum);
         if (rc != CUTILS_OK) return rc;   /* tx auto-rolls-back */
+        snprintf(last_applied, sizeof(last_applied), "%s", tracked);
     }
 
-    return db_tx_commit(&tx);
+    if (db_tx_commit(&tx) != CUTILS_OK)
+        return commit_fail(db, last_applied); /* tx auto-rolls-back */
+    return CUTILS_OK;
 }
 
 /* --- Public API: run compiled-in library migrations --- */
@@ -258,7 +305,8 @@ int db_run_app_migrations(cutils_db_t *db, const char *migrations_dir)
 
     /* Ensure tracking table exists */
     int rc = db_exec_raw(db, TRACKING_TABLE_SQL);
-    if (rc != CUTILS_OK) return rc;
+    if (rc != CUTILS_OK)
+        return migrate_fail(db, "migrations: tracking table setup failed");
 
     /* tx is declared before any goto to cleanup: — C forbids goto-ing past
      * a cleanup-attributed declaration. Zero-initialized so the cleanup
@@ -299,8 +347,12 @@ int db_run_app_migrations(cutils_db_t *db, const char *migrations_dir)
     qsort(files, (size_t)count, sizeof(char *), cmp_strings);
 
     /* Apply migrations in a single transaction */
+    char last_applied[256] = "";
     rc = cutils_db_tx_begin(db, &tx);
-    if (rc != CUTILS_OK) goto cleanup;
+    if (rc != CUTILS_OK) {
+        rc = migrate_fail(db, "migrations: begin failed");
+        goto cleanup;
+    }
 
     for (int i = 0; i < count; i++) {
         /* Read file contents */
@@ -358,9 +410,12 @@ int db_run_app_migrations(cutils_db_t *db, const char *migrations_dir)
         fprintf(stderr, "Migration: applying %s\n", files[i]);
         rc = apply_migration(db, files[i], sql, checksum);
         if (rc != CUTILS_OK) goto cleanup;   /* tx auto-rolls-back */
+        snprintf(last_applied, sizeof(last_applied), "%s", files[i]);
     }
 
     rc = db_tx_commit(&tx);
+    if (rc != CUTILS_OK)
+        rc = commit_fail(db, last_applied);  /* tx auto-rolls-back */
 
 cleanup:
     for (int i = 0; i < count; i++) free(files[i]);
