@@ -661,6 +661,8 @@ Use a numeric prefix for ordering: `001_`, `002_`, etc. The name is the tracking
 
 All migrations in a batch (one call to `db_run_app_migrations` or `db_run_compiled_migrations`) run within a single transaction. Each individual migration gets its own savepoint. If a migration's SQL fails, its savepoint is rolled back and the entire transaction is rolled back — no partial application.
 
+A failed migration returns `CUTILS_ERR_MIGRATE` with the statement's own error, naming the migration and SQLite's extended result code: `migration 002_add_index.sql failed (sqlite error 19): exec: UNIQUE constraint failed: ...`. Some failures (a temp-store failure, `SQLITE_FULL`, `SQLITE_IOERR`, `RAISE(ROLLBACK)` in a trigger) make SQLite roll back the whole transaction itself. Since 1.8.1 the runner checks for that before issuing `ROLLBACK TO` and `ROLLBACK`. Before 1.8.1 those rollbacks failed against the vanished transaction, and their error ("cannot rollback - no transaction is active") replaced the real one. The scoped `CUTILS_AUTO_DB_TX` cleanup follows the same rule for every caller.
+
 ### Checksum enforcement
 
 The SHA256 checksum is computed over the raw SQL text. If the SQL for a migration changes after it has been applied, the runner returns `CUTILS_ERR_MIGRATE` with a descriptive error message. This is intentional: a migration that was already applied to a database should not be silently re-interpreted with different content.
