@@ -39,8 +39,9 @@ The public surface is everything reachable through `<cutils/*.h>`. Headers in `s
 **Link-time:**
 - [SQLite3](https://sqlite.org) (`-lsqlite3`)
 - [libcurl](https://curl.se/libcurl/) (`-lcurl`)
-- [OpenSSL](https://www.openssl.org) libcrypto (`-lcrypto`)
 - pthreads (`-lpthread`)
+
+OpenSSL is needed only to build the test suite (`libssl-dev`); since 1.9.0 the library itself no longer links libcrypto.
 
 **Vendored (included):**
 - [cJSON](https://github.com/DaveGamble/cJSON) — JSON parsing, built into the static library
@@ -85,7 +86,7 @@ In your app's Makefile:
 CUTILS_DIR = ../c-utils
 
 INCLUDES = -Isrc -I$(CUTILS_DIR)/include -I$(CUTILS_DIR)/lib/cJSON
-LIBS     = -L$(CUTILS_DIR) -lc-utils -lsqlite3 -lcurl -lcrypto -lpthread
+LIBS     = -L$(CUTILS_DIR) -lc-utils -lsqlite3 -lcurl -lpthread
 ```
 
 Build c-utils first, then your app:
