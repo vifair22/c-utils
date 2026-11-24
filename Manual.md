@@ -25,9 +25,10 @@ AppGuard (lifecycle orchestrator)
 |---------|---------|---------|
 | SQLite3 | Database engine | `-lsqlite3` |
 | libcurl | Pushover HTTP delivery | `-lcurl` |
-| OpenSSL libcrypto | SHA256 checksums for migrations | `-lcrypto` |
 | pthreads | Background threads, mutexes | `-lpthread` |
 | cJSON | JSON parsing (vendored, built into libc-utils.a) | — |
+
+Migration checksums use a built-in SHA-256 (1.9.0). Earlier versions needed OpenSSL libcrypto for it; the digests are identical, so databases migrated by any version still verify.
 
 All headers are under `include/cutils/`. The umbrella header `<cutils.h>` pulls in everything.
 
@@ -1899,7 +1900,7 @@ The consuming application's Makefile references c-utils by relative path:
 CUTILS_DIR = ../c-utils
 
 INCLUDES = -Isrc -I$(CUTILS_DIR)/include -I$(CUTILS_DIR)/lib/cJSON
-LIBS     = -L$(CUTILS_DIR) -lc-utils -lsqlite3 -lcurl -lcrypto -lpthread
+LIBS     = -L$(CUTILS_DIR) -lc-utils -lsqlite3 -lcurl -lpthread
 ```
 
 Build c-utils before building the consuming application. The static library (`libc-utils.a`) and headers are the only interface — there is no install step.

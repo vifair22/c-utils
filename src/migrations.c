@@ -1,5 +1,6 @@
 #include "cutils/db.h"
 #include "db_internal.h"
+#include "cutils_sha256.h"
 #include "cutils/error.h"
 #include "cutils/mem.h"
 
@@ -8,7 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
-#include <openssl/sha.h>
 
 /* File-local scoped cleanup for DIR handles. */
 static void closedir_p(DIR **d)
@@ -22,17 +22,16 @@ static void closedir_p(DIR **d)
 
 /* --- SHA256 checksum helper --- */
 
-/* Caller guarantees out is at least (SHA256_DIGEST_LENGTH * 2 + 1)
- * bytes (65 for SHA256). snprintf with the exact remaining space is a
- * style match for the rest of the codebase — every other src/ file
- * uses snprintf rather than sprintf. */
+/* Caller guarantees out is at least (CUTILS_SHA256_DIGEST_LEN * 2 + 1)
+ * bytes (65). The built-in SHA-256 (1.9.0) produces the same digest as
+ * OpenSSL's SHA256(), so checksums recorded by earlier versions match. */
 static void sha256_hex(const char *data, size_t len, char *out)
 {
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256((const unsigned char *)data, len, hash);
-    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++)
+    uint8_t hash[CUTILS_SHA256_DIGEST_LEN];
+    cutils_sha256(data, len, hash);
+    for (int i = 0; i < CUTILS_SHA256_DIGEST_LEN; i++)
         snprintf(out + i * 2, 3, "%02x", hash[i]);
-    out[SHA256_DIGEST_LENGTH * 2] = '\0';
+    out[CUTILS_SHA256_DIGEST_LEN * 2] = '\0';
 }
 
 /* --- Compiled-in library migrations --- */
