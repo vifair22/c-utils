@@ -17,5 +17,5 @@ Version: @VERSION@
 
 Requires.private: sqlite3 libcurl libcrypto
 Libs: -L${libdir} -lc-utils
-Libs.private: -lsqlite3 -lcurl -lcrypto -lpthread
+Libs.private: -lsqlite3 -lcurl -lpthread
 Cflags: -I${includedir}

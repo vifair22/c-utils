@@ -56,6 +56,7 @@ SRCS     = src/error.c \
            src/mem.c \
            src/db.c \
            src/migrations.c \
+           src/sha256.c \
            src/config.c \
            src/config_yaml.c \
            src/log.c \
@@ -122,6 +123,8 @@ TEST_SRC_OBJS    = $(patsubst src/%.c,$(TEST_DIR)/obj/%.o,$(SRCS))
 TEST_VENDOR_OBJS = $(patsubst lib/cJSON/%.c,$(TEST_DIR)/vendor/%.o,$(VENDOR))
 TEST_ALL_OBJS    = $(TEST_SRC_OBJS) $(TEST_VENDOR_OBJS)
 TEST_LIB         = $(TEST_DIR)/$(LIB)
+# -lcrypto is test-only (1.9.0): test_sha256 cross-checks the built-in
+# SHA-256 against OpenSSL. The library itself no longer needs it.
 TEST_LIBS        = -L$(TEST_DIR) -lc-utils -lsqlite3 -lcurl -lcrypto -lcmocka -lpthread
 
 $(TEST_DIR)/obj/%.o: src/%.c | $(TEST_DIR)/obj
@@ -210,7 +213,7 @@ BENCH_OBJS     = $(patsubst bench/%.c,$(BENCH_DIR)/obj/%.o,$(BENCH_SRCS))
 BENCH_LIB_OBJS = $(patsubst src/%.c,$(BENCH_DIR)/lib/%.o,$(SRCS))
 BENCH_VENDOR_OBJS = $(patsubst lib/cJSON/%.c,$(BENCH_DIR)/vendor/%.o,$(VENDOR))
 BENCH_LIB      = $(BENCH_DIR)/$(LIB)
-BENCH_LIBS     = -L$(BENCH_DIR) -lc-utils -lsqlite3 -lcurl -lcrypto -lpthread
+BENCH_LIBS     = -L$(BENCH_DIR) -lc-utils -lsqlite3 -lcurl -lpthread
 BENCH_BIN      = $(BENCH_DIR)/bin/bench
 
 $(BENCH_DIR)/obj/%.o: bench/%.c | $(BENCH_DIR)/obj
