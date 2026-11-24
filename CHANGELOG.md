@@ -5,6 +5,23 @@ All notable changes to c-utils are recorded here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 the public-header level (see README "API stability").
 
+## [1.9.0] - 2026-11-24
+
+c-utils no longer needs OpenSSL.
+
+### Changed
+
+- **Migration checksums use a built-in SHA-256** (FIPS 180-4) instead
+  of OpenSSL's `SHA256()`. The digests are identical, so databases
+  migrated by earlier versions still verify.
+  - `-lcrypto` is no longer needed to link c-utils, and is gone from
+    the pkg-config `Libs.private`. Consumers that link it only for
+    c-utils can drop it; keeping it does no harm.
+  - Statically linked consumers no longer pull in libcrypto for
+    migrations (rtr-report: 8.7 MB down toward its 2.2 MB baseline).
+  - OpenSSL remains a test-only dependency, used to cross-check the
+    digest.
+
 ## [1.8.2] - 2026-11-19
 
 Migration error context for c-backup (B288), and a Makefile fix.
